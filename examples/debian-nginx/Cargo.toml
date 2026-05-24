@@ -1,0 +1,25 @@
+[package]
+name = "debian-nginx"
+description = ""
+publish = false
+version.workspace = true
+rust-version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "debian-nginx"
+path = "src/main.rs"
+
+[features]
+# The `cindy` CLI always builds with --no-default-features and exactly
+# one of the two. Defaulting to *both* makes plain `cargo check` (and
+# rust-analyzer) analyse the orchestrator and the worker halves at once
+# — `#[cindy::main]` is built for exactly this dual-feature shape — so
+# the whole program is type-checked without special editor setup.
+default = ["orchestrator", "remote"]
+orchestrator = ["cindy/orchestrator"]
+remote = ["cindy/remote"]
+
+[dependencies]
+cindy = { workspace = true }

@@ -1,0 +1,55 @@
+[package]
+name = "cindy"
+description.workspace = true
+authors.workspace = true
+version.workspace = true
+rust-version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+readme = "README.md"
+
+[dependencies]
+cindy-macros.workspace = true
+
+postcard = { workspace = true, features = ["alloc"] }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+tokio = { workspace = true, features = [
+  "io-std",
+  "io-util",
+  "macros",
+  "rt-multi-thread",
+  "sync",
+  "time",
+] }
+
+anyhow_serde = "1.0"
+base64 = "0.22"
+chacha20poly1305 = "0.10"
+inventory = "0.3"
+nix = { version = "0.31", features = ["fs", "user"] }
+similar = "3.1"
+tempfile = "3.27"
+zeroize = "1.8"
+uuid = { version = "1.23", features = ["v4", "serde"] }
+zbus_systemd = { version = "0.26000", default-features = false, features = [
+  "systemd1",
+  "zbus-async-tokio",
+] }
+ureq = { version = "3", default-features = false, features = ["rustls"] }
+tar = "0.4.46"
+flate2 = { version = "1.1.9", default-features = false, features = [
+  "rust_backend",
+] }
+lzma-rs = "0.3.0"
+ruzstd = "0.8.3"
+zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
+sevenz-rust2 = "0.21.0"
+sha2 = "0.11"
+
+[features]
+orchestrator = []
+remote = []

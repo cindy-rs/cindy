@@ -1,0 +1,35 @@
+[package]
+name = "e2e-localhost"
+description = "End-to-end localhost example/test exercising cindy's builtin modules with no SSH and no system mutation."
+publish = false
+version.workspace = true
+rust-version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "e2e-localhost"
+path = "src/main.rs"
+
+[features]
+# The `cindy` CLI always builds with --no-default-features and exactly
+# one of the two. Defaulting to *both* makes plain `cargo check` (and
+# rust-analyzer) analyse the orchestrator and the worker halves at once
+# — `#[cindy::main]` is built for exactly this dual-feature shape — so
+# the whole program is type-checked without special editor setup.
+default = ["orchestrator", "remote"]
+# Forwarded to cindy so the `#[cindy::main]`/`#[cindy::remote]` macros
+# expand to the orchestrator side or the remote-worker side. The test
+# harness builds this crate once with each feature and cross-pipes the
+# two resulting processes — exactly what the real CLI does, minus SSH.
+orchestrator = ["cindy/orchestrator"]
+remote = ["cindy/remote"]
+
+[dependencies]
+cindy = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
+tempfile = "3.27"
+sha2 = "0.10"
