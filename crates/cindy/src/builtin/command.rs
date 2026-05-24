@@ -1,0 +1,161 @@
+//! Run an arbitrary process (`command`) or a script through an
+//! explicit interpreter (`shell`) on the remote machine.
+//!
+//! Unlike the other builtins, these execute opaque user-supplied
+//! programs, so the framework cannot introspect what a change *is* —
+//! there is no on-disk state to read back, and therefore no honest
+//! "changed / unchanged" to report. These modules deliberately make no
+//! idempotency claim: they always run, and they hand you back the raw
+//! [`Output`] (exit code, stdout, stderr). Deciding whether the
+//! intended effect happened is *your* job — inspect the code/output, or
+//! check filesystem state with a read-only builtin (e.g. `stat`) before
+//! and after.
+//!
+//! Consistent with that, a **non-zero exit is not an error** — it's
+//! data, reported in [`Output::code`]. Only failing to run the program
+//! at all errors. When "non-zero should fail the play" is what you
+//! mean, say so with [`Output::exit_ok`]:
+//!
+//! ```ignore
+//! command(vec!["systemctl".into(), "reload".into(), "nginx".into()], <_>::default())
+//!     .await?      // spawn/transport errors
+//!     .exit_ok()?; // non-zero exit fails the play, with stdout/stderr attached
+//! ```
+
+use std::process::Command;
+
+use crate as cindy;
+use crate::Context;
+
+/// Captured result of the executed process.
+///
+/// Returned for both [`command`] and [`shell`]. The program always ran
+/// (these modules never skip), so there is no "changed" flag — just the
+/// observable result for you to act on.
+#[derive(Clone, PartialEq, Eq)]
+#[crate::wire]
+pub struct Output {
+    /// Process exit code, or `None` if the program was terminated by a
+    /// signal (no code available).
+    pub code: Option<i32>,
+    /// Captured standard output.
+    pub stdout: String,
+    /// Captured standard error.
+    pub stderr: String,
+}
+
+impl Output {
+    /// `true` if the program exited successfully (`code == 0`).
+    pub fn success(&self) -> bool {
+        self.code == Some(0)
+    }
+
+    /// Turn a non-zero (or signal-terminated) exit into an error
+    /// carrying the captured stdout/stderr, for callers where anything
+    /// but success should fail the play.
+    pub fn exit_ok(self) -> crate::Result<Self> {
+        if self.success() {
+            return Ok(self);
+        }
+        crate::bail!(
+            "process exited with {:?}:\n--- stdout ---\n{}\n--- stderr ---\n{}",
+            self.code,
+            self.stdout,
+            self.stderr,
+        );
+    }
+}
+
+/// Execution environment shared by [`command`] and [`shell`].
+#[derive(Clone, Default, PartialEq, Eq)]
+#[crate::wire]
+pub struct State {
+    /// Working directory to run the program in. `None` ⇒ inherit the
+    /// remote worker's current directory.
+    pub chdir: Option<std::path::PathBuf>,
+    /// Extra environment variables to set for the child process. These
+    /// are layered on top of the worker's inherited environment.
+    pub env: std::collections::BTreeMap<String, String>,
+}
+
+/// Run an already-configured [`Command`] to completion and capture its
+/// [`Output`]. Errors only when the program couldn't be run at all; the
+/// exit status — zero or not — is the caller's data, not our verdict
+/// (see the module docs and [`Output::exit_ok`]).
+fn run(mut cmd: Command, state: &State, label: &str) -> crate::Result<Output> {
+    if let Some(dir) = state.chdir.as_ref() {
+        cmd.current_dir(dir);
+    }
+    for (k, v) in &state.env {
+        cmd.env(k, v);
+    }
+
+    let out = cmd.output().context(format!("Failed to spawn {label}"))?;
+
+    Ok(Output {
+        code: out.status.code(),
+        stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+    })
+}
+
+/// Run a program directly, without a shell.
+///
+/// `argv[0]` is the program to execute and the remaining elements are
+/// its arguments, passed verbatim — there is **no** shell, so globbing,
+/// pipes, redirection, `&&`, environment-variable expansion, etc. are
+/// *not* interpreted. If you need any of that, reach for [`shell`].
+///
+/// `argv` must be non-empty. This module makes no idempotency claim: it
+/// runs every time and reports the raw [`Output`].
+#[crate::remote]
+pub fn command(argv: Vec<String>, state: State) -> crate::Result<Output> {
+    let Some((program, args)) = argv.split_first() else {
+        crate::bail!("`command` requires a non-empty argv (argv[0] is the program)");
+    };
+
+    let mut cmd = Command::new(program);
+    cmd.args(args);
+    run(cmd, &state, &format!("`command` {program:?}"))
+}
+
+/// Run a script through an explicit interpreter.
+///
+/// `shell` deliberately refuses to assume an interpreter: `interpreter`
+/// is the **full path** to the shell binary (`/bin/sh`, `/bin/bash`,
+/// `/usr/bin/zsh`, …) and `script` is handed to it via `-c`. There is
+/// no implicit `bash`/`sh`/`zsh` — the caller must spell out exactly
+/// which interpreter runs, so plays don't silently depend on whatever
+/// `/bin/sh` happens to point at on a given host.
+///
+/// `interpreter` must be an absolute path that exists on the remote;
+/// the module fails fast otherwise rather than letting the OS produce a
+/// confusing `ENOENT`.
+#[crate::remote]
+pub fn shell(
+    interpreter: std::path::PathBuf,
+    script: String,
+    state: State,
+) -> crate::Result<Output> {
+    if !interpreter.is_absolute() {
+        crate::bail!(
+            "`shell` interpreter must be an absolute path, got {}; \
+             there is no implicit shell — spell out e.g. /bin/bash",
+            interpreter.display()
+        );
+    }
+    if !interpreter.exists() {
+        crate::bail!(
+            "`shell` interpreter {} does not exist on the remote",
+            interpreter.display()
+        );
+    }
+
+    let mut cmd = Command::new(&interpreter);
+    cmd.arg("-c").arg(&script);
+    run(
+        cmd,
+        &state,
+        &format!("`shell` via {}", interpreter.display()),
+    )
+}

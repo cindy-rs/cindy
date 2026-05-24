@@ -1,0 +1,44 @@
+[package]
+name = "cindy-cli"
+description.workspace = true
+authors.workspace = true
+version.workspace = true
+rust-version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+readme = "README.md"
+
+[[bin]]
+name = "cindy"
+path = "src/main.rs"
+
+[dependencies]
+cindy.workspace = true
+
+postcard = { workspace = true }
+proc-macro2 = { workspace = true, features = ["span-locations"] }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+syn = { workspace = true, features = ["full"] }
+tokio = { workspace = true, features = ["full"] }
+
+base64 = "0.22"
+cargo_metadata = "0.23"
+clap = { version = "4.6", features = ["derive"] }
+color-eyre = "0.6"
+eyre = "0.6"
+futures-util = "0.3"
+nom = "8.0"
+openssh = "0.11"
+platforms = "3.10"
+rand = "0.10"
+tempfile = "3.27"
+tracing = "0.1"
+tracing-subscriber = "0.3"
+ratatui = { version = "0.30.1", default-features = false, features = ["crossterm"] }
+nucleo-matcher = "0.3.1"
+crossterm = { version = "0.29", features = ["event-stream"] }
+ansi-to-tui = "8.0.1"

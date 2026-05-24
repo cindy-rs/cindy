@@ -1,0 +1,5 @@
+/target
+
+# Nested build dir produced by the e2e-localhost integration test's
+# in-test `cargo build` (kept separate to avoid build-lock contention).
+target-e2e/
