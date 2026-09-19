@@ -54,9 +54,9 @@ pub fn call<T: serde::de::DeserializeOwned>(
 
     async move {
         match rx.await {
-            Ok(RemoteFnResponse::Ok(bytes)) => {
-                postcard::from_bytes(&bytes).expect("Failed to deserialize return value")
-            }
+            Ok(RemoteFnResponse::Ok(bytes)) => postcard::from_bytes(&bytes).unwrap_or_else(|e| {
+                panic!("failed to deserialize return value of `{fn_id}`: {e:?}")
+            }),
             Ok(RemoteFnResponse::Panic(msg)) => panic!("remote task panicked: {msg}"),
             Err(_) => panic!(
                 "RPC connection to the worker closed before `{fn_id}` returned \
@@ -102,10 +102,13 @@ pub async fn rpc(
                         let _ = reader_tx.send(response);
                     }
                     Err(e) => {
+                        // No raw-bytes dump: a response frame can carry a
+                        // revealed secret value, and stderr is forwarded to
+                        // the operator's terminal verbatim. Length only.
                         eprintln!(
                             "RPC framing corruption on the worker channel: {e:?} \
-                             (raw bytes: {:?})",
-                            String::from_utf8_lossy(&buffer)
+                             (frame length: {} bytes)",
+                            buffer.len()
                         );
                         break;
                     }
@@ -124,7 +127,13 @@ pub async fn rpc(
         while let Some(cobs_packet) = writer_rx.recv().await {
             use tokio::io::AsyncWriteExt as _;
 
-            let _ = stdout.write_all(&cobs_packet).await;
+            if let Err(e) = stdout.write_all(&cobs_packet).await {
+                // A broken write pipe means the same dead-worker scenario
+                // the reader side sees as EOF: stop here and let the reader
+                // task's teardown fail the in-flight calls.
+                eprintln!("RPC write error on the worker channel: {e}");
+                break;
+            }
             let _ = stdout.flush().await;
         }
     });
@@ -142,7 +151,9 @@ pub async fn rpc(
 
                     pending_futures.insert(uuid, registration.tx);
                 }
-                // All senders gone — the orchestrator main is over.
+                // Defensive: `ORCHESTRATOR_TX` is a `OnceLock` that is never
+                // reset, so this arm is not expected to fire; if it ever
+                // does, stop rather than spin on a closed channel.
                 None => break,
             },
 
