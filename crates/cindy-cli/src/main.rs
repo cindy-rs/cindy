@@ -882,13 +882,77 @@ async fn compile_orchestrator(workspace_root: &Path) -> eyre::Result<PathBuf> {
     }
 
     let stdout_str = String::from_utf8(output.stdout)?;
-    let exe_path = stdout_str
-        .lines()
-        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
-        .filter_map(|json| json["executable"].as_str().map(PathBuf::from))
-        .next_back()
+    let exe_path = extract_executable(&stdout_str)?
         .context("Failed to extract orchestrator executable path")?;
     Ok(exe_path)
+}
+
+/// Extract the playbook binary's path from `cargo`/`cross` JSON output.
+///
+/// Cargo emits one `compiler-artifact` line per artifact, and anything
+/// carrying an `executable` field includes dependencies' build scripts
+/// (with an *empty* path) plus every `[[bin]]` of the build — emitted in
+/// alphabetical order, so "the last one" silently deploys the wrong
+/// binary whenever a package has several bins (`src/bin/zebra.rs` beats
+/// the package's own). Pin the expected bin via cargo metadata instead:
+/// the root package (as cargo resolves it from this cwd — the same root
+/// the build itself uses) must have exactly one bin target, and only
+/// that bin's artifact line is accepted. Virtual workspaces (no root
+/// package) can't be pinned; there we take the last non-empty bin-kind
+/// artifact, which at least excludes build scripts and libs.
+fn extract_executable(stdout: &str) -> eyre::Result<Option<PathBuf>> {
+    let metadata = cargo_metadata::MetadataCommand::new().exec()?;
+    let expected_name: Option<String> = match metadata.root_package() {
+        Some(pkg) => {
+            let bins: Vec<&str> = pkg
+                .targets
+                .iter()
+                .filter(|t| t.kind.contains(&cargo_metadata::TargetKind::Bin))
+                .map(|t| t.name.as_str())
+                .collect();
+            match bins.as_slice() {
+                [] => None,
+                [one] => Some((*one).to_owned()),
+                many => {
+                    eyre::bail!(
+                        "the playbook package `{}` defines {} bin targets [{}]; cindy \
+                         deploys exactly one — remove the extra [[bin]]s / src/bin/*.rs \
+                         files, or run from the package you want deployed",
+                        pkg.name,
+                        many.len(),
+                        many.join(", ")
+                    );
+                }
+            }
+        }
+        None => None,
+    };
+
+    let mut last = None;
+    for line in stdout.lines() {
+        let Ok(json) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        let Some(exe) = json["executable"].as_str() else {
+            continue;
+        };
+        if exe.is_empty() {
+            continue;
+        }
+        let kind_is_bin = json["target"]["kind"]
+            .as_array()
+            .is_some_and(|k| k.iter().any(|k| k == "bin"));
+        if !kind_is_bin {
+            continue;
+        }
+        if let Some(want) = &expected_name
+            && json["target"]["name"].as_str() != Some(want.as_str())
+        {
+            continue;
+        }
+        last = Some(PathBuf::from(exe));
+    }
+    Ok(last)
 }
 
 #[tracing::instrument(skip_all, fields(triplet = platform.target_triple))]
@@ -959,11 +1023,7 @@ async fn compile_remote_worker(
     // target-dir (mounted into the container at the same path), giving a host
     // path we can actually read.
     let stdout_str = String::from_utf8(output.stdout)?;
-    let exe_name = stdout_str
-        .lines()
-        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
-        .filter_map(|json| json["executable"].as_str().map(PathBuf::from))
-        .next_back()
+    let exe_name = extract_executable(&stdout_str)?
         .context("Failed to extract remote executable path")?
         .file_name()
         .context("remote executable path had no file name")?
