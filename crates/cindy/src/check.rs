@@ -12,8 +12,10 @@
 //! - `command`/`shell` don't execute (their [`Output`](crate::builtin::command::Output)
 //!   marks itself not-run; `exit_ok` passes so plays flow through),
 //!   but a play's *own* `#[remote]` functions still run — cindy can't
-//!   know what user code mutates. Treat a green `--check` as "the
-//!   builtins wouldn't touch anything", not "nothing would happen".
+//!   know what user code mutates. Custom functions that mutate should
+//!   guard themselves with [`dry_run`], reporting the would-change
+//!   instead of applying it; then a green `--check` is trustworthy for
+//!   the whole play.
 //! - `fetch` can't verify a checksum without downloading the body, so
 //!   an existing destination reports `Unchanged` on content it can't
 //!   re-check.

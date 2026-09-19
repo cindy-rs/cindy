@@ -226,6 +226,12 @@ async fn main(host: cindy::Host<Vars>) -> cindy::Result<()> {
     // would-change and apply nothing — the harness asserts the probe
     // file was never created and this process exited 0.
     if std::env::var_os("CINDY_E2E_DRY_RUN").is_some() {
+        // This branch runs in the orchestrator process — the flag must
+        // be installed there too, not only in the worker (which the
+        // builtin assertions below exercise over RPC).
+        if !cindy::dry_run() {
+            cindy::bail!("orchestrator-side dry_run() is false under --check");
+        }
         let (user, group) = builtin::current_owner_names();
         let probe = host.vars.work_dir.join("dry-run-probe.txt");
         let file_return = builtin::path::file(

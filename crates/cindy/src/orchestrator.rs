@@ -81,8 +81,13 @@ pub async fn rpc(
     // `WorkerInbound::Call`.
     // Check mode (`cindy play --check`) reaches the worker through the
     // handshake like the vault keys do: one decision, installed before
-    // any call is dispatched, never argv/env on the target.
+    // any call is dispatched, never argv/env on the target. It is also
+    // installed *here*: builtins invoked in-process on the orchestrator
+    // (`::inner` calls, playbook `main()` code) must honour check mode
+    // just like their RPC-driven worker-side twins — the flag describes
+    // the run, not the process.
     let dry_run = std::env::var_os("CINDY_DRY_RUN").is_some_and(|v| v == "1");
+    crate::check::install(dry_run);
     let handshake = postcard::to_allocvec_cobs(&WorkerInbound::Handshake {
         vault_keys,
         dry_run,
