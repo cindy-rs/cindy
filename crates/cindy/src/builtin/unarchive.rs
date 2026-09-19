@@ -23,6 +23,14 @@ pub struct State {
     pub dest: PathBuf,
     /// Archive format. `None` ⇒ infer from `src`'s extension.
     pub format: Option<Format>,
+    /// Ceiling on the *decompressed* size of a compressed tar
+    /// (`*.tar.gz` etc.), rejected with an error naming this knob.
+    /// Bounds the worker's memory against a crafted archive —
+    /// decompression is multiplication, and the worker holds the
+    /// expanded stream in memory. `None` ⇒
+    /// [`decompress::DEFAULT_MAX_BYTES`](super::decompress::DEFAULT_MAX_BYTES),
+    /// the same default `fetch` applies to what it stages.
+    pub max_bytes: Option<u64>,
 }
 
 /// How an archive entry compares to what's already at the destination.
@@ -227,6 +235,7 @@ pub fn extract(src: impl Into<PathBuf>, dest: impl Into<PathBuf>) -> crate::Resu
         src,
         dest,
         format: None,
+        max_bytes: None,
     })
 }
 
@@ -274,8 +283,13 @@ fn apply(state: State) -> crate::Result<super::Return> {
         Format::Tar(codec) => {
             let raw = std::fs::read(&state.src)
                 .context(format!("Couldn't read {}", state.src.display()))?;
-            let tar_bytes =
-                super::decompress::decompress::inner(raw, codec.unwrap_or(super::Codec::Store))?;
+            let tar_bytes = super::decompress::bounded(
+                raw,
+                codec.unwrap_or(super::Codec::Store),
+                state
+                    .max_bytes
+                    .unwrap_or(super::decompress::DEFAULT_MAX_BYTES),
+            )?;
             let entries = list_tar(&tar_bytes)?;
             establish_dest(&state.dest)?;
             render_summary(&entries, &state.dest);
@@ -331,6 +345,7 @@ mod tests {
             src: archive_path,
             dest: out.clone(),
             format: Some(format),
+            max_bytes: None,
         })
         .unwrap_or_else(|e| panic!("unarchive {format:?} failed: {e}"));
 
@@ -441,6 +456,7 @@ mod tests {
             src: archive_path,
             dest: out.clone(),
             format: Some(format),
+            max_bytes: None,
         })
         .unwrap_or_else(|e| panic!("unarchive {format:?} failed: {e}"));
 
@@ -518,6 +534,7 @@ mod tests {
             src: archive_path,
             dest: dest.clone(),
             format: None,
+            max_bytes: None,
         })
         .unwrap();
 

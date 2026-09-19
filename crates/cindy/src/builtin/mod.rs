@@ -16,7 +16,7 @@ pub mod user;
 /// opposed to [`Format`], which is the archive *container*. The
 /// [`compress`] and [`decompress`] modules operate purely on this, and
 /// [`archive`]/[`unarchive`] reuse them via `compress::compress::inner`
-/// / `decompress::decompress::inner` for the tar-based formats.
+/// / `decompress::bounded` for the tar-based formats.
 ///
 /// Every codec is pure Rust (no C, no FFI): `flate2`/miniz_oxide for
 /// gzip, `lzma-rs` for xz, `ruzstd` for zstd.

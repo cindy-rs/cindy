@@ -61,22 +61,6 @@ for a reason that isn't visible in the code.
 
 ## Priority 1 — correctness bugs
 
-### Decompression has no output ceiling
-
-`crates/cindy/src/builtin/decompress.rs:27` decompresses into an
-unbounded `Vec<u8>`. `unarchive` feeds it whole archives, so a crafted
-`.tar.gz` OOMs the worker. This matters more now than it looks:
-`a9f7208` bounded `fetch`, and `fetch` → `unarchive` is the natural
-pipeline, so the bound I added stops at exactly the wrong place.
-
-**Approach:** a `max_bytes` on the decompress path mirroring
-`fetch::State::max_bytes` (same default, same "reject and name the
-knob" error). A `Read` adapter that errors past N bytes is enough for
-all three codecs.
-
-**Done when:** a test decompresses a small highly-compressible input
-under a low ceiling and gets a named error, not an allocation.
-
 ### The seal/unseal rewriter hardcodes `::cindy::`
 
 `crates/cindy-cli/src/secret.rs:287` emits `::cindy::Secret::sealed_b64`
