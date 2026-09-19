@@ -22,8 +22,6 @@
 //!     .exit_ok()?; // non-zero exit fails the play, with stdout/stderr attached
 //! ```
 
-use std::process::Command;
-
 use crate as cindy;
 use crate::Context;
 
@@ -76,21 +74,44 @@ pub struct State {
     /// Extra environment variables to set for the child process. These
     /// are layered on top of the worker's inherited environment.
     pub env: std::collections::BTreeMap<String, String>,
+    /// Kill the program if it hasn't exited after this long, and fail
+    /// the call. The timeout is *our* intervention, not the program's
+    /// exit behavior, so it surfaces as an error rather than an
+    /// [`Output`]. `None` (the default) waits forever, like a plain
+    /// shell would.
+    pub timeout: Option<std::time::Duration>,
 }
 
 /// Run an already-configured [`Command`] to completion and capture its
-/// [`Output`]. Errors only when the program couldn't be run at all; the
-/// exit status — zero or not — is the caller's data, not our verdict
-/// (see the module docs and [`Output::exit_ok`]).
-fn run(mut cmd: Command, state: &State, label: &str) -> crate::Result<Output> {
+/// [`Output`]. Errors only when the program couldn't be run at all (or
+/// hit [`State::timeout`]); the exit status — zero or not — is the
+/// caller's data, not our verdict (see the module docs and
+/// [`Output::exit_ok`]).
+async fn run(
+    mut cmd: tokio::process::Command,
+    state: &State,
+    label: &str,
+) -> crate::Result<Output> {
     if let Some(dir) = state.chdir.as_ref() {
         cmd.current_dir(dir);
     }
     for (k, v) in &state.env {
         cmd.env(k, v);
     }
+    // A timed-out call drops the in-flight `output()` future; without
+    // this the orphaned child would keep running on the target.
+    cmd.kill_on_drop(true);
 
-    let out = cmd.output().context(format!("Failed to spawn {label}"))?;
+    let out = match state.timeout {
+        None => cmd.output().await,
+        Some(limit) => match tokio::time::timeout(limit, cmd.output()).await {
+            Ok(res) => res,
+            Err(_elapsed) => {
+                crate::bail!("{label} timed out after {limit:?} and was killed")
+            }
+        },
+    }
+    .context(format!("Failed to spawn {label}"))?;
 
     Ok(Output {
         code: out.status.code(),
@@ -109,14 +130,14 @@ fn run(mut cmd: Command, state: &State, label: &str) -> crate::Result<Output> {
 /// `argv` must be non-empty. This module makes no idempotency claim: it
 /// runs every time and reports the raw [`Output`].
 #[crate::remote]
-pub fn command(argv: Vec<String>, state: State) -> crate::Result<Output> {
+pub async fn command(argv: Vec<String>, state: State) -> crate::Result<Output> {
     let Some((program, args)) = argv.split_first() else {
         crate::bail!("`command` requires a non-empty argv (argv[0] is the program)");
     };
 
-    let mut cmd = Command::new(program);
+    let mut cmd = tokio::process::Command::new(program);
     cmd.args(args);
-    run(cmd, &state, &format!("`command` {program:?}"))
+    run(cmd, &state, &format!("`command` {program:?}")).await
 }
 
 /// Run a script through an explicit interpreter.
@@ -132,7 +153,7 @@ pub fn command(argv: Vec<String>, state: State) -> crate::Result<Output> {
 /// the module fails fast otherwise rather than letting the OS produce a
 /// confusing `ENOENT`.
 #[crate::remote]
-pub fn shell(
+pub async fn shell(
     interpreter: std::path::PathBuf,
     script: String,
     state: State,
@@ -151,11 +172,39 @@ pub fn shell(
         );
     }
 
-    let mut cmd = Command::new(&interpreter);
+    let mut cmd = tokio::process::Command::new(&interpreter);
     cmd.arg("-c").arg(&script);
     run(
         cmd,
         &state,
         &format!("`shell` via {}", interpreter.display()),
     )
+    .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn timeout_kills_the_child_and_errors() {
+        let state = State {
+            timeout: Some(std::time::Duration::from_millis(300)),
+            ..State::default()
+        };
+        let err = command::inner(vec!["sleep".into(), "30".into()], state)
+            .await
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("timed out"), "{err:#}");
+    }
+
+    #[tokio::test]
+    async fn no_timeout_still_waits_forever_semantics() {
+        // No timeout configured: a plain quick command behaves exactly
+        // as before the field existed.
+        let out = command::inner(vec!["true".into()], State::default())
+            .await
+            .unwrap();
+        assert_eq!(out.code, Some(0));
+    }
 }
