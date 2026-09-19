@@ -341,12 +341,14 @@ fn apply(state: State) -> crate::Result<super::Return> {
     if satisfied {
         // Content is already right, but owner/mode may have drifted —
         // reconcile those rather than reporting a blanket `Unchanged`.
-        // Check mode can't cheaply know whether the attrs would drift
-        // without applying them, and re-verifying the checksum would
-        // mean downloading the body — the one thing check mode must
-        // not do — so an existing destination reports `Unchanged`.
+        // Check mode asks the same question without applying: the attr
+        // comparison is stat-level (`file_attrs_satisfied`), and the
+        // checksum that established `satisfied` hashed the *local*
+        // file — no download is involved on either side of the
+        // decision, so under-reporting here had no excuse.
         if crate::dry_run() {
-            return Ok(super::Return::Unchanged);
+            let attrs_ok = super::path::file_attrs_satisfied(&state.dest, &user, &group, mode);
+            return Ok(super::Return::from_changed(!attrs_ok));
         }
         return super::path::reconcile_file_attrs(&state.dest, &user, &group, mode);
     }

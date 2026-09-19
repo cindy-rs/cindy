@@ -389,6 +389,20 @@ fn owner_matches(old: &OldState, user: &str, group: &str) -> bool {
     old.user == user && old.group == group
 }
 
+/// The comparison half of [`reconcile_file_attrs`]: would it leave the
+/// file's attributes alone? Pure metadata — no content, no mutation.
+fn attrs_match(old: &OldState, user: &str, group: &str, mode: Mode) -> bool {
+    owner_matches(old, user, group) && old.mode == Some(mode)
+}
+
+/// Would [`reconcile_file_attrs`] report `Unchanged` for this file?
+/// Extracted so check mode can ask the attr-drift question without
+/// applying anything — the answer is stat-level reads (owner names +
+/// mode), never content.
+pub(crate) fn file_attrs_satisfied(path: &Path, user: &str, group: &str, mode: Mode) -> bool {
+    capture_old_state(path).is_ok_and(|old| attrs_match(&old, user, group, mode))
+}
+
 /// `true` when the on-disk file's content equals `want`. Reads the file
 /// here — the one place content is loaded for comparison, and only when
 /// both sides are regular files.
@@ -616,7 +630,7 @@ pub(crate) fn reconcile_file_attrs(
     mode: Mode,
 ) -> crate::Result<super::Return> {
     let old = capture_old_state(path)?;
-    if owner_matches(&old, user, group) && old.mode == Some(mode) {
+    if attrs_match(&old, user, group, mode) {
         return Ok(super::Return::Unchanged);
     }
 
@@ -795,6 +809,34 @@ mod tests {
             .expect("current gid has a group entry")
             .name;
         (user, group)
+    }
+
+    /// The pure predicate behind `reconcile_file_attrs`'s `Unchanged`
+    /// path — and behind fetch's check-mode attr report. Owner drift
+    /// can't be arranged without root, but mode drift can, and absence
+    /// is the other failure shape.
+    #[test]
+    fn file_attrs_satisfied_reads_without_applying() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let (user, group) = current_owner();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let file = tmp.path().join("attr-probe");
+        std::fs::write(&file, b"content").expect("write");
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).expect("chmod");
+
+        // Matching attrs: satisfied.
+        assert!(file_attrs_satisfied(&file, &user, &group, Mode(0o600)));
+        // Mode drift: not satisfied — this is the drift check mode
+        // must not paper over with `Unchanged`.
+        assert!(!file_attrs_satisfied(&file, &user, &group, Mode(0o644)));
+        // Absent: not satisfied.
+        assert!(!file_attrs_satisfied(
+            &tmp.path().join("missing"),
+            &user,
+            &group,
+            Mode(0o600)
+        ));
     }
 
     /// `State` is reconstructed on the worker from the remote-fn args
