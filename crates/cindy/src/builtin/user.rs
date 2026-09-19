@@ -533,6 +533,8 @@ fn reconcile_existing(name: &str, want: &Presence, observed: &Presence) -> crate
 
     if args.is_empty() {
         Ok(false)
+    } else if crate::dry_run() {
+        Ok(true)
     } else {
         let mut cmd = Command::new("usermod");
         cmd.args(&args).args(["--", name]);
@@ -551,39 +553,47 @@ fn apply(state: State) -> crate::Result<super::Return> {
         // Remove an existing account.
         (Presence::Absent { remove_home }, Presence::Present { .. }) => {
             show_diff(&state.name, observed.clone(), state.presence.clone());
-            let mut cmd = Command::new("userdel");
-            if *remove_home {
-                cmd.arg("--remove");
+            if crate::dry_run() {
+                true
+            } else {
+                let mut cmd = Command::new("userdel");
+                if *remove_home {
+                    cmd.arg("--remove");
+                }
+                super::run_check_retry_locks(cmd.args(["--", &state.name]))?;
+                true
             }
-            super::run_check_retry_locks(cmd.args(["--", &state.name]))?;
-            true
         }
 
         // Create a new account: every requested attribute applies.
         (want @ Presence::Present { .. }, Presence::Absent { .. }) => {
             check_system_consistency(&state.name, want, None)?;
             show_diff(&state.name, observed.clone(), want.clone());
-            let mut cmd = Command::new("useradd");
-            cmd.args(useradd_args(want)).args(["--", &state.name]);
-            match super::run_check_retry_locks(&mut cmd) {
-                Ok(()) => true,
-                // A concurrent run created the account between our
-                // observation and our `useradd` — the desired end
-                // state arriving by another hand, not a lock problem
-                // (that path retried already). Re-observe and
-                // reconcile what actually landed; if it is somehow
-                // still gone, the failure was real and is reported
-                // as-is.
-                Err(e) if super::is_create_race(&e) => {
-                    let now = observe(&state.name)?;
-                    match &now {
-                        present @ Presence::Present { .. } => {
-                            reconcile_existing(&state.name, want, present)?
+            if crate::dry_run() {
+                true
+            } else {
+                let mut cmd = Command::new("useradd");
+                cmd.args(useradd_args(want)).args(["--", &state.name]);
+                match super::run_check_retry_locks(&mut cmd) {
+                    Ok(()) => true,
+                    // A concurrent run created the account between our
+                    // observation and our `useradd` — the desired end
+                    // state arriving by another hand, not a lock problem
+                    // (that path retried already). Re-observe and
+                    // reconcile what actually landed; if it is somehow
+                    // still gone, the failure was real and is reported
+                    // as-is.
+                    Err(e) if super::is_create_race(&e) => {
+                        let now = observe(&state.name)?;
+                        match &now {
+                            present @ Presence::Present { .. } => {
+                                reconcile_existing(&state.name, want, present)?
+                            }
+                            _ => return Err(e),
                         }
-                        _ => return Err(e),
                     }
+                    Err(e) => return Err(e),
                 }
-                Err(e) => return Err(e),
             }
         }
 

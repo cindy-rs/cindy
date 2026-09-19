@@ -326,6 +326,42 @@ fn worker_death_fails_fast() {
     );
 }
 
+/// Check mode (`cindy play --check`): the dry-run flag travels the
+/// handshake, builtins report would-changes without applying anything,
+/// and the play still exits 0 — with the probe file it "created" nowhere
+/// on disk and the command it ran marked not-executed.
+#[test]
+fn check_mode_applies_nothing() {
+    let tmp = tempfile::tempdir().expect("create temp dir");
+
+    let host_context = serde_json::json!({
+        "name": "localhost",
+        "tags": ["example:e2e"],
+        "vars": {
+            "work_dir": tmp.path().join("work"),
+            "fetch_url": "http://127.0.0.1/",
+            "fetch_sha256": "",
+        }
+    });
+
+    let status = start_play(
+        tmp.path(),
+        &host_context,
+        &[("CINDY_E2E_DRY_RUN", "1"), ("CINDY_DRY_RUN", "1")],
+        &[],
+    )
+    .wait();
+    assert!(
+        status.success(),
+        "orchestrator exited with failure: {status:?}"
+    );
+
+    assert!(
+        !tmp.path().join("work/dry-run-probe.txt").exists(),
+        "check mode created the probe file it was only supposed to report"
+    );
+}
+
 /// The worker's RPC byte budget must gate dispatch: with the budget
 /// forced to 64 KiB, a fan-out of eight ~40 KiB calls may only run
 /// one at a time. The play's probes observe their own concurrency and

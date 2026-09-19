@@ -583,23 +583,27 @@ async fn apply(state: State) -> crate::Result<super::Return> {
                             "mask: removing admin-authored {kind} {} to complete the mask",
                             unit_path.display()
                         );
-                        if meta.is_dir() {
-                            tokio::fs::remove_dir_all(&unit_path)
-                                .await
-                                .context("Failed to clear conflicting directory at mask target")?;
-                        } else {
-                            tokio::fs::remove_file(&unit_path)
-                                .await
-                                .context("Failed to clear conflicting file at mask target")?;
+                        if !crate::dry_run() {
+                            if meta.is_dir() {
+                                tokio::fs::remove_dir_all(&unit_path).await.context(
+                                    "Failed to clear conflicting directory at mask target",
+                                )?;
+                            } else {
+                                tokio::fs::remove_file(&unit_path)
+                                    .await
+                                    .context("Failed to clear conflicting file at mask target")?;
+                            }
                         }
                     }
 
-                    manager
-                        .mask_unit_files(unit_files, false, true) // Force point to /dev/null
-                        .await
-                        .context(format!("MaskUnitFiles({unit_name}) failed"))?;
+                    if !crate::dry_run() {
+                        manager
+                            .mask_unit_files(unit_files, false, true) // Force point to /dev/null
+                            .await
+                            .context(format!("MaskUnitFiles({unit_name}) failed"))?;
 
-                    manager.reload().await.context("Daemon-reload failed")?;
+                        manager.reload().await.context("Daemon-reload failed")?;
+                    }
                     changed = true;
                 }
             }
@@ -631,21 +635,25 @@ async fn apply(state: State) -> crate::Result<super::Return> {
                     .map(UnitState::needs_disable_call)
                     .unwrap_or(false)
                 {
-                    manager
-                        .disable_unit_files(unit_files, false)
-                        .await
-                        .context(format!("DisableUnitFiles({unit_name}) failed"))?;
+                    if !crate::dry_run() {
+                        manager
+                            .disable_unit_files(unit_files, false)
+                            .await
+                            .context(format!("DisableUnitFiles({unit_name}) failed"))?;
+                    }
                     changed = true;
                 }
             }
             Enablement::Enabled => {
                 if is_masked {
-                    manager
-                        .unmask_unit_files(unit_files.clone(), false)
-                        .await
-                        .context(format!("UnmaskUnitFiles({unit_name}) failed"))?;
+                    if !crate::dry_run() {
+                        manager
+                            .unmask_unit_files(unit_files.clone(), false)
+                            .await
+                            .context(format!("UnmaskUnitFiles({unit_name}) failed"))?;
+                        current_file_state = read_file_state(&manager, &unit_name).await?;
+                    }
                     changed = true;
-                    current_file_state = read_file_state(&manager, &unit_name).await?;
                 }
                 if current_file_state == Some(UnitState::Bad) {
                     rollback_mask(&manager, &unit_files, initial_unit_state).await;
@@ -667,10 +675,12 @@ async fn apply(state: State) -> crate::Result<super::Return> {
                     .map(UnitState::needs_enable_call)
                     .unwrap_or(true)
                 {
-                    manager
-                        .enable_unit_files(unit_files, false, true) // Pass force=true to clear stale overrides
-                        .await
-                        .context(format!("EnableUnitFiles({unit_name}) failed"))?;
+                    if !crate::dry_run() {
+                        manager
+                            .enable_unit_files(unit_files, false, true) // Pass force=true to clear stale overrides
+                            .await
+                            .context(format!("EnableUnitFiles({unit_name}) failed"))?;
+                    }
                     changed = true;
                 }
             }
@@ -684,6 +694,18 @@ async fn apply(state: State) -> crate::Result<super::Return> {
             initial_active_state
         };
         let is_running = active.map(ActiveState::is_running).unwrap_or(false);
+
+        // Check mode: decide whether a job would be queued without
+        // subscribing or driving anything.
+        if crate::dry_run() {
+            changed |= match runtime_action {
+                RuntimeAction::Started => !is_running,
+                RuntimeAction::Stopped => is_running,
+                // Restart/reload act unconditionally.
+                RuntimeAction::Restarted | RuntimeAction::Reloaded => true,
+            };
+            return Ok(super::Return::from_changed(changed));
+        }
 
         // Subscribe before queueing the job (see `wait_job`).
         let mut jobs = manager

@@ -79,8 +79,15 @@ pub async fn rpc(
     // its vault keys over the (SSH-protected) pipe so the key material
     // never lands in the target's argv/env. Everything after this is a
     // `WorkerInbound::Call`.
-    let handshake = postcard::to_allocvec_cobs(&WorkerInbound::Handshake { vault_keys })
-        .expect("Failed to serialize handshake");
+    // Check mode (`cindy play --check`) reaches the worker through the
+    // handshake like the vault keys do: one decision, installed before
+    // any call is dispatched, never argv/env on the target.
+    let dry_run = std::env::var_os("CINDY_DRY_RUN").is_some_and(|v| v == "1");
+    let handshake = postcard::to_allocvec_cobs(&WorkerInbound::Handshake {
+        vault_keys,
+        dry_run,
+    })
+    .expect("Failed to serialize handshake");
     let _ = writer_tx.send(handshake);
 
     let mut pending_futures: HashMap<Uuid, oneshot::Sender<RemoteFnResponse>> = HashMap::new();

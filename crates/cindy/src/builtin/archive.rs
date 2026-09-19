@@ -265,6 +265,13 @@ fn apply(state: State) -> crate::Result<super::Return> {
         Format::SevenZ => build_7z(&state.sources)?,
     };
 
+    // Check mode: building the bytes is pure computation, but whether
+    // the destination would change is `path::file`'s comparison, which
+    // needs the bytes. Report the conservative `Changed`.
+    if crate::dry_run() {
+        return Ok(super::Return::Changed);
+    }
+
     // Materialise the archive via the `path` module: it owns the
     // on-disk state-transition logic (replacing an existing file, dir,
     // or symlink at `dest`) and emits the diff.

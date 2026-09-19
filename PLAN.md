@@ -81,15 +81,6 @@ ignore warnings.
 Bigger pieces. Each is worth its own discussion before implementation;
 don't start one without checking it's still wanted.
 
-### `--check` / dry-run
-
-The largest missing feature versus Ansible, and the one that gets more
-expensive to add the longer it waits. The machinery is mostly there:
-every builtin already computes desired-vs-live and renders a diff before
-acting. Thread a `dry_run` flag through `WorkerInbound::Handshake` into a
-worker-global, and have each `apply` return after the diff. Doing this
-before more builtins land is much cheaper than after.
-
 ### `--forks` and `--serial`
 
 `crates/cindy-cli/src/main.rs:459` fans out discovery with
@@ -171,10 +162,3 @@ backpressure and streaming fetch. Untested: the vault-key handshake
 reaching a worker-side `reveal()`, preflight failure on a missing key,
 `--limit` end to end, and concurrent builtin invocation — which is where
 the shadow-utils race above lives, so that item and this one pair well.
-
-## Needs a decision
-
-Ask the human; don't pick for them.
-
-1. **Is `--check` wanted for 0.4?** It's the item whose cost grows
-   fastest with delay.

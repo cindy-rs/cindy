@@ -220,6 +220,35 @@ async fn main(host: cindy::Host<Vars>) -> cindy::Result<()> {
         return Ok(());
     }
 
+    // Check-mode scenario (see tests/e2e.rs): the harness runs the
+    // orchestrator with CINDY_DRY_RUN=1, which reaches the worker
+    // through the RPC handshake. Every builtin below must report a
+    // would-change and apply nothing — the harness asserts the probe
+    // file was never created and this process exited 0.
+    if std::env::var_os("CINDY_E2E_DRY_RUN").is_some() {
+        let (user, group) = builtin::current_owner_names();
+        let probe = host.vars.work_dir.join("dry-run-probe.txt");
+        let file_return = builtin::path::file(
+            probe.clone(),
+            b"must not exist after the run".to_vec(),
+            &user,
+            &group,
+            builtin::path::Mode::try_from(0o644)?,
+        )
+        .await?;
+        if !file_return.changed() {
+            cindy::bail!("path::file reported Unchanged for a missing file under --check");
+        }
+        let out =
+            builtin::command::command(vec!["true".into()], builtin::command::State::default())
+                .await?;
+        if !out.dry_run {
+            cindy::bail!("command executed under --check: the worker never got the flag");
+        }
+        out.exit_ok()?;
+        return Ok(());
+    }
+
     let work = &host.vars.work_dir;
 
     // --- path: directory, file, symlink -------------------------------

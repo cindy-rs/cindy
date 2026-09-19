@@ -68,6 +68,17 @@ Then run it against any slice of your fleet:
 cindy play --limit prague
 ```
 
+Preview what a run would change without applying anything:
+
+```sh
+cindy play --check
+```
+
+Every builtin renders its diff and reports `Changed` for what it *would*
+have applied; `command`/`shell` don't execute. Your own `#[remote]`
+functions still run — cindy can't know what user code mutates, so treat
+a green `--check` as "the builtins wouldn't touch anything".
+
 Full documentation lives at [cindy.rs](https://cindy.rs).
 
 ## Security model

@@ -341,7 +341,20 @@ fn apply(state: State) -> crate::Result<super::Return> {
     if satisfied {
         // Content is already right, but owner/mode may have drifted —
         // reconcile those rather than reporting a blanket `Unchanged`.
+        // Check mode can't cheaply know whether the attrs would drift
+        // without applying them, and re-verifying the checksum would
+        // mean downloading the body — the one thing check mode must
+        // not do — so an existing destination reports `Unchanged`.
+        if crate::dry_run() {
+            return Ok(super::Return::Unchanged);
+        }
         return super::path::reconcile_file_attrs(&state.dest, &user, &group, mode);
+    }
+
+    // Check mode: the destination is missing or stale, so the fetch
+    // would change it — report that without transferring anything.
+    if crate::dry_run() {
+        return Ok(super::Return::Changed);
     }
 
     // Resolve the owner before the transfer, so a typo'd user fails in a

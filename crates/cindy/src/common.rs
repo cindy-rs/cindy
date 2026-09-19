@@ -21,9 +21,12 @@ pub struct RemoteFnPayload {
 #[crate::wire]
 pub enum WorkerInbound {
     /// Sent once, first: the `{vault: raw-key-bytes}` map the worker
-    /// installs into its keychain before serving any calls.
+    /// installs into its keychain before serving any calls, plus the
+    /// check-mode decision (`cindy play --check`) installed before any
+    /// call is dispatched.
     Handshake {
         vault_keys: std::collections::HashMap<String, Vec<u8>>,
+        dry_run: bool,
     },
     /// A remote-function invocation.
     Call(RemoteFnPayload),

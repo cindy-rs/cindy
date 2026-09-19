@@ -53,6 +53,13 @@ enum Subcommand {
         limit: Option<String>,
         #[clap(long)]
         unprivileged: bool,
+        /// Check mode: build everything, connect everywhere, render
+        /// every diff — but apply nothing. Builtins report what they
+        /// *would* change; `command`/`shell` don't execute; custom
+        /// `#[remote]` functions still run (cindy can't know what user
+        /// code mutates).
+        #[clap(long)]
+        check: bool,
     },
     Inventory {
         #[clap(long)]
@@ -327,11 +334,12 @@ async fn run_after_launch(
         }
     }
 
-    let (limit, unprivileged) = match subcommand {
+    let (limit, unprivileged, check_mode) = match subcommand {
         Subcommand::Play {
             limit,
             unprivileged,
-        } => (limit, unprivileged),
+            check,
+        } => (limit, unprivileged, check),
         Subcommand::Inventory { host, json, reveal } => {
             if json {
                 // Pick the JSON source: the secrets-decrypted whole
@@ -572,6 +580,12 @@ async fn run_after_launch(
     let host_contexts = Arc::new(host_contexts);
     let host_vault_keys = Arc::new(host_vault_keys);
 
+    if check_mode {
+        tracing::warn!(
+            "check mode: builtins will report without applying; command/shell will not              execute; custom #[remote] functions still run"
+        );
+    }
+
     let deployment_futures = discovered_hosts.into_iter().enumerate().map(|(idx, host)| {
         let orch_path = Arc::clone(&orchestrator_path);
         let worker_binaries = Arc::clone(&worker_binaries);
@@ -677,7 +691,8 @@ async fn run_after_launch(
                 orchestrator_cmd
                     .kill_on_drop(true)
                     .env("CINDY_HOST_CONTEXT_FILE", context_file.path())
-                    .env("CINDY_VAULT_KEYS", &vault_keys_json);
+                    .env("CINDY_VAULT_KEYS", &vault_keys_json)
+                    .env("CINDY_DRY_RUN", if check_mode { "1" } else { "0" });
                 let mut orchestrator_run = orchestrator_cmd
                     .stdin(std::process::Stdio::piped())
                     .stdout(std::process::Stdio::piped())

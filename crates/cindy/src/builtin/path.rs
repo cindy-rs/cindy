@@ -657,6 +657,9 @@ fn apply(state: State) -> crate::Result<super::Return> {
         let ft = md.file_type();
         if !ft.is_file() && !ft.is_dir() && !ft.is_symlink() {
             eprintln!("removing special file {}", state.destination.display());
+            if crate::dry_run() {
+                return Ok(super::Return::Changed);
+            }
             std::fs::remove_file(&state.destination).context(format!(
                 "Couldn't remove special file {}",
                 state.destination.display()
@@ -678,6 +681,13 @@ fn apply(state: State) -> crate::Result<super::Return> {
         kind: old.to_kind(&state.destination),
     };
     let _ = <State as crate::Diff>::diff(&old_view, &state, &mut std::io::stderr().lock());
+
+    // Check mode: the diff above is the report. `state_matches` has
+    // already returned `Unchanged` for converged requests, so anything
+    // reaching here would have been applied — say so and stop.
+    if crate::dry_run() {
+        return Ok(super::Return::Changed);
+    }
 
     match &state.kind {
         Kind::Absent => {

@@ -291,18 +291,30 @@ fn apply(state: State) -> crate::Result<super::Return> {
                     .unwrap_or(super::decompress::DEFAULT_MAX_BYTES),
             )?;
             let entries = list_tar(&tar_bytes)?;
+            if crate::dry_run() {
+                render_summary(&entries, &state.dest);
+                return Ok(super::Return::Changed);
+            }
             establish_dest(&state.dest)?;
             render_summary(&entries, &state.dest);
             extract_tar(&tar_bytes, &state.dest)?;
         }
         Format::Zip => {
             let entries = list_zip(&state.src)?;
+            if crate::dry_run() {
+                render_summary(&entries, &state.dest);
+                return Ok(super::Return::Changed);
+            }
             establish_dest(&state.dest)?;
             render_summary(&entries, &state.dest);
             extract_zip(&state.src, &state.dest)?;
         }
         Format::SevenZ => {
             let entries = list_7z(&state.src)?;
+            if crate::dry_run() {
+                render_summary(&entries, &state.dest);
+                return Ok(super::Return::Changed);
+            }
             establish_dest(&state.dest)?;
             render_summary(&entries, &state.dest);
             extract_7z(&state.src, &state.dest)?;

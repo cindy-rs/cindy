@@ -244,12 +244,14 @@ fn reconcile_existing(name: &str, want: &Presence, observed: &Presence) -> crate
                     system: Some(*w <= sys_gid_max()),
                 },
             );
-            super::run_check_retry_locks(Command::new("groupmod").args([
-                "--gid",
-                &w.to_string(),
-                "--",
-                name,
-            ]))?;
+            if !crate::dry_run() {
+                super::run_check_retry_locks(Command::new("groupmod").args([
+                    "--gid",
+                    &w.to_string(),
+                    "--",
+                    name,
+                ]))?;
+            }
             Ok(true)
         }
         _ => Ok(false),
@@ -266,7 +268,9 @@ fn apply(state: State) -> crate::Result<super::Return> {
         // Want absent, currently present → delete.
         (Presence::Absent, present @ Presence::Present { .. }) => {
             show_diff(&state.name, present.clone(), Presence::Absent);
-            super::run_check_retry_locks(Command::new("groupdel").args(["--", &state.name]))?;
+            if !crate::dry_run() {
+                super::run_check_retry_locks(Command::new("groupdel").args(["--", &state.name]))?;
+            }
             true
         }
 
@@ -274,32 +278,36 @@ fn apply(state: State) -> crate::Result<super::Return> {
         (want @ Presence::Present { gid, system }, Presence::Absent) => {
             check_system_consistency(&state.name, want, None)?;
             show_diff(&state.name, Presence::Absent, want.clone());
-            let mut cmd = Command::new("groupadd");
-            if *system == Some(true) {
-                cmd.arg("--system");
-            }
-            if let Some(gid) = gid {
-                cmd.args(["--gid", &gid.to_string()]);
-            }
-            match super::run_check_retry_locks(cmd.args(["--", &state.name])) {
-                Ok(()) => true,
-                // A concurrent run created the group between our
-                // observation and our `groupadd` — the desired end
-                // state arriving by another hand, not a lock problem
-                // (that path retried already). Re-observe and
-                // reconcile what actually landed; if it is somehow
-                // still gone, the failure was real and is reported
-                // as-is.
-                Err(e) if super::is_create_race(&e) => {
-                    let now = observe(&state.name)?;
-                    match &now {
-                        present @ Presence::Present { .. } => {
-                            reconcile_existing(&state.name, want, present)?
-                        }
-                        _ => return Err(e),
-                    }
+            if crate::dry_run() {
+                true
+            } else {
+                let mut cmd = Command::new("groupadd");
+                if *system == Some(true) {
+                    cmd.arg("--system");
                 }
-                Err(e) => return Err(e),
+                if let Some(gid) = gid {
+                    cmd.args(["--gid", &gid.to_string()]);
+                }
+                match super::run_check_retry_locks(cmd.args(["--", &state.name])) {
+                    Ok(()) => true,
+                    // A concurrent run created the group between our
+                    // observation and our `groupadd` — the desired end
+                    // state arriving by another hand, not a lock problem
+                    // (that path retried already). Re-observe and
+                    // reconcile what actually landed; if it is somehow
+                    // still gone, the failure was real and is reported
+                    // as-is.
+                    Err(e) if super::is_create_race(&e) => {
+                        let now = observe(&state.name)?;
+                        match &now {
+                            present @ Presence::Present { .. } => {
+                                reconcile_existing(&state.name, want, present)?
+                            }
+                            _ => return Err(e),
+                        }
+                    }
+                    Err(e) => return Err(e),
+                }
             }
         }
 

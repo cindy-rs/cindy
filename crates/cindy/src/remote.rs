@@ -188,7 +188,11 @@ pub async fn rpc(rpc_in: tokio::fs::File, rpc_out: tokio::fs::File) {
                         // before any `Call` is dispatched, so a missing key fails
                         // here rather than mid-play. The keys arrive over the
                         // (SSH-protected) pipe, never via argv/env.
-                        Ok(WorkerInbound::Handshake { vault_keys }) => {
+                        Ok(WorkerInbound::Handshake {
+                            vault_keys,
+                            dry_run,
+                        }) => {
+                            crate::check::install(dry_run);
                             if let Err(e) = crate::secret::keychain::install_raw_keys(vault_keys)
                                 .and_then(|()| worker_vault_preflight())
                             {

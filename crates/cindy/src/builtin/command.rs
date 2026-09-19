@@ -14,7 +14,11 @@
 //! Consistent with that, a **non-zero exit is not an error** — it's
 //! data, reported in [`Output::code`]. Only failing to run the program
 //! at all errors. When "non-zero should fail the play" is what you
-//! mean, say so with [`Output::exit_ok`]:
+//! mean, say so with [`Output::exit_ok`]. One exception: under
+//! `cindy play --check` the program is not executed at all — the
+//! returned [`Output`] marks itself [`dry_run`](Output::dry_run) with
+//! empty streams, and `exit_ok` passes so plays flow through check
+//! mode (logic that reads `stdout` sees the absence).
 //!
 //! ```ignore
 //! command(vec!["systemctl".into(), "reload".into(), "nginx".into()], <_>::default())
@@ -26,9 +30,10 @@ use crate::Context;
 
 /// Captured result of the executed process.
 ///
-/// Returned for both [`command`] and [`shell`]. The program always ran
-/// (these modules never skip), so there is no "changed" flag — just the
-/// observable result for you to act on.
+/// Returned for both [`command`] and [`shell`]. Outside check mode the
+/// program always ran, so there is no "changed" flag — just the
+/// observable result for you to act on. Under check mode nothing ran
+/// and [`dry_run`](Output::dry_run) is set.
 #[derive(Clone, PartialEq, Eq)]
 #[crate::wire]
 pub struct Output {
@@ -39,12 +44,17 @@ pub struct Output {
     pub stdout: String,
     /// Captured standard error.
     pub stderr: String,
+    /// True when check mode suppressed the execution: `code` is `None`
+    /// and the streams carry a not-executed note. `exit_ok` passes so
+    /// plays flow through `--check`, but logic reading `stdout` sees
+    /// the absence.
+    pub dry_run: bool,
 }
 
 impl Output {
     /// `true` if the program exited successfully (`code == 0`).
     pub fn success(&self) -> bool {
-        self.code == Some(0)
+        self.dry_run || self.code == Some(0)
     }
 
     /// Turn a non-zero (or signal-terminated) exit into an error
@@ -101,6 +111,20 @@ async fn run(
     // this the orphaned child would keep running on the target.
     cmd.kill_on_drop(true);
 
+    // Check mode never executes the program: running it *is* the
+    // mutation, and there is no desired state to compare against.
+    // Report the absence honestly and loudly.
+    if crate::dry_run() {
+        let note = format!("[dry-run] {label} not executed");
+        eprintln!("{note}");
+        return Ok(Output {
+            code: None,
+            stdout: String::new(),
+            stderr: note,
+            dry_run: true,
+        });
+    }
+
     let out = match state.timeout {
         None => cmd.output().await,
         Some(limit) => match tokio::time::timeout(limit, cmd.output()).await {
@@ -116,6 +140,7 @@ async fn run(
         code: out.status.code(),
         stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
         stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+        dry_run: false,
     })
 }
 

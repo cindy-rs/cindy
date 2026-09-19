@@ -22,10 +22,12 @@ pub mod __reexports {
 }
 
 pub mod builtin;
+pub mod check;
 pub mod diff;
 
 pub use cindy_macros::{action, inventory, main, remote, wire};
 
+pub use check::dry_run;
 pub use diff::Diff;
 pub use inventory::{Host, Inventory};
 pub use secret::Secret;

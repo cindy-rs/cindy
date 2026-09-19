@@ -635,6 +635,15 @@ fn apply(state: State) -> crate::Result<crate::builtin::Return> {
 
     let plan = plan_holds(&state, &current, &unsatisfied);
 
+    // Check mode: the plan above is read-only analysis; report what it
+    // would do without driving apt.
+    if crate::dry_run() {
+        let would = !plan.release.is_empty()
+            || !unsatisfied.is_empty()
+            || (plan.finalise.is_some() && state.hold.is_some());
+        return Ok(crate::builtin::Return::from_changed(would));
+    }
+
     // Step 1: release the holds that stand in the way.
     if !plan.release.is_empty() {
         run_check_retry_locks(apt_mark("unhold", &plan.release).as_mut())?;
