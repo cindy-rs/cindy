@@ -69,6 +69,7 @@ enum Subcommand {
 }
 
 #[derive(Debug, Parser)]
+#[command(version)]
 struct Args {
     #[command(subcommand)]
     subcommand: Subcommand,
@@ -92,9 +93,20 @@ async fn forward_stderr(
     source: progress::Source,
 ) {
     let mut line = String::new();
-    while reader.read_line(&mut line).await.unwrap_or(0) > 0 {
-        let _ = tx.send(progress::Msg::Line(idx, source, line.trim_end().to_owned()));
-        line.clear();
+    loop {
+        match reader.read_line(&mut line).await {
+            Ok(0) => break,
+            Ok(_) => {
+                let _ = tx.send(progress::Msg::Line(idx, source, line.trim_end().to_owned()));
+                line.clear();
+            }
+            Err(e) => {
+                // A read error usually just means the child died mid-line;
+                // its exit status carries the real story.
+                tracing::debug!(error = %e, "stderr forwarder read failed");
+                break;
+            }
+        }
     }
 }
 
@@ -269,7 +281,11 @@ async fn main() -> eyre::Result<()> {
             Ok(())
         }
         Err(e) if e.downcast_ref::<RunFailed>().is_some() => {
-            eprintln!("\x1b[31m{e}\x1b[0m");
+            if std::io::stderr().is_terminal() {
+                eprintln!("\x1b[31m{e}\x1b[0m");
+            } else {
+                eprintln!("{e}");
+            }
             std::process::exit(1);
         }
         Err(e) => Err(e),
@@ -297,6 +313,21 @@ async fn run_after_launch(
         debug,
         json_revealed,
     } = get_inventory(&orchestrator_exe_path, reveal_secrets).await?;
+
+    // Host names key the per-host context and vault-key maps and address
+    // `--host`; a duplicate would silently run one host's play twice and
+    // the other's never. Fail loudly at the source instead.
+    {
+        let mut seen = HashSet::new();
+        for host in &inventory.hosts {
+            if !seen.insert(host.name.as_str()) {
+                eyre::bail!(
+                    "duplicate host name `{}` in the inventory — host names must be unique",
+                    host.name
+                );
+            }
+        }
+    }
 
     let (limit, unprivileged) = match subcommand {
         Subcommand::Play {
@@ -840,6 +871,16 @@ async fn compile_orchestrator(workspace_root: &Path) -> eyre::Result<PathBuf> {
         eyre::bail!("{}", String::from_utf8_lossy(&output.stderr))
     }
 
+    // On success cargo's stderr still carries the warnings — with
+    // `--message-format=json` they don't go anywhere the user would see
+    // them. Forward them to the log so a playbook full of deprecations
+    // isn't silent.
+    for line in String::from_utf8_lossy(&output.stderr).lines() {
+        if !line.trim().is_empty() {
+            tracing::info!("cargo: {line}");
+        }
+    }
+
     let stdout_str = String::from_utf8(output.stdout)?;
     let exe_path = stdout_str
         .lines()
@@ -906,6 +947,11 @@ async fn compile_remote_worker(
     let output = cmd.output().await?;
     if !output.status.success() {
         eyre::bail!("{}", String::from_utf8_lossy(&output.stderr))
+    }
+    for line in String::from_utf8_lossy(&output.stderr).lines() {
+        if !line.trim().is_empty() {
+            tracing::info!("cross: {line}");
+        }
     }
     // `cross` runs cargo inside a container, so the `executable` it reports is
     // a container path that may not exist on the host. We only trust it for

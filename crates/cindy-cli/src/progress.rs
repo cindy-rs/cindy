@@ -41,6 +41,11 @@ const LIST_PCT: u16 = 30;
 /// Advanced by the render tick, so a busy host visibly *moves*.
 const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
+/// Per-host retained output lines. A chatty host streaming for hours
+/// would otherwise grow the pane (and its per-frame re-render) without
+/// bound; the oldest lines are evicted past this point.
+const MAX_LINES: usize = 10_000;
+
 /// Compact human-readable duration: `9.3s` under a minute, `4m07s` beyond.
 fn fmt_duration(d: std::time::Duration) -> String {
     let secs = d.as_secs();
@@ -141,6 +146,9 @@ struct Host {
     tags: Vec<String>,
     status: Status,
     lines: Vec<(Source, String)>,
+    /// Lines evicted from `lines` once it hit [`MAX_LINES`]; the output
+    /// title reports `dropped + lines.len()` so the count stays truthful.
+    dropped: usize,
     /// When the host appeared in the view (its deployment started).
     started: std::time::Instant,
     /// Total runtime, frozen at the moment a terminal status arrived.
@@ -159,6 +167,15 @@ impl Host {
         self.status = status;
         if status != Status::Running && self.elapsed.is_none() {
             self.elapsed = Some(self.started.elapsed());
+        }
+    }
+
+    fn push_line(&mut self, src: Source, line: String) {
+        self.lines.push((src, line));
+        let excess = self.lines.len().saturating_sub(MAX_LINES);
+        if excess > 0 {
+            self.lines.drain(..excess);
+            self.dropped += excess;
         }
     }
 }
@@ -220,6 +237,7 @@ fn add_host(hosts: &mut Vec<Host>, name: String, tags: Vec<String>) {
         tags,
         status: Status::Running,
         lines: Vec::new(),
+        dropped: 0,
         started: std::time::Instant::now(),
         elapsed: None,
     });
@@ -227,19 +245,22 @@ fn add_host(hosts: &mut Vec<Host>, name: String, tags: Vec<String>) {
 
 /// Non-interactive fallback: prefix every line with its host and print it.
 /// The loop ends on its own when every sender is dropped (all hosts done).
+/// This path only runs when stderr is not a tty, so it emits no ANSI of
+/// its own and strips escape codes from child output — raw escapes in a
+/// piped log/CI capture are noise.
 async fn stream(mut rx: tokio::sync::mpsc::UnboundedReceiver<Msg>) {
     let mut hosts: Vec<Host> = Vec::new();
     while let Some(msg) = rx.recv().await {
         match msg {
             Msg::AddHost { name, tags } => add_host(&mut hosts, name, tags),
             Msg::Line(idx, _src, line) => {
-                eprintln!("\x1b[36m[{}]\x1b[0m {}", hosts[idx].name, line);
+                eprintln!("[{}] {}", hosts[idx].name, strip_ansi(&line));
             }
             Msg::Status(idx, status) => {
                 hosts[idx].status = status;
                 let label = match status {
-                    Status::Finished => "\x1b[32mfinished\x1b[0m",
-                    Status::Failed => "\x1b[31mfailed\x1b[0m",
+                    Status::Finished => "finished",
+                    Status::Failed => "failed",
                     Status::Running => continue,
                 };
                 eprintln!("[{}] {label}", hosts[idx].name);
@@ -248,6 +269,25 @@ async fn stream(mut rx: tokio::sync::mpsc::UnboundedReceiver<Msg>) {
             // ends when the senders drop right after this message.
             Msg::Shutdown => break,
         }
+    }
+}
+
+/// Render a possibly-ANSI-styled string back to plain text.
+fn strip_ansi(s: &str) -> String {
+    use ansi_to_tui::IntoText as _;
+    match s.into_text() {
+        Ok(text) => text
+            .lines
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|sp| sp.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
+        Err(_) => s.to_owned(),
     }
 }
 
@@ -441,7 +481,7 @@ async fn tui_loop(
                 match msg {
                     Some(Msg::AddHost { name, tags }) => add_host(hosts, name, tags),
                     Some(Msg::Line(idx, src, line)) => {
-                        hosts[idx].lines.push((src, line));
+                        hosts[idx].push_line(src, line);
                         // When scrolled back into history (vert > 0), pin the
                         // view to the same absolute lines as new output arrives
                         // — only the tail (vert == 0) follows new output.
@@ -716,7 +756,11 @@ fn draw_output(
             let mut spans = vec![
                 Span::raw(" "),
                 Span::styled(format!("{glyph} "), Style::default().fg(h.status.color())),
-                Span::raw(format!("{} · {total} lines", h.name)),
+                Span::raw(format!(
+                    "{} · {} lines",
+                    h.name,
+                    h.dropped + h.lines.len()
+                )),
             ];
             if scroll.vert > 0 {
                 spans.push(Span::styled(
@@ -761,6 +805,7 @@ mod tests {
             tags: vec!["env:test".into()],
             status: Status::Running,
             lines: vec![(Source::Worker, "hello".into())],
+            dropped: 0,
             started: std::time::Instant::now(),
             elapsed: None,
         };
@@ -838,5 +883,25 @@ mod tests {
         let hosts = vec![host("web-01", Status::Finished)];
         let screen = render(&hosts);
         assert!(screen.contains("✓ web-01 · 1 lines"), "{screen}");
+    }
+
+    #[test]
+    fn output_history_is_capped_but_count_stays_truthful() {
+        let mut h = host("chatty", Status::Running);
+        h.lines.clear();
+        for i in 0..(MAX_LINES + 500) {
+            h.push_line(Source::Worker, format!("line {i}"));
+        }
+        assert_eq!(h.lines.len(), MAX_LINES);
+        assert_eq!(h.dropped, 500);
+        assert_eq!(h.lines[0].1, "line 500");
+        let screen = render(&[h]);
+        assert!(screen.contains(&format!("chatty · {} lines", MAX_LINES + 500)), "{screen}");
+    }
+
+    #[test]
+    fn strip_ansi_removes_escape_codes() {
+        assert_eq!(strip_ansi("\x1b[31mfailed\x1b[0m"), "failed");
+        assert_eq!(strip_ansi("plain"), "plain");
     }
 }
