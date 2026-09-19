@@ -82,6 +82,160 @@ fn start_http_server() -> String {
     format!("http://{addr}/")
 }
 
+/// Like [`start_http_server`] but sends **no** `Content-Length`, so the
+/// body is delimited only by the connection close.
+///
+/// That's the case `max_bytes` has to police mid-stream: with no
+/// declared length there is nothing to reject up front, so the limit can
+/// only be enforced as the bytes actually arrive.
+fn start_http_server_unsized() -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind localhost");
+    let addr = listener.local_addr().expect("local addr");
+
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            let mut buf = [0u8; 1024];
+            let _ = stream.read(&mut buf);
+            let _ = stream
+                .write_all(b"HTTP/1.0 200 OK\r\nContent-Type: application/octet-stream\r\n\r\n");
+            let _ = stream.write_all(FETCH_BODY);
+            let _ = stream.flush();
+            // Dropping the stream closes the connection, which is what
+            // terminates the body for the client.
+        }
+    });
+
+    format!("http://{addr}/")
+}
+
+/// A wired-up orchestrator/worker pair, plumbed exactly the way
+/// `cindy play` does it.
+struct Play {
+    orchestrator: std::process::Child,
+    worker: std::process::Child,
+    pumps: Vec<std::thread::JoinHandle<()>>,
+    /// Kept alive deliberately: the orchestrator reads the host context
+    /// from this path at startup, so unlinking it early is a race.
+    _context_file: tempfile::NamedTempFile,
+}
+
+/// Build both halves, hand the host context over by temp file (as the
+/// CLI does), and cross the pipes: orchestrator stdout → worker stdin,
+/// worker stdout → orchestrator stdin.
+///
+/// The scenarios below differ only in their host context and the env var
+/// that selects a branch of the playbook, so they share this driver
+/// instead of each repeating the plumbing.
+fn start_play(
+    tmp: &Path,
+    host_context: &serde_json::Value,
+    orchestrator_env: &[(&str, &str)],
+    worker_env: &[(&str, &str)],
+) -> Play {
+    let orchestrator_bin = build_variant("orchestrator");
+    let remote_bin_src = build_variant("remote");
+
+    // The remote worker deletes its own executable on startup (it's
+    // designed to be an uploaded throwaway). Copy it to a temp path so
+    // the cached build artifact survives for re-runs.
+    let remote_bin = tmp.join("remote-worker");
+    std::fs::copy(&remote_bin_src, &remote_bin).expect("copy remote worker");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mut perms = std::fs::metadata(&remote_bin).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&remote_bin, perms).unwrap();
+    }
+
+    let mut worker_cmd = Command::new(&remote_bin);
+    worker_cmd
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit());
+    for (k, v) in worker_env {
+        worker_cmd.env(k, v);
+    }
+    let mut worker = worker_cmd.spawn().expect("spawn remote worker");
+
+    let context_file = tempfile::NamedTempFile::new().expect("create context file");
+    std::fs::write(context_file.path(), host_context.to_string()).expect("write host context");
+
+    let mut orch_cmd = Command::new(&orchestrator_bin);
+    orch_cmd
+        .env("CINDY_HOST_CONTEXT_FILE", context_file.path())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit());
+    for (k, v) in orchestrator_env {
+        orch_cmd.env(k, v);
+    }
+    let mut orchestrator = orch_cmd.spawn().expect("spawn orchestrator");
+
+    let mut o_out = orchestrator.stdout.take().unwrap();
+    let mut r_in = worker.stdin.take().unwrap();
+    let mut r_out = worker.stdout.take().unwrap();
+    let mut o_in = orchestrator.stdin.take().unwrap();
+
+    let pumps = vec![
+        std::thread::spawn(move || {
+            let _ = std::io::copy(&mut o_out, &mut r_in);
+            // Closing the worker's stdin signals end-of-requests so its
+            // RPC read loop terminates.
+            drop(r_in);
+        }),
+        std::thread::spawn(move || {
+            let _ = std::io::copy(&mut r_out, &mut o_in);
+            drop(o_in);
+        }),
+    ];
+
+    Play {
+        orchestrator,
+        worker,
+        pumps,
+        _context_file: context_file,
+    }
+}
+
+impl Play {
+    /// Wait for the orchestrator — it drives the play and holds the
+    /// authoritative exit code — then let the worker EOF out.
+    fn wait(mut self) -> std::process::ExitStatus {
+        let status = self.orchestrator.wait().expect("wait orchestrator");
+        for pump in std::mem::take(&mut self.pumps) {
+            let _ = pump.join();
+        }
+        let _ = self.worker.wait();
+        status
+    }
+
+    /// Kill the worker outright, simulating a host that drops mid-call.
+    fn kill_worker(&mut self) {
+        self.worker.kill().expect("kill remote worker");
+    }
+
+    /// Poll for the orchestrator's exit, asserting it happens within
+    /// `deadline` of now rather than hanging the suite.
+    fn wait_orchestrator_within(
+        &mut self,
+        deadline: std::time::Duration,
+    ) -> std::process::ExitStatus {
+        let start = std::time::Instant::now();
+        loop {
+            if let Some(status) = self.orchestrator.try_wait().expect("try_wait orchestrator") {
+                return status;
+            }
+            assert!(
+                start.elapsed() < deadline,
+                "orchestrator still running {deadline:?} after the worker died — RPC hang regression"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+    }
+}
+
 #[test]
 fn e2e_localhost_play() {
     let tmp = tempfile::tempdir().expect("create temp dir");
@@ -105,70 +259,7 @@ fn e2e_localhost_play() {
         }
     });
 
-    // --- build both sides --------------------------------------------
-    let orchestrator_bin = build_variant("orchestrator");
-    let remote_bin_src = build_variant("remote");
-
-    // The remote worker deletes its own executable on startup (it's
-    // designed to be an uploaded throwaway). Copy it to a temp path so
-    // the cached build artifact survives for re-runs.
-    let remote_bin = tmp.path().join("remote-worker");
-    std::fs::copy(&remote_bin_src, &remote_bin).expect("copy remote worker");
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        let mut perms = std::fs::metadata(&remote_bin).unwrap().permissions();
-        perms.set_mode(0o755);
-        std::fs::set_permissions(&remote_bin, perms).unwrap();
-    }
-
-    // --- spawn both processes ----------------------------------------
-    let mut remote = Command::new(&remote_bin)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::inherit())
-        .spawn()
-        .expect("spawn remote worker");
-
-    // Hand the context over the same way the CLI does: a temp file,
-    // with the env var pointing at its path.
-    let context_file = tempfile::NamedTempFile::new().expect("create context file");
-    std::fs::write(context_file.path(), host_context.to_string()).expect("write host context");
-
-    let mut orchestrator = Command::new(&orchestrator_bin)
-        .env("CINDY_HOST_CONTEXT_FILE", context_file.path())
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::inherit())
-        .spawn()
-        .expect("spawn orchestrator");
-
-    // --- cross-pipe: orch stdout -> remote stdin, remote stdout -> orch stdin
-    let mut o_out = orchestrator.stdout.take().unwrap();
-    let mut r_in = remote.stdin.take().unwrap();
-    let mut r_out = remote.stdout.take().unwrap();
-    let mut o_in = orchestrator.stdin.take().unwrap();
-
-    let pump_o_to_r = std::thread::spawn(move || {
-        let _ = std::io::copy(&mut o_out, &mut r_in);
-        // Closing the remote's stdin signals end-of-requests so its RPC
-        // read loop terminates.
-        drop(r_in);
-    });
-    let pump_r_to_o = std::thread::spawn(move || {
-        let _ = std::io::copy(&mut r_out, &mut o_in);
-        drop(o_in);
-    });
-
-    // --- wait for the orchestrator (it drives the play) --------------
-    let orch_status = orchestrator.wait().expect("wait orchestrator");
-
-    // The remote loops until its stdin closes; once the orchestrator is
-    // done, the pump threads finish and the remote exits.
-    let _ = pump_o_to_r.join();
-    let _ = pump_r_to_o.join();
-    let _ = remote.wait();
-
+    let orch_status = start_play(tmp.path(), &host_context, &[], &[]).wait();
     assert!(
         orch_status.success(),
         "orchestrator exited with failure: {orch_status:?}"
@@ -220,77 +311,19 @@ fn worker_death_fails_fast() {
         }
     });
 
-    let orchestrator_bin = build_variant("orchestrator");
-    let remote_bin_src = build_variant("remote");
-    let remote_bin = tmp.path().join("remote-worker");
-    std::fs::copy(&remote_bin_src, &remote_bin).expect("copy remote worker");
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        let mut perms = std::fs::metadata(&remote_bin).unwrap().permissions();
-        perms.set_mode(0o755);
-        std::fs::set_permissions(&remote_bin, perms).unwrap();
-    }
-
-    let mut remote = Command::new(&remote_bin)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::inherit())
-        .spawn()
-        .expect("spawn remote worker");
-
-    // Hand the context over the same way the CLI does: a temp file,
-    // with the env var pointing at its path.
-    let context_file = tempfile::NamedTempFile::new().expect("create context file");
-    std::fs::write(context_file.path(), host_context.to_string()).expect("write host context");
-
-    let mut orchestrator = Command::new(&orchestrator_bin)
-        .env("CINDY_HOST_CONTEXT_FILE", context_file.path())
-        .env("CINDY_E2E_SLEEP", "1")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::inherit())
-        .spawn()
-        .expect("spawn orchestrator");
-
-    let mut o_out = orchestrator.stdout.take().unwrap();
-    let mut r_in = remote.stdin.take().unwrap();
-    let mut r_out = remote.stdout.take().unwrap();
-    let mut o_in = orchestrator.stdin.take().unwrap();
-
-    std::thread::spawn(move || {
-        let _ = std::io::copy(&mut o_out, &mut r_in);
-        drop(r_in);
-    });
-    std::thread::spawn(move || {
-        let _ = std::io::copy(&mut r_out, &mut o_in);
-        drop(o_in);
-    });
+    let mut play = start_play(tmp.path(), &host_context, &[("CINDY_E2E_SLEEP", "1")], &[]);
 
     // Give the `sleep 30` call time to dispatch, then kill the worker.
     std::thread::sleep(std::time::Duration::from_secs(2));
-    remote.kill().expect("kill remote worker");
-    let killed_at = std::time::Instant::now();
+    play.kill_worker();
 
     // The orchestrator must now exit non-zero on its own, well before
     // the 30s the remote call would have taken.
-    let deadline = std::time::Duration::from_secs(15);
-    let status = loop {
-        if let Some(status) = orchestrator.try_wait().expect("try_wait orchestrator") {
-            break status;
-        }
-        assert!(
-            killed_at.elapsed() < deadline,
-            "orchestrator still running {deadline:?} after the worker died — RPC hang regression"
-        );
-        std::thread::sleep(std::time::Duration::from_millis(100));
-    };
-
+    let status = play.wait_orchestrator_within(std::time::Duration::from_secs(15));
     assert!(
         !status.success(),
         "orchestrator reported success although the worker died mid-call"
     );
-    let _ = remote.wait();
 }
 
 /// The worker's RPC byte budget must gate dispatch: with the budget
@@ -312,62 +345,74 @@ fn backpressure_serialises_oversized_fanout() {
         }
     });
 
-    let orchestrator_bin = build_variant("orchestrator");
-    let remote_bin_src = build_variant("remote");
-    let remote_bin = tmp.path().join("remote-worker");
-    std::fs::copy(&remote_bin_src, &remote_bin).expect("copy remote worker");
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        let mut perms = std::fs::metadata(&remote_bin).unwrap().permissions();
-        perms.set_mode(0o755);
-        std::fs::set_permissions(&remote_bin, perms).unwrap();
-    }
-
-    let mut remote = Command::new(&remote_bin)
-        .env("CINDY_RPC_BUDGET", "65536")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::inherit())
-        .spawn()
-        .expect("spawn remote worker");
-
-    // Hand the context over the same way the CLI does: a temp file,
-    // with the env var pointing at its path.
-    let context_file = tempfile::NamedTempFile::new().expect("create context file");
-    std::fs::write(context_file.path(), host_context.to_string()).expect("write host context");
-
-    let mut orchestrator = Command::new(&orchestrator_bin)
-        .env("CINDY_HOST_CONTEXT_FILE", context_file.path())
-        .env("CINDY_E2E_BUDGET", "1")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::inherit())
-        .spawn()
-        .expect("spawn orchestrator");
-
-    let mut o_out = orchestrator.stdout.take().unwrap();
-    let mut r_in = remote.stdin.take().unwrap();
-    let mut r_out = remote.stdout.take().unwrap();
-    let mut o_in = orchestrator.stdin.take().unwrap();
-
-    let pump_o_to_r = std::thread::spawn(move || {
-        let _ = std::io::copy(&mut o_out, &mut r_in);
-        drop(r_in);
-    });
-    let pump_r_to_o = std::thread::spawn(move || {
-        let _ = std::io::copy(&mut r_out, &mut o_in);
-        drop(o_in);
-    });
-
-    let orch_status = orchestrator.wait().expect("wait orchestrator");
-    let _ = pump_o_to_r.join();
-    let _ = pump_r_to_o.join();
-    let _ = remote.wait();
+    let orch_status = start_play(
+        tmp.path(),
+        &host_context,
+        &[("CINDY_E2E_BUDGET", "1")],
+        &[("CINDY_RPC_BUDGET", "65536")],
+    )
+    .wait();
 
     assert!(
         orch_status.success(),
         "orchestrator exited with failure: {orch_status:?} — the byte budget \
          failed to serialise an oversized fan-out"
     );
+}
+
+/// `fetch` streams its body instead of buffering it, which puts three
+/// promises on the line: an over-sized body is refused (declared length
+/// or not), a failed checksum leaves the destination untouched because
+/// verification happens before the atomic publish, and an
+/// already-satisfied destination is never re-downloaded. The play
+/// asserts all of them from the inside (see `CINDY_E2E_FETCH_LIMITS` in
+/// src/main.rs) and fails the run if any breaks; here we re-check the
+/// filesystem independently.
+#[test]
+fn fetch_streams_within_its_limits() {
+    let tmp = tempfile::tempdir().expect("create temp dir");
+    let work_dir = tmp.path().join("work");
+
+    let host_context = serde_json::json!({
+        "name": "localhost",
+        "tags": ["example:e2e"],
+        "vars": {
+            "work_dir": work_dir,
+            "fetch_url": start_http_server(),
+            "fetch_sha256": hex(&sha2::Sha256::digest(FETCH_BODY)),
+            "fetch_url_unsized": start_http_server_unsized(),
+        }
+    });
+
+    let orch_status = start_play(
+        tmp.path(),
+        &host_context,
+        &[("CINDY_E2E_FETCH_LIMITS", "1")],
+        &[],
+    )
+    .wait();
+    assert!(
+        orch_status.success(),
+        "orchestrator exited with failure: {orch_status:?} — a streaming-fetch \
+         guarantee broke (see its stderr above)"
+    );
+
+    // Nothing an over-limit or failed-checksum fetch touched may exist.
+    for rejected in ["over-declared.bin", "over-streamed.bin", "bad-checksum.bin"] {
+        assert!(
+            !work_dir.join(rejected).exists(),
+            "{rejected} was published despite the fetch being rejected"
+        );
+    }
+
+    // The good one landed, byte-exact, with the mode the second (skipped)
+    // fetch reconciled.
+    let good = work_dir.join("streamed.bin");
+    assert_eq!(std::fs::read(&good).unwrap(), FETCH_BODY);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mode = std::fs::metadata(&good).unwrap().permissions().mode() & 0o7777;
+        assert_eq!(mode, 0o644, "drifted mode was not reconciled");
+    }
 }

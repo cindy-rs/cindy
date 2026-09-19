@@ -5,6 +5,12 @@ pub struct Vars {
     work_dir: PathBuf,
     fetch_url: String,
     fetch_sha256: String,
+    /// Same body as `fetch_url`, served without a `Content-Length` — the
+    /// only shape in which `max_bytes` has to bite mid-stream rather
+    /// than off the declared length. Defaulted so the scenarios that
+    /// don't exercise fetch can leave it out of their host context.
+    #[serde(default)]
+    fetch_url_unsized: String,
     /// Bulk payload holder: the e2e test stuffs >128 KiB into it to
     /// prove the host-context hand-off survives contexts too large
     /// for a single env var (kernel `MAX_ARG_STRLEN`).
@@ -25,6 +31,7 @@ fn inventory() -> cindy::Inventory<Vars> {
                 work_dir: std::env::temp_dir().join("cindy-e2e"),
                 fetch_url: "http://127.0.0.1/".into(),
                 fetch_sha256: String::new(),
+                fetch_url_unsized: "http://127.0.0.1/".into(),
                 padding: String::new(),
             },
         }],
@@ -87,6 +94,129 @@ async fn main(host: cindy::Host<Vars>) -> cindy::Result<()> {
                 );
             }
         }
+        return Ok(());
+    }
+
+    // Streaming-fetch regression scenario (see tests/e2e.rs). `fetch`
+    // no longer buffers a body in RAM, which puts three promises on the
+    // line: an over-sized body is refused (whether or not the server
+    // declares a length), a failed checksum leaves the destination
+    // untouched because verification happens before the publish, and an
+    // already-satisfied destination is *not* re-downloaded.
+    if std::env::var_os("CINDY_E2E_FETCH_LIMITS").is_some() {
+        use builtin::fetch;
+
+        let work = &host.vars.work_dir;
+        let (user, group) = builtin::current_owner_names();
+        builtin::path::directory(
+            work.clone(),
+            &user,
+            &group,
+            builtin::path::Mode::try_from(0o755)?,
+        )
+        .await?;
+
+        // A body over the limit, rejected off the declared
+        // Content-Length before any transfer starts.
+        let declared = work.join("over-declared.bin");
+        if fetch::fetch(fetch::State {
+            url: host.vars.fetch_url.clone(),
+            dest: declared.clone(),
+            max_bytes: Some(4),
+            ..Default::default()
+        })
+        .await
+        .is_ok()
+        {
+            cindy::bail!("fetch accepted a body whose Content-Length exceeded max_bytes");
+        }
+        if declared.exists() {
+            cindy::bail!(
+                "rejected oversized fetch left {} behind",
+                declared.display()
+            );
+        }
+
+        // The same, with no declared length — the limit has to be
+        // enforced as the bytes arrive.
+        let streamed = work.join("over-streamed.bin");
+        if fetch::fetch(fetch::State {
+            url: host.vars.fetch_url_unsized.clone(),
+            dest: streamed.clone(),
+            max_bytes: Some(4),
+            ..Default::default()
+        })
+        .await
+        .is_ok()
+        {
+            cindy::bail!("fetch accepted an undeclared body that exceeded max_bytes");
+        }
+        if streamed.exists() {
+            cindy::bail!(
+                "rejected oversized stream left {} behind",
+                streamed.display()
+            );
+        }
+
+        // A checksum mismatch must not publish: the bytes are staged in
+        // a temp file and only renamed once the digest agrees.
+        let bad_sum = work.join("bad-checksum.bin");
+        if fetch::fetch(fetch::State {
+            url: host.vars.fetch_url.clone(),
+            dest: bad_sum.clone(),
+            checksum: Some(fetch::Checksum::Sha256("0".repeat(64))),
+            ..Default::default()
+        })
+        .await
+        .is_ok()
+        {
+            cindy::bail!("fetch accepted a body that failed its checksum");
+        }
+        if bad_sum.exists() {
+            cindy::bail!(
+                "failed-checksum fetch published {} anyway",
+                bad_sum.display()
+            );
+        }
+
+        // A good fetch lands the bytes…
+        let good = work.join("streamed.bin");
+        if !fetch::fetch(fetch::State {
+            url: host.vars.fetch_url.clone(),
+            dest: good.clone(),
+            checksum: Some(fetch::Checksum::Sha256(host.vars.fetch_sha256.clone())),
+            mode: Some(builtin::path::Mode::try_from(0o644)?),
+            ..Default::default()
+        })
+        .await?
+        .changed()
+        {
+            cindy::bail!("first fetch of {} reported Unchanged", good.display());
+        }
+
+        // …and a re-run whose content is already satisfied must repair
+        // drifted permissions *without* transferring anything. Pointing
+        // it at a refused port is the proof: if it re-downloaded, this
+        // call would fail instead of fixing the mode.
+        builtin::command::command(
+            vec!["chmod".into(), "600".into(), good.display().to_string()],
+            builtin::command::State::default(),
+        )
+        .await?
+        .exit_ok()?;
+        if !fetch::fetch(fetch::State {
+            url: "http://127.0.0.1:1/unreachable".into(),
+            dest: good.clone(),
+            checksum: Some(fetch::Checksum::Sha256(host.vars.fetch_sha256.clone())),
+            mode: Some(builtin::path::Mode::try_from(0o644)?),
+            ..Default::default()
+        })
+        .await?
+        .changed()
+        {
+            cindy::bail!("mode drift on a satisfied destination was not reported as Changed");
+        }
+
         return Ok(());
     }
 

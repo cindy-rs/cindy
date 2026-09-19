@@ -72,6 +72,19 @@ pub fn text_diff(old: &str, new: &str, out: &mut dyn Write) -> io::Result<()> {
     Ok(())
 }
 
+/// Write a one-line note about work that has no structural diff to show
+/// — an action taken (`restart`, `reload`), an attribute reconciled
+/// without touching content — so it is still visible in the play's
+/// output instead of passing silently.
+///
+/// Styled like a hunk header and honouring `NO_COLOR` exactly as
+/// [`text_diff`] does, so every line a builtin emits comes out in one
+/// voice rather than each module rolling its own escape codes.
+pub fn note(out: &mut dyn Write, body: &str) -> io::Result<()> {
+    let style = Style::detect();
+    write_styled_line(out, style.header, body, style.reset)
+}
+
 fn write_styled_line(out: &mut dyn Write, color: &str, body: &str, reset: &str) -> io::Result<()> {
     let body = body.strip_suffix('\n').unwrap_or(body);
     if color.is_empty() {

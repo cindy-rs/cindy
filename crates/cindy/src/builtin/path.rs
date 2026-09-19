@@ -15,7 +15,6 @@
 
 use crate::Context;
 
-use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -451,6 +450,20 @@ fn resolve_gid(name: &str) -> crate::Result<nix::unistd::Gid> {
     }
 }
 
+/// Resolve a `user`:`group` name pair to numeric ids, erroring on either
+/// miss.
+///
+/// Exposed in-crate so callers that don't go through [`apply`] (e.g.
+/// [`fetch`](super::fetch)) resolve the owner up front — a typo'd user
+/// must fail the call before anything destructive or expensive happens,
+/// not after.
+pub(crate) fn resolve_owner(
+    user: &str,
+    group: &str,
+) -> crate::Result<(nix::unistd::Uid, nix::unistd::Gid)> {
+    Ok((resolve_uid(user)?, resolve_gid(group)?))
+}
+
 /// fsync the directory containing `path` so a preceding `rename(2)`
 /// (the file write's atomic publish) survives power-loss. The file's
 /// own data was already fsynced before the rename; this makes the
@@ -464,38 +477,165 @@ fn fsync_parent(path: &Path) -> crate::Result<()> {
         .context(format!("Couldn't fsync directory {}", dir.display()))
 }
 
-/// Apply ownership + mode to a freshly created directory **without
-/// following symlinks**, closing the TOCTOU window where the directory
-/// could be swapped for a symlink between create and chmod/chown.
+/// Apply ownership + mode to an **existing** path without following
+/// symlinks, closing the TOCTOU window where the target could be
+/// swapped for a symlink between the observation and the chown/chmod.
 ///
-/// Opens the path with `O_NOFOLLOW | O_DIRECTORY` (so a symlink swap
-/// makes the open fail, never operates on the link's target) and uses
-/// `fchown`/`fchmod` on that fd.
-fn apply_dir_attrs(
+/// Opens with `O_NOFOLLOW` (plus `O_DIRECTORY` when `expect_dir`), so a
+/// symlink swap makes the *open* fail instead of silently redirecting
+/// the operation onto the link's target, then acts on that fd with
+/// `fchown`/`fchmod`.
+fn apply_attrs_nofollow(
     path: &Path,
     uid: nix::unistd::Uid,
     gid: nix::unistd::Gid,
     mode: Mode,
+    expect_dir: bool,
 ) -> crate::Result<()> {
     use nix::fcntl::{OFlag, open};
     use nix::sys::stat::{Mode as NixMode, fchmod};
 
-    let fd = open(
-        path,
-        OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_RDONLY | OFlag::O_CLOEXEC,
-        NixMode::empty(),
-    )
-    .context(format!(
-        "Couldn't open directory {} (O_NOFOLLOW) to set attributes",
+    let mut flags = OFlag::O_NOFOLLOW | OFlag::O_RDONLY | OFlag::O_CLOEXEC;
+    if expect_dir {
+        flags |= OFlag::O_DIRECTORY;
+    }
+
+    let fd = open(path, flags, NixMode::empty()).context(format!(
+        "Couldn't open {} (O_NOFOLLOW) to set attributes",
         path.display()
     ))?;
 
     nix::unistd::fchown(&fd, Some(uid), Some(gid))
-        .context("Couldn't change ownership of the directory")?;
-
-    let bits = NixMode::from_bits_truncate(mode.0);
-    fchmod(&fd, bits).context("Couldn't set permissions of the directory")?;
+        .context(format!("Couldn't change ownership of {}", path.display()))?;
+    fchmod(&fd, NixMode::from_bits_truncate(mode.0))
+        .context(format!("Couldn't set permissions of {}", path.display()))?;
     Ok(())
+}
+
+/// A fully written, correctly owned temp file waiting to be renamed over
+/// its destination.
+///
+/// Splitting the write from the rename is what lets a caller check the
+/// bytes it just streamed — a digest it could only compute *while*
+/// streaming — before anything becomes visible at the destination. Drop
+/// it instead of calling [`Staged::publish`] and the temp file is
+/// unlinked, leaving the destination exactly as it was.
+pub(crate) struct Staged {
+    tmp: tempfile::NamedTempFile,
+    destination: PathBuf,
+    written: u64,
+}
+
+impl Staged {
+    /// Bytes written into the staged file.
+    pub(crate) fn written(&self) -> u64 {
+        self.written
+    }
+
+    /// Rename the staged file over its destination, and make the rename
+    /// itself durable.
+    pub(crate) fn publish(self) -> crate::Result<()> {
+        self.tmp
+            .persist(&self.destination)
+            .context("Couldn't persist the temporary file")?;
+        fsync_parent(&self.destination)
+    }
+}
+
+/// Stream `reader` into a temp file alongside `destination`, owned by
+/// `uid`:`gid` at `mode`, ready to be published.
+///
+/// The content never has to exist in memory all at once, which is what
+/// lets [`fetch`](super::fetch) handle an artefact larger than the
+/// target's RAM. The temp file starts at `0o000` and takes its ownership
+/// and mode through its own *file descriptor*, so it appears at
+/// `destination` already correct — there is no window where it is
+/// visible with the wrong attributes, and no path-based `chown`/`chmod`
+/// for anything to race.
+pub(crate) fn stage_stream(
+    destination: &Path,
+    reader: &mut dyn std::io::Read,
+    uid: nix::unistd::Uid,
+    gid: nix::unistd::Gid,
+    mode: Mode,
+) -> crate::Result<Staged> {
+    let parent_raw = destination
+        .parent()
+        .context("Parent directory unavailable")?;
+    let parent = if parent_raw.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        parent_raw
+    };
+
+    let mut tmp = tempfile::Builder::new()
+        .permissions(Mode(0o0000).into())
+        .prefix(".cindy.")
+        .tempfile_in(parent)
+        .context("Couldn't create temporary file")?;
+
+    let written = std::io::copy(reader, &mut tmp).context("Couldn't write the temporary file")?;
+
+    nix::unistd::fchown(tmp.as_file(), Some(uid), Some(gid))
+        .context("Couldn't change ownership of the temporary file")?;
+    nix::sys::stat::fchmod(
+        tmp.as_file(),
+        nix::sys::stat::Mode::from_bits_truncate(mode.0),
+    )
+    .context("Couldn't set permissions of the temporary file")?;
+
+    // Flush the data *and* the attribute change before the rename:
+    // otherwise a crash after rename(2) but before write-back can leave
+    // a zero-length or partial file at `destination`. `persist` does not
+    // fsync for us.
+    tmp.as_file()
+        .sync_all()
+        .context("Couldn't fsync the temporary file before rename")?;
+
+    Ok(Staged {
+        tmp,
+        destination: destination.to_path_buf(),
+        written,
+    })
+}
+
+/// Reconcile only ownership and mode on the regular file at `path`,
+/// leaving its content alone.
+///
+/// For builtins that establish content by other means — [`fetch`]
+/// streams it, and can't hand the bytes to [`apply`] without buffering
+/// the whole artefact — but still want this module's total owner/mode
+/// guarantee. Reports `Unchanged` when both already match, so a
+/// satisfied download doesn't claim work it didn't do.
+///
+/// [`fetch`]: super::fetch
+pub(crate) fn reconcile_file_attrs(
+    path: &Path,
+    user: &str,
+    group: &str,
+    mode: Mode,
+) -> crate::Result<super::Return> {
+    let old = capture_old_state(path)?;
+    if owner_matches(&old, user, group) && old.mode == Some(mode) {
+        return Ok(super::Return::Unchanged);
+    }
+
+    let (uid, gid) = resolve_owner(user, group)?;
+    // A one-line note rather than a `State` diff: rendering the `File`
+    // variant would mean reading the content this function exists to
+    // avoid loading.
+    let _ = crate::diff::note(
+        &mut std::io::stderr().lock(),
+        &format!(
+            "~ {} {user}:{group} {mode} (was {}:{} {})",
+            path.display(),
+            old.user,
+            old.group,
+            old.mode.map_or_else(|| "?".to_owned(), |m| m.to_string()),
+        ),
+    );
+    apply_attrs_nofollow(path, uid, gid, mode, false)?;
+    Ok(super::Return::Changed)
 }
 
 /// Apply a fully-specified `State` to the destination on the worker.
@@ -550,66 +690,34 @@ fn apply(state: State) -> crate::Result<super::Return> {
             group,
             mode,
         } => {
-            let new_uid = resolve_uid(user)?;
-            let new_gid = resolve_gid(group)?;
+            // Resolve the owner before anything destructive: a typo'd
+            // user must fail the call, not leave the directory cleared
+            // below already gone.
+            let (new_uid, new_gid) = resolve_owner(user, group)?;
 
-            // `tempfile::persist`'s rename(2) replaces an existing file
+            // `Staged::publish`'s rename(2) replaces an existing file
             // or symlink atomically. The one thing rename can't replace
             // is a directory, so pre-clear that case.
             if matches!(old.kind, ObservedKind::Directory) {
                 remove_existing(&state.destination, &old.kind)?;
             }
 
-            let parent_raw = state
-                .destination
-                .parent()
-                .context("Parent directory unavailable")?;
-            let parent = if parent_raw.as_os_str().is_empty() {
-                Path::new(".")
-            } else {
-                parent_raw
-            };
-
-            let mut tmp_file = tempfile::Builder::new()
-                .permissions(Mode(0o0000).into())
-                .prefix(".cindy.")
-                .tempfile_in(parent)
-                .context("Couldn't create temporary file")?;
-
-            tmp_file
-                .write_all(content)
-                .context("Couldn't write to temporary file")?;
-
-            // Flush data before the atomic rename. Otherwise a crash
-            // after rename(2) but before write-back can leave a
-            // zero-length/partial file at `destination`. `persist` does
-            // not fsync for us.
-            tmp_file
-                .as_file()
-                .sync_all()
-                .context("Couldn't fsync the temporary file before rename")?;
-
-            // Ownership/mode are applied to the temp file (by path, but
-            // it's our private O_… temp in the dest dir) before the
-            // rename, so the file appears at `destination` already
-            // owning the right uid/gid and mode — no window where it's
-            // visible with the wrong attributes.
-            nix::unistd::chown(tmp_file.path(), Some(new_uid), Some(new_gid))
-                .context("Couldn't change ownership of the temporary file")?;
-            std::fs::set_permissions(tmp_file.path(), (*mode).into())
-                .context("Couldn't set permissions of the temporary file")?;
-
-            tmp_file
-                .persist(&state.destination)
-                .context("Couldn't persist the temporary file")?;
-
-            // Make the rename itself durable.
-            fsync_parent(&state.destination)?;
+            // The in-memory content is just a reader here, so the write,
+            // the fd-based attribute application, the fsyncs and the
+            // atomic publish are shared verbatim with the streaming
+            // callers (see `stage_stream`).
+            stage_stream(
+                &state.destination,
+                &mut &content[..],
+                new_uid,
+                new_gid,
+                *mode,
+            )?
+            .publish()?;
         }
 
         Kind::Directory { user, group, mode } => {
-            let new_uid = resolve_uid(user)?;
-            let new_gid = resolve_gid(group)?;
+            let (new_uid, new_gid) = resolve_owner(user, group)?;
 
             match old.kind {
                 ObservedKind::Directory => {
@@ -627,7 +735,7 @@ fn apply(state: State) -> crate::Result<super::Return> {
             // Apply ownership/mode via an O_NOFOLLOW fd so a symlink
             // swap between the create above and now can't redirect the
             // chown/chmod onto an attacker-chosen target.
-            apply_dir_attrs(&state.destination, new_uid, new_gid, *mode)?;
+            apply_attrs_nofollow(&state.destination, new_uid, new_gid, *mode, true)?;
         }
 
         Kind::Link {
@@ -635,8 +743,7 @@ fn apply(state: State) -> crate::Result<super::Return> {
             user,
             group,
         } => {
-            let new_uid = resolve_uid(user)?;
-            let new_gid = resolve_gid(group)?;
+            let (new_uid, new_gid) = resolve_owner(user, group)?;
 
             if !matches!(old.kind, ObservedKind::Absent) {
                 remove_existing(&state.destination, &old.kind)?;

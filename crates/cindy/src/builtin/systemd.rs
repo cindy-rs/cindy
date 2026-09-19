@@ -447,19 +447,13 @@ pub async fn disable_and_stop(name: impl Into<String>) -> crate::Result<super::R
 /// Print a one-line note for an *action* that has no state delta to diff.
 ///
 /// `restart`/`reload` leave a running unit running, so the structural
-/// `State` diff renders nothing even though work happened. This makes that
-/// work visible. Written to stderr — the same stream the diff uses — and
-/// honours `NO_COLOR` like [`crate::diff::text_diff`].
+/// `State` diff renders nothing even though work happened. This makes
+/// that work visible, on the same stream and in the same style as every
+/// other builtin's output.
 fn print_action(unit_name: &str, verb: &str) {
-    use std::io::Write as _;
-    let (color, reset) = if std::env::var_os("NO_COLOR").is_some_and(|v| !v.is_empty()) {
-        ("", "")
-    } else {
-        ("\x1b[36;1m", "\x1b[0m") // bold cyan, matching diff hunk headers
-    };
-    let _ = writeln!(
-        std::io::stderr().lock(),
-        "{color}~ {unit_name} {verb}{reset}",
+    let _ = crate::diff::note(
+        &mut std::io::stderr().lock(),
+        &format!("~ {unit_name} {verb}"),
     );
 }
 
