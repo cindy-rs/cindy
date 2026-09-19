@@ -35,19 +35,33 @@ const DEFAULT_KEYS_DIR: &str = "keys";
 static KEYCHAIN: Mutex<Option<HashMap<String, VaultKey>>> = Mutex::new(None);
 
 fn cache_get(vault: &str) -> Option<VaultKey> {
-    KEYCHAIN.lock().ok()?.as_ref()?.get(vault).cloned()
+    lock().as_ref()?.get(vault).cloned()
 }
 
 fn cache_put(vault: String, key: VaultKey) {
-    let mut guard = KEYCHAIN.lock().expect("keychain mutex poisoned");
+    let mut guard = lock();
     guard.get_or_insert_with(HashMap::new).insert(vault, key);
+}
+
+/// Take the keychain lock, recovering it from poisoning.
+///
+/// The lock is only ever held across whole-map operations that can't
+/// leave the map half-updated, so a panic in some other thread while
+/// holding it leaves perfectly usable data behind. Recovering keeps
+/// all three accessors consistent (the old mix silently fell back to
+/// a disk read on `cache_get` while `cache_put`/`install_keys`
+/// panicked — a poisoned lock surfaced three different ways).
+fn lock() -> std::sync::MutexGuard<'static, Option<HashMap<String, VaultKey>>> {
+    KEYCHAIN
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 /// Bulk-install vault keys into the in-memory keychain. Used on the worker
 /// side, where we get the keys in pre-decoded form from the
 /// orchestrator through an env var.
 pub fn install_keys(map: HashMap<String, VaultKey>) {
-    let mut guard = KEYCHAIN.lock().expect("keychain mutex poisoned");
+    let mut guard = lock();
     let chain = guard.get_or_insert_with(HashMap::new);
     for (k, v) in map {
         chain.insert(k, v);
@@ -130,23 +144,31 @@ pub fn vault_key_path(vault: &str) -> crate::Result<PathBuf> {
 }
 
 fn read_key_file(path: &Path) -> crate::Result<Option<VaultKey>> {
-    let bytes = match std::fs::read(path) {
+    use zeroize::Zeroize as _;
+
+    let mut bytes = match std::fs::read(path) {
         Ok(b) => b,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(e).context(format!("Reading {}", path.display())),
     };
     if bytes.len() != VAULT_KEY_LEN {
+        let len = bytes.len();
+        bytes.zeroize();
         crate::bail!(
             "{} has the wrong size ({} bytes, expected {VAULT_KEY_LEN}). \
              Either it isn't a cindy vault key file, or it got truncated. \
              Delete it and re-run `cindy secret vault create <name>` \
              (or restore it from wherever you have a backup).",
             path.display(),
-            bytes.len()
+            len
         );
     }
     let mut arr = [0u8; VAULT_KEY_LEN];
     arr.copy_from_slice(&bytes);
+    // The intermediate Vec held raw key material; wipe it like
+    // `install_raw_keys` wipes its own, rather than dropping it for
+    // the allocator to hand to whoever asks next.
+    bytes.zeroize();
     Ok(Some(zeroize::Zeroizing::new(arr)))
 }
 

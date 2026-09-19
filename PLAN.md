@@ -63,25 +63,6 @@ for a reason that isn't visible in the code.
 
 ## Priority 2 — robustness and consistency
 
-### Unbounded TUI log buffer
-
-`crates/cindy-cli/src/progress.rs:64` — `log_buffer()` is a
-`Mutex<Vec<String>>` that never evicts. `5ea6f0c` capped per-host output
-at `MAX_LINES` (`:47`) but missed this one, so a long play grows it
-without bound. Also `lock().unwrap()` inside a `Write` impl: one poisoned
-lock and every subsequent log write panics.
-
-**Approach:** same cap and eviction as the host panes; swallow poisoning
-rather than panicking in a logging path.
-
-### Key material left unzeroized, and inconsistent poison handling
-
-`crates/cindy/src/secret/keychain.rs:132` — `read_key_file` reads a key
-into a plain `Vec<u8>` and drops it unzeroized, while `install_raw_keys`
-carefully zeroizes the equivalent buffer. And `cache_get` (`:37`)
-swallows mutex poisoning by silently falling back to a disk read, where
-`cache_put` (`:41`) panics on it. Pick one and apply it to both.
-
 ### `apt-get` on pre-2.1.10 apt
 
 Decided: **buster is not a target** — the fleet is VyOS 1.3+ (apt ≥

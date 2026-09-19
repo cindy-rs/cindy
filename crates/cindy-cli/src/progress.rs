@@ -59,10 +59,32 @@ fn fmt_duration(d: std::time::Duration) -> String {
 /// Shared sink for the CLI's own `tracing` output so it can be shown in a
 /// pane instead of corrupting the alternate screen. Lines accumulate here;
 /// the TUI reads them each frame.
-static LOG: OnceLock<Mutex<Vec<String>>> = OnceLock::new();
+static LOG: OnceLock<Mutex<LogBuffer>> = OnceLock::new();
 
-fn log_buffer() -> &'static Mutex<Vec<String>> {
-    LOG.get_or_init(|| Mutex::new(Vec::new()))
+/// The retained log lines plus how many were evicted past
+/// [`MAX_LINES`] — the same cap and eviction policy as the host panes,
+/// for the same reason: a chatty process streaming for hours must not
+/// grow the pane (and its per-frame re-render) without bound. The
+/// dropped count keeps the pane title truthful about what was lost.
+#[derive(Default)]
+struct LogBuffer {
+    lines: Vec<String>,
+    dropped: usize,
+}
+
+impl LogBuffer {
+    fn push(&mut self, line: String) {
+        self.lines.push(line);
+        let excess = self.lines.len().saturating_sub(MAX_LINES);
+        if excess > 0 {
+            self.lines.drain(..excess);
+            self.dropped += excess;
+        }
+    }
+}
+
+fn log_buffer() -> &'static Mutex<LogBuffer> {
+    LOG.get_or_init(|| Mutex::new(LogBuffer::default()))
 }
 
 /// A `tracing_subscriber` writer that appends formatted log lines to the
@@ -74,7 +96,13 @@ impl std::io::Write for LogWriter {
         let s = String::from_utf8_lossy(buf);
         let line = s.trim_end_matches('\n');
         if !line.is_empty() {
-            log_buffer().lock().unwrap().push(line.to_owned());
+            // Recover a poisoned lock rather than panicking: this is a
+            // logging path, and the buffer can't be half-updated by a
+            // panic — the data inside is still exactly what was pushed.
+            log_buffer()
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(line.to_owned());
         }
         Ok(buf.len())
     }
@@ -610,12 +638,18 @@ fn source_line(src: Source, s: &str) -> Line<'static> {
 }
 
 fn draw_log(f: &mut ratatui::Frame, area: Rect) {
-    let buf = log_buffer().lock().unwrap();
+    let buf = log_buffer()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let view = area.height.saturating_sub(2);
-    let start = buf.len().saturating_sub(view as usize);
-    let body: Vec<Line> = buf[start..].iter().map(|l| ansi_line(l)).collect();
-    let para =
-        Paragraph::new(body).block(Block::default().borders(Borders::ALL).title(" cli log "));
+    let start = buf.lines.len().saturating_sub(view as usize);
+    let body: Vec<Line> = buf.lines[start..].iter().map(|l| ansi_line(l)).collect();
+    let title = if buf.dropped > 0 {
+        format!(" cli log · {} lines dropped ", buf.dropped)
+    } else {
+        " cli log ".to_owned()
+    };
+    let para = Paragraph::new(body).block(Block::default().borders(Borders::ALL).title(title));
     f.render_widget(para, area);
 }
 
@@ -795,6 +829,32 @@ fn draw_output(
 mod tests {
     use super::*;
     use ratatui::backend::TestBackend;
+
+    /// The CLI's own log pane gets the same cap as the host panes: a
+    /// long play's `tracing` output must not grow it without bound, and
+    /// the title must stay truthful about what was evicted.
+    #[test]
+    fn cli_log_buffer_is_capped_and_counts_dropped() {
+        use std::io::Write as _;
+
+        let mut writer = LogWriter;
+        for i in 0..(MAX_LINES + 500) {
+            // One write call per line, the way the tracing subscriber
+            // delivers a formatted event.
+            writer.write_all(format!("line {i}\n").as_bytes()).unwrap();
+        }
+        let buf = log_buffer()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(buf.lines.len(), MAX_LINES);
+        assert!(buf.dropped >= 500);
+        // The newest content survived; the oldest was evicted.
+        assert_eq!(
+            buf.lines.last().unwrap(),
+            &format!("line {}", MAX_LINES + 499)
+        );
+        assert!(buf.lines[0].starts_with("line "));
+    }
 
     fn host(name: &str, status: Status) -> Host {
         let mut h = Host {

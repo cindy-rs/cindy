@@ -294,6 +294,7 @@ async fn main(host: cindy::Host<Vars>) -> cindy::Result<()> {
         src: tarball.clone(),
         dest: extract_dir.clone(),
         format: None,
+        max_bytes: None,
     })
     .await?;
 
