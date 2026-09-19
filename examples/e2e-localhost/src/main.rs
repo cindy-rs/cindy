@@ -97,6 +97,30 @@ async fn main(host: cindy::Host<Vars>) -> cindy::Result<()> {
         return Ok(());
     }
 
+    // Orchestrator-side backpressure regression (see tests/e2e.rs):
+    // the harness squeezes the orchestrator's own RPC byte budget to
+    // 64 KiB while this play fans out 32 ~40 KiB calls. Dispatch must
+    // park on the budget without deadlocking: frame writes serialise,
+    // but response routing never parks, so every call still completes
+    // with its data intact. (Worker-side concurrency is *not* asserted
+    // here — the worker's budget is normal, so several probes may
+    // legitimately run at once; the orchestrator budget only paces
+    // frame writes.)
+    if std::env::var_os("CINDY_E2E_ORCH_BUDGET").is_some() {
+        let blob = vec![7u8; 40 * 1024];
+        let results =
+            futures_util::future::join_all((0..32).map(|_| budget_probe(blob.clone()))).await;
+        for (len, _) in results {
+            if len != blob.len() {
+                cindy::bail!(
+                    "orchestrator budget probe data mangled: {len} != {}",
+                    blob.len()
+                );
+            }
+        }
+        return Ok(());
+    }
+
     // Streaming-fetch regression scenario (see tests/e2e.rs). `fetch`
     // no longer buffers a body in RAM, which puts three promises on the
     // line: an over-sized body is refused (whether or not the server

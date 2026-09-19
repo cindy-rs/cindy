@@ -396,6 +396,46 @@ fn backpressure_serialises_oversized_fanout() {
     );
 }
 
+/// The orchestrator's own RPC byte budget must park dispatch, not
+/// response routing: with the budget forced to 64 KiB, a fan-out of
+/// 32 ~40 KiB calls still completes — every frame waits its turn to
+/// reach the pipe while responses keep flowing. Acquiring the budget
+/// inside the routing loop (the obvious-but-wrong mirror of the
+/// worker's read-loop acquire) deadlocks right here: the worker's
+/// budget only releases as responses flow, and responses can't flow
+/// through a parked loop.
+#[test]
+fn orchestrator_backpressure_completes_under_tiny_budget() {
+    let tmp = tempfile::tempdir().expect("create temp dir");
+
+    let host_context = serde_json::json!({
+        "name": "localhost",
+        "tags": ["example:e2e"],
+        "vars": {
+            "work_dir": tmp.path().join("work"),
+            "fetch_url": "http://127.0.0.1/",
+            "fetch_sha256": "",
+        }
+    });
+
+    let mut play = start_play(
+        tmp.path(),
+        &host_context,
+        &[
+            ("CINDY_E2E_ORCH_BUDGET", "1"),
+            ("CINDY_RPC_BUDGET", "65536"),
+        ],
+        &[],
+    );
+    let orch_status = play.wait_orchestrator_within(std::time::Duration::from_secs(60));
+
+    assert!(
+        orch_status.success(),
+        "orchestrator exited with failure: {orch_status:?} — the dispatch-side byte budget \
+         deadlocked or mangled an oversized fan-out"
+    );
+}
+
 /// `fetch` streams its body instead of buffering it, which puts three
 /// promises on the line: an over-sized body is refused (declared length
 /// or not), a failed checksum leaves the destination untouched because

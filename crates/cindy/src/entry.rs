@@ -111,11 +111,10 @@ pub async fn orchestrator_init(rpc_in: tokio::fs::File, rpc_out: tokio::fs::File
         fail(e);
     }
 
-    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-    crate::orchestrator::ORCHESTRATOR_TX
-        .set(tx)
-        .expect("ORCHESTRATOR_TX already set");
-    tokio::spawn(crate::orchestrator::rpc(rx, rpc_in, rpc_out, vault_keys));
+    let writer_rx = crate::orchestrator::install_dispatch();
+    tokio::spawn(crate::orchestrator::rpc(
+        rpc_in, rpc_out, vault_keys, writer_rx,
+    ));
 }
 
 /// Write `bytes` to the (saved) RPC stdout and exit 0. Shared tail of

@@ -1,17 +1,75 @@
 use std::collections::HashMap;
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
 use tokio::sync::{mpsc, oneshot};
 use uuid::Uuid;
 
 use crate::common::{RemoteFnPayload, RemoteFnResponse, RemoteFnResponsePayload, WorkerInbound};
 
-pub struct OutboundRegistration {
-    pub payload: RemoteFnPayload,
-    pub tx: oneshot::Sender<RemoteFnResponse>,
+/// One queued outbound frame, with the budget permits that admitted it.
+/// The permit rides with the frame and is dropped by the writer task
+/// once the bytes are on the pipe — that's the moment the budget is
+/// handed back, so at most `budget` bytes of not-yet-written frames can
+/// exist at any time.
+pub(crate) type QueuedFrame = (Vec<u8>, tokio::sync::OwnedSemaphorePermit);
+
+/// How many frames may sit in the writer queue. Bytes are already
+/// bounded by the budget (every queued frame holds its permits); this
+/// only caps the *count*, keeping queue bookkeeping flat even under
+/// floods of floor-cost calls.
+const WRITER_QUEUE_SLOTS: usize = 256;
+
+/// Everything a remote call needs to reach the worker: the budgeted
+/// writer queue and the response-routing table.
+#[derive(Clone)]
+struct Dispatch {
+    writer_tx: mpsc::Sender<QueuedFrame>,
+    pending: Arc<Mutex<Pending>>,
+    budget: Arc<tokio::sync::Semaphore>,
+    budget_size: usize,
 }
 
-pub static ORCHESTRATOR_TX: std::sync::OnceLock<mpsc::UnboundedSender<OutboundRegistration>> =
-    std::sync::OnceLock::new();
+/// In-flight calls by uuid, plus the `dead` flag the routing loop sets
+/// when the worker is gone: later dispatch attempts must fail their
+/// caller immediately instead of queueing a frame nobody will answer.
+#[derive(Default)]
+struct Pending {
+    dead: bool,
+    calls: HashMap<Uuid, oneshot::Sender<RemoteFnResponse>>,
+}
+
+impl Dispatch {
+    fn lock(&self) -> MutexGuard<'_, Pending> {
+        self.pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+/// Build the dispatch machinery and install it in the `DISPATCH`
+/// global, returning the writer-queue receiver for [`rpc`] to drain.
+/// Called once from the `#[cindy::main]` entry, before any call can
+/// happen.
+pub fn install_dispatch() -> mpsc::Receiver<QueuedFrame> {
+    let budget_size = crate::common::rpc_byte_budget();
+    let (writer_tx, writer_rx) = mpsc::channel(WRITER_QUEUE_SLOTS);
+    let dispatch = Dispatch {
+        writer_tx,
+        pending: Arc::new(Mutex::new(Pending::default())),
+        budget: Arc::new(tokio::sync::Semaphore::new(budget_size)),
+        budget_size,
+    };
+    DISPATCH
+        .set(dispatch)
+        .map_err(|_| "DISPATCH already set")
+        .expect("DISPATCH already set");
+    writer_rx
+}
+
+/// The dispatch context installed by [`install_dispatch`]. Remote
+/// calls read it; it is never reset, so a `get()` here can't fail
+/// once the entry has run.
+static DISPATCH: OnceLock<Dispatch> = OnceLock::new();
 
 /// Dispatch a remote-function call and return a future that resolves to
 /// its (postcard-decoded) return value.
@@ -26,6 +84,13 @@ pub static ORCHESTRATOR_TX: std::sync::OnceLock<mpsc::UnboundedSender<OutboundRe
 /// let (a, b) = (a.await, b.await);
 /// ```
 ///
+/// The dispatch itself happens in a spawned task that first acquires
+/// byte-budget permits for the frame. Under a saturated budget — the
+/// worker stalled, the SSH pipe full — new calls park there instead of
+/// piling serialized frames in orchestrator memory, while in-flight
+/// calls keep completing: response routing must never park, because
+/// the worker's own budget only releases as responses flow back.
+///
 /// A remote panic is re-raised locally so it bubbles through whatever
 /// `join!`/`try_join!` the orchestrator's `main` uses and surfaces in
 /// the `#[cindy::main]` `JoinError` arm as `exit(1)`. The worker
@@ -39,18 +104,53 @@ pub fn call<T: serde::de::DeserializeOwned>(
     args: Vec<u8>,
 ) -> impl std::future::Future<Output = T> {
     let (tx, rx) = oneshot::channel();
-    ORCHESTRATOR_TX
-        .get()
-        .expect("ORCHESTRATOR_TX not set")
-        .send(OutboundRegistration {
-            payload: RemoteFnPayload {
-                uuid: Uuid::new_v4(),
-                fn_id: fn_id.to_string(),
-                data: args,
-            },
-            tx,
-        })
-        .expect("Orchestrator channel closed");
+    let dispatch = DISPATCH.get().expect("DISPATCH not set");
+    let uuid = Uuid::new_v4();
+    let payload = RemoteFnPayload {
+        uuid,
+        fn_id: fn_id.to_string(),
+        data: args,
+    };
+
+    tokio::spawn(async move {
+        let cost = u32::try_from(crate::common::outbound_cost(
+            payload.data.len(),
+            dispatch.budget_size,
+        ))
+        .unwrap_or(u32::MAX);
+        let permit = dispatch
+            .budget
+            .clone()
+            .acquire_many_owned(cost)
+            .await
+            .expect("RPC budget semaphore closed");
+
+        // Register before the frame is written — the response can't
+        // exist before the frame does, so this can't race the routing
+        // loop. Failing the `dead` check means the worker is already
+        // gone; fail the caller now rather than queue a frame nobody
+        // will answer.
+        {
+            let mut pending = dispatch.lock();
+            if pending.dead {
+                let _ = tx.send(RemoteFnResponse::Panic(
+                    "RPC connection to the worker closed before this call was dispatched"
+                        .to_owned(),
+                ));
+                return;
+            }
+            pending.calls.insert(uuid, tx);
+        }
+
+        let frame = postcard::to_allocvec_cobs(&WorkerInbound::Call(payload))
+            .expect("Failed to serialize `WorkerInbound::Call`");
+        if dispatch.writer_tx.send((frame, permit)).await.is_err() {
+            // Writer task ended (dead worker) before taking the frame:
+            // unregister so the caller fails through the normal
+            // closed-connection path instead of hanging.
+            dispatch.lock().calls.remove(&uuid);
+        }
+    });
 
     async move {
         match rx.await {
@@ -67,13 +167,13 @@ pub fn call<T: serde::de::DeserializeOwned>(
 }
 
 pub async fn rpc(
-    mut registration_rx: mpsc::UnboundedReceiver<OutboundRegistration>,
     rpc_in: tokio::fs::File,
     rpc_out: tokio::fs::File,
     vault_keys: HashMap<String, Vec<u8>>,
+    mut writer_rx: mpsc::Receiver<QueuedFrame>,
 ) {
+    let dispatch = DISPATCH.get().expect("DISPATCH not set");
     let (reader_tx, mut reader_rx) = mpsc::unbounded_channel::<RemoteFnResponsePayload>();
-    let (writer_tx, mut writer_rx) = mpsc::unbounded_channel::<Vec<u8>>();
 
     // First frame on the wire is always the handshake: hand the worker
     // its vault keys over the (SSH-protected) pipe so the key material
@@ -93,9 +193,23 @@ pub async fn rpc(
         dry_run,
     })
     .expect("Failed to serialize handshake");
-    let _ = writer_tx.send(handshake);
-
-    let mut pending_futures: HashMap<Uuid, oneshot::Sender<RemoteFnResponse>> = HashMap::new();
+    // Budgeted like any other frame — at startup nothing competes for
+    // permits, so this can't park.
+    let permit = dispatch
+        .budget
+        .clone()
+        .acquire_many_owned(
+            u32::try_from(crate::common::call_cost(
+                handshake.len(),
+                dispatch.budget_size,
+            ))
+            .unwrap_or(u32::MAX),
+        )
+        .await
+        .expect("RPC budget semaphore closed");
+    if dispatch.writer_tx.send((handshake, permit)).await.is_err() {
+        panic!("writer task died before the handshake was queued");
+    }
 
     tokio::spawn(async move {
         use tokio::io::AsyncBufReadExt as _;
@@ -104,8 +218,8 @@ pub async fn rpc(
         let mut buffer = Vec::with_capacity(4096);
 
         // Ending this task for any reason (EOF, I/O error, corrupt
-        // frame) drops `reader_tx`, which the select loop below sees as
-        // `None` and treats as "the worker is gone".
+        // frame) drops `reader_tx`, which the routing loop below sees
+        // as `None` and treats as "the worker is gone".
         loop {
             match stdin.read_until(0x00, &mut buffer).await {
                 Ok(0) => break,
@@ -136,7 +250,7 @@ pub async fn rpc(
 
     tokio::spawn(async move {
         let mut stdout = rpc_out;
-        while let Some(cobs_packet) = writer_rx.recv().await {
+        while let Some((cobs_packet, permit)) = writer_rx.recv().await {
             use tokio::io::AsyncWriteExt as _;
 
             if let Err(e) = stdout.write_all(&cobs_packet).await {
@@ -147,53 +261,56 @@ pub async fn rpc(
                 break;
             }
             let _ = stdout.flush().await;
+            // The frame is on the pipe: the budget these permits
+            // represent is no longer held as an unwritten copy in this
+            // process — SSH flow control owns the backpressure from
+            // here. Drop releases the permits.
+            drop(permit);
         }
     });
 
+    // Response routing only. Dispatch (budget acquire, registration,
+    // frame serialisation) happens in the per-call tasks that
+    // `call()` spawns — routing must never park behind a saturated
+    // budget, because the worker's own budget only releases as
+    // responses flow through this loop; parking here would deadlock
+    // both sides.
     loop {
-        tokio::select! {
-            registration = registration_rx.recv() => match registration {
-                Some(registration) => {
-                    let uuid = registration.payload.uuid;
-
-                    let outbound_bytes =
-                        postcard::to_allocvec_cobs(&WorkerInbound::Call(registration.payload))
-                            .expect("Failed to serialize `WorkerInbound::Call`");
-                    let _ = writer_tx.send(outbound_bytes);
-
-                    pending_futures.insert(uuid, registration.tx);
+        match reader_rx.recv().await {
+            Some(response) => {
+                // If the receiving future was dropped before the
+                // response arrived (e.g. a sibling in a `try_join!`
+                // already errored), there's nothing to deliver to —
+                // ignore rather than crash the RPC loop.
+                if let Some(tx) = dispatch.lock().calls.remove(&response.uuid) {
+                    let _ = tx.send(response.response);
                 }
-                // Defensive: `ORCHESTRATOR_TX` is a `OnceLock` that is never
-                // reset, so this arm is not expected to fire; if it ever
-                // does, stop rather than spin on a closed channel.
-                None => break,
-            },
-
-            response = reader_rx.recv() => match response {
-                Some(response) => {
-                    // If the receiving future was dropped before the
-                    // response arrived (e.g. a sibling in a `try_join!`
-                    // already errored), there's nothing to deliver to —
-                    // ignore rather than crash the RPC loop.
-                    if let Some(tx) = pending_futures.remove(&response.uuid) {
-                        let _ = tx.send(response.response);
-                    }
+            }
+            // Reader task ended: worker EOF, I/O error, or corrupt
+            // frame. Mark the dispatch dead, fail every in-flight
+            // call (dropping the oneshot senders would do it too, but
+            // an explicit message beats a generic "channel closed"),
+            // and let late dispatch attempts fail fast at their
+            // registration instead of hanging.
+            None => {
+                let mut pending = dispatch.lock();
+                let in_flight = pending.calls.len();
+                if in_flight > 0 {
+                    eprintln!(
+                        "RPC connection to the worker closed with {in_flight} call(s) still \
+                         in flight"
+                    );
                 }
-                // Reader task ended: worker EOF, I/O error, or corrupt
-                // frame. Stop the loop; dropping `pending_futures` below
-                // drops every in-flight oneshot sender, which fails the
-                // corresponding awaiting futures with a clear message
-                // instead of letting them hang forever.
-                None => {
-                    if !pending_futures.is_empty() {
-                        eprintln!(
-                            "RPC connection to the worker closed with {} call(s) still in flight",
-                            pending_futures.len()
-                        );
-                    }
-                    break;
+                pending.dead = true;
+                for (_, tx) in pending.calls.drain() {
+                    let _ = tx.send(RemoteFnResponse::Panic(
+                        "RPC connection to the worker closed before the call returned \
+                         (worker crashed or the SSH channel dropped)"
+                            .to_owned(),
+                    ));
                 }
-            },
+                break;
+            }
         }
     }
 }
