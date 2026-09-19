@@ -162,7 +162,9 @@ mod tests {
         let cipher = ChaCha20Poly1305::new(key.as_slice().into());
         let mut nonce = [0u8; NONCE_LEN];
         nonce[0] = BLOB_VERSION;
-        let ct = cipher.encrypt(Nonce::from_slice(&nonce), pt.as_slice()).unwrap();
+        let ct = cipher
+            .encrypt(Nonce::from_slice(&nonce), pt.as_slice())
+            .unwrap();
         let mut legacy = nonce.to_vec();
         legacy.extend_from_slice(&ct);
 
