@@ -129,6 +129,16 @@ impl UnitState {
     }
 }
 
+/// Check mode's prediction for the `Disabled` arm, decided purely from
+/// the observed file state: unmasking a masked unit is a change on its
+/// own, and whether a disable would follow is unknowable without
+/// performing the unmask (the post-unmask state is only readable after
+/// mutating) — so it folds into the same report. Check mode
+/// over-reports rather than under-reports.
+fn disable_would_change(observed: Option<UnitState>) -> bool {
+    observed.is_some_and(|s| s.is_masked() || s.needs_disable_call())
+}
+
 /// Mirror of systemd's `ActiveState` unit property.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ActiveState {
@@ -196,6 +206,11 @@ async fn rollback_mask(
     unit_files: &[String],
     initial_unit_state: Option<UnitState>,
 ) {
+    // Check mode never masked/unmasked anything to roll back; doing it
+    // here would be the run's first mutation.
+    if crate::dry_run() {
+        return;
+    }
     if initial_unit_state.is_some_and(UnitState::is_masked) {
         let runtime = matches!(initial_unit_state, Some(UnitState::MaskedRuntime));
         let _ = manager
@@ -331,6 +346,12 @@ async fn wait_job(
 /// ```
 #[crate::remote]
 pub async fn daemon_reload() -> crate::Result<()> {
+    if crate::dry_run() {
+        // A reload is a system action, not a read — check mode reports
+        // it rather than running it. Deliberate, but never silent.
+        eprintln!("check mode: would run daemon-reload");
+        return Ok(());
+    }
     let conn = system_bus().await?;
     let manager = ManagerProxy::new(conn)
         .await
@@ -653,12 +674,24 @@ async fn apply(state: State) -> crate::Result<super::Return> {
             }
             Enablement::Disabled => {
                 if is_masked {
-                    manager
-                        .unmask_unit_files(unit_files.clone(), false)
-                        .await
-                        .context(format!("UnmaskUnitFiles({unit_name}) failed"))?;
-                    changed = true;
-                    current_file_state = read_file_state(&manager, &unit_name).await?;
+                    if crate::dry_run() {
+                        // The pure decision, reported without
+                        // mutating: a masked unit would be unmasked,
+                        // and whether a disable would follow is only
+                        // knowable post-unmask, so it folds in
+                        // (over-report beats under-report). The bails
+                        // below still fire on the *observed* state,
+                        // where masked is neither bad nor
+                        // uninstallable.
+                        changed = disable_would_change(current_file_state);
+                    } else {
+                        manager
+                            .unmask_unit_files(unit_files.clone(), false)
+                            .await
+                            .context(format!("UnmaskUnitFiles({unit_name}) failed"))?;
+                        changed = true;
+                        current_file_state = read_file_state(&manager, &unit_name).await?;
+                    }
                 }
                 if current_file_state == Some(UnitState::Bad) {
                     rollback_mask(&manager, &unit_files, initial_unit_state).await;
@@ -814,6 +847,36 @@ async fn apply(state: State) -> crate::Result<super::Return> {
 
 #[cfg(test)]
 mod tests {
+    use super::disable_would_change;
+
+    /// The `Disabled` arm's check-mode prediction, from the observed
+    /// state — pinned so the dry-run branch can't drift from the pure
+    /// decision it's supposed to report.
+    #[test]
+    fn disable_would_change_covers_masked_and_enabled_family() {
+        // A masked unit would be unmasked — a change by itself (the
+        // would-disable on top is folded in; see the fn).
+        assert!(disable_would_change(Some(UnitState::Masked)));
+        assert!(disable_would_change(Some(UnitState::MaskedRuntime)));
+        // Anything with links to tear down would be disabled.
+        for state in [
+            UnitState::Enabled,
+            UnitState::EnabledRuntime,
+            UnitState::Linked,
+            UnitState::LinkedRuntime,
+            UnitState::Alias,
+        ] {
+            assert!(disable_would_change(Some(state)), "{state:?}");
+        }
+        // Already disabled, static/indirect (no [Install] to disable),
+        // bad-but-unmasked is a bail not a change, absent: no change.
+        assert!(!disable_would_change(Some(UnitState::Disabled)));
+        assert!(!disable_would_change(Some(UnitState::Static)));
+        assert!(!disable_would_change(Some(UnitState::Indirect)));
+        assert!(!disable_would_change(Some(UnitState::Bad)));
+        assert!(!disable_would_change(None));
+    }
+
     use super::*;
 
     #[test]
