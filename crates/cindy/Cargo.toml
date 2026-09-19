@@ -28,12 +28,12 @@ tokio = { workspace = true, features = [
 ] }
 
 anyhow_serde = "1.0"
-base64 = "0.22"
+base64.workspace = true
 chacha20poly1305 = "0.10"
 inventory = "0.3"
 nix = { version = "0.31", features = ["fs", "user"] }
 similar = "3.1"
-tempfile = "3.27"
+tempfile.workspace = true
 zeroize = "1.8"
 uuid = { version = "1.23", features = ["v4", "serde"] }
 zbus_systemd = { version = "0.26000", default-features = false, features = [

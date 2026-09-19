@@ -212,10 +212,33 @@ pub fn create(
     })
 }
 
+/// Two sources with the same final path component would silently
+/// overwrite each other's entries in the archive — the full paths
+/// differ, so the collision is invisible until extraction yields one
+/// tree where two were expected. Reject it up front, naming both
+/// offenders.
+fn check_unique_entry_names(sources: &[PathBuf]) -> crate::Result<()> {
+    let mut seen: std::collections::HashMap<&Path, &Path> = std::collections::HashMap::new();
+    for source in sources {
+        if let Some(first) = seen.insert(entry_name(source)?, source) {
+            crate::bail!(
+                "sources {} and {} both archive as `{}` — an entry name is its \
+                 source's final path component; archive them via a parent directory \
+                 or rename one",
+                first.display(),
+                source.display(),
+                entry_name(source)?.display()
+            );
+        }
+    }
+    Ok(())
+}
+
 fn apply(state: State) -> crate::Result<super::Return> {
     if state.sources.is_empty() {
         crate::bail!("`archive` needs at least one source path");
     }
+    check_unique_entry_names(&state.sources)?;
 
     let format = match state.format {
         Some(f) => f,
@@ -257,4 +280,29 @@ fn apply(state: State) -> crate::Result<super::Return> {
         state.mode.unwrap_or(super::path::Mode(0o644)),
     )?;
     Ok(super::Return::Changed)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn srcs(paths: &[&str]) -> Vec<PathBuf> {
+        paths.iter().map(PathBuf::from).collect()
+    }
+
+    #[test]
+    fn colliding_entry_names_are_rejected_up_front() {
+        // The exact scenario from the plan: different directories,
+        // same basename — the second entry would silently clobber the
+        // first inside the archive.
+        let err = check_unique_entry_names(&srcs(&["/a/conf", "/b/conf"])).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("/a/conf"), "{msg}");
+        assert!(msg.contains("/b/conf"), "{msg}");
+        assert!(msg.contains("`conf`"), "{msg}");
+
+        assert!(check_unique_entry_names(&srcs(&["/a/conf", "/a/conf.d"])).is_ok());
+        assert!(check_unique_entry_names(&srcs(&["/a/conf", "/b/other"])).is_ok());
+        assert!(check_unique_entry_names(&srcs(&["/only/one"])).is_ok());
+    }
 }

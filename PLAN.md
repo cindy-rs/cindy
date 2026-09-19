@@ -76,18 +76,6 @@ Every build prints a future-incompatibility warning for `nix`. Bump when
 a fixed release exists; until then it's noise that trains people to
 ignore warnings.
 
-### Workspace dependency hygiene
-
-AGENTS.md says cindy's dependencies "should move toward
-`[workspace.dependencies]`". `base64` and `tempfile` are still pinned
-independently in `crates/cindy` and `crates/cindy-cli`.
-
-### `archive` collides on basenames
-
-`crates/cindy/src/builtin/archive.rs:35` — `entry_name` uses the final
-path component, so `create(["/a/conf", "/b/conf"], …)` silently writes
-two entries with the same name. Error on a duplicate.
-
 ## Priority 3 — architecture
 
 Bigger pieces. Each is worth its own discussion before implementation;
