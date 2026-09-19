@@ -67,6 +67,10 @@ check.fmt:
   image: *image
   script:
     - cargo fmt --check
+    # The site is a nested workspace: root fmt only reaches its snippet
+    # files (via examples/snippet-check's #[path] mods), so check its
+    # own sources explicitly.
+    - cargo fmt --check --manifest-path web/Cargo.toml
 check.clippy:
   extends: .rust-cache
   stage: stageless
