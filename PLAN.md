@@ -55,7 +55,8 @@ for a reason that isn't visible in the code.
   ("attacker can rearrange ciphertexts but not execute code") doesn't
   exist here, because ciphertexts live in the playbook source and anyone
   who can move a blob can rewrite the code that consumes it. The
-  *version byte* half of that proposal does still stand — see below.
+  *version byte* half of that proposal was implemented separately
+  (see git history).
 - **`apt::install_all` was rejected** in favour of `impl
   Into<PackageList>`, which is what `fe3dc4e` implemented.
 
@@ -81,65 +82,12 @@ ignore warnings.
 Bigger pieces. Each is worth its own discussion before implementation;
 don't start one without checking it's still wanted.
 
-### `--forks` and `--serial`
-
-`crates/cindy-cli/src/main.rs:459` fans out discovery with
-`try_join_all` and `:776` fans out deployment with `join_all`, both
-unbounded. Two hundred selected hosts means two hundred concurrent SSH
-sessions and two hundred local orchestrator processes. `--forks N` is a
-semaphore (the `build_gate` at `:494` is the pattern); `--serial N` is
-batching, and is the reason people tolerate Ansible's slowness — it's
-what makes rolling deploys possible.
-
-### Worker upload is O(hosts × binary) per run
-
-`crates/cindy-cli/src/main.rs:617` pipes the whole (~8 MB static musl)
-binary to every host on every play, uncompressed, with no cache. Hash it,
-probe the target for an existing copy, upload only on miss. Related:
-`/tmp` is `noexec` on hardened hosts, which fails the play with a
-confusing exec error — make the staging directory configurable (`:579`)
-and say so explicitly when exec fails.
-
-### Orchestrator-side RPC backpressure
-
-`0e2c8fc` gave the worker a byte-weighted budget. The orchestrator's
-`writer_tx` (`crates/cindy/src/orchestrator.rs:76`) is still unbounded,
-so when the worker stalls the pipe, serialized frames pile up in
-orchestrator memory — a second full copy of everything the play holds.
-Mirror the worker's semaphore on the dispatch side.
-
-### systemd: connection per call, fixed job timeout
-
-`crates/cindy/src/builtin/systemd.rs:484` opens a fresh system-bus
-connection for every action; a play touching 20 units opens 20. A
-worker-global `OnceCell<Connection>` is a small safe win. `JOB_TIMEOUT`
-(`:234`) is hardcoded at 90s, which is short for a database start —
-make it a `State` field. Separately, `read_active_state` uses `LoadUnit`
-for what is a read-only probe, which *loads* the unit as a side effect;
-`GetUnit` with a fallback is the non-mutating form.
-
 ### Vault key rotation
 
 There is no `cindy secret vault rotate`. Recovering from a leaked key
 today means `unseal --all`, delete the key file by hand, `vault create`,
 `seal --all` — with plaintext transiently on disk and no atomicity. A
 first-class rotate belongs in the secrets story.
-
-### A version byte on sealed ciphertexts
-
-The surviving half of the rejected AAD proposal, and *not* a security
-argument. Sealed ciphertexts get committed to source and live for years.
-Today the only way to tell a v1 blob from a future v2 is that postcard
-fails to parse it — which is literally how `crates/cindy/src/secret/mod.rs`
-guesses ("probably sealed by an older cindy version"). One leading byte
-turns every future crypto change into a clean, detectable migration.
-Cheapest now, before there's a corpus of blobs in the wild.
-
-### `KnownHosts::Add` is blind TOFU
-
-`crates/cindy-cli/src/main.rs:426` silently trusts the first host key it
-sees. At minimum log the accepted fingerprint; ideally offer a strict
-mode.
 
 ### `fetch` has no headers, auth, or proxy
 
