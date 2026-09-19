@@ -162,20 +162,17 @@ async fn get_inventory(
 ///
 /// Every build the CLI drives uses an absolute `--target-dir` anchored here
 /// so the worker/orchestrator binaries land — and are read back from — the
-/// same place regardless of the directory `cindy` was invoked from. (A
-/// relative `--target-dir` is relative to the *cwd*, which silently diverges
-/// from the absolute paths we later compute, leaving us reading a binary that
-/// was written somewhere else.)
-fn workspace_root() -> eyre::Result<PathBuf> {
-    let meta = cargo_metadata::MetadataCommand::new().exec()?;
-    Ok(meta.workspace_root.into_std_path_buf())
-}
-
 #[tokio::main]
 async fn main() -> eyre::Result<()> {
     let args = Args::parse();
     color_eyre::install()?;
-    let workspace_root = workspace_root()?;
+    // One `cargo metadata` run for the whole invocation: the workspace
+    // root (anchoring `--target-dir`, so a relative one can't silently
+    // diverge from the absolute paths we later compute) and the
+    // package/target facts `extract_executable` pins the deployed bin
+    // with both come from it.
+    let cargo_meta = Arc::new(cargo_metadata::MetadataCommand::new().exec()?);
+    let workspace_root = cargo_meta.workspace_root.clone().into_std_path_buf();
     let is_play = matches!(args.subcommand, Subcommand::Play { .. });
     // The run view (progress::run) takes over stderr with an alternate
     // screen when stderr is a tty. A tracing layer writing to that same
@@ -203,7 +200,7 @@ async fn main() -> eyre::Result<()> {
     // We compile lazily for that one and short-circuit otherwise.
     if let Subcommand::Secret(cmd) = args.subcommand {
         let orch = if secret::requires_orchestrator(&cmd) {
-            Some(compile_orchestrator(&workspace_root).await?)
+            Some(compile_orchestrator(&workspace_root, &cargo_meta).await?)
         } else {
             None
         };
@@ -239,7 +236,7 @@ async fn main() -> eyre::Result<()> {
     // their RPC loops and exit.
     let result: eyre::Result<()> = tokio::select! {
         biased;
-        r = run_after_launch(args.subcommand, workspace_root, progress_tx.clone()) => r,
+        r = run_after_launch(args.subcommand, workspace_root, Arc::clone(&cargo_meta), progress_tx.clone()) => r,
         _ = abort_rx.changed() => Err(eyre::eyre!(
             "play aborted from the run view; in-flight deployments were torn down"
         )),
@@ -298,9 +295,10 @@ async fn main() -> eyre::Result<()> {
 async fn run_after_launch(
     subcommand: Subcommand,
     workspace_root: PathBuf,
+    cargo_meta: Arc<cargo_metadata::Metadata>,
     progress_tx: tokio::sync::mpsc::UnboundedSender<progress::Msg>,
 ) -> eyre::Result<()> {
-    let orchestrator_exe_path = compile_orchestrator(&workspace_root).await?;
+    let orchestrator_exe_path = compile_orchestrator(&workspace_root, &cargo_meta).await?;
 
     // `--reveal` must reach the orchestrator dump, which does the
     // decryption (it has the vault keys and the typed `V`); the CLI
@@ -473,9 +471,10 @@ async fn run_after_launch(
 
     // https://github.com/rust-lang/rustup/issues/988
     tracing::info!(component = "rust-src", "installing component");
-    std::process::Command::new("rustup")
+    tokio::process::Command::new("rustup")
         .args(["component", "add", "rust-src"])
-        .output()?
+        .output()
+        .await?
         .ok_or_die()?;
     for platform in &unique_platforms {
         if matches!(platform.tier, platforms::Tier::Three) {
@@ -488,7 +487,6 @@ async fn run_after_launch(
             .ok_or_die()?;
     }
 
-    let cargo_meta = Arc::new(cargo_metadata::MetadataCommand::new().exec()?);
     let root = Arc::new(workspace_root.clone());
     // FIXME: semaphore here until rustup proxy safe for concurrent use.
     let build_gate = Arc::new(tokio::sync::Semaphore::new(1));
@@ -507,12 +505,27 @@ async fn run_after_launch(
             ))
         }
     });
-    let compilation_results = Arc::new(
-        try_join_all(compilation_futures)
-            .await?
-            .into_iter()
-            .collect::<HashMap<_, _>>(),
-    );
+    let compilation_results = try_join_all(compilation_futures)
+        .await?
+        .into_iter()
+        .collect::<HashMap<_, _>>();
+
+    // Read each platform's worker binary once and share the bytes
+    // across every host's upload: a 200-host fan-out on one platform
+    // used to re-read the same ~8 MB static binary 200 times, once
+    // per deployment task, blocking the async runtime's thread each
+    // time.
+    let mut worker_binaries: HashMap<&'static platforms::Platform, Arc<[u8]>> = HashMap::new();
+    for (platform, path) in &compilation_results {
+        worker_binaries.insert(
+            *platform,
+            tokio::fs::read(path)
+                .await
+                .map(Arc::from)
+                .with_context(|| format!("Reading worker binary {}", path.display()))?,
+        );
+    }
+    let worker_binaries = Arc::new(worker_binaries);
 
     // Vault key preflight (fail-fast). Enumerate the vaults the play's
     // in-code `secret!`s reference, then — per host — union them with
@@ -561,7 +574,7 @@ async fn run_after_launch(
 
     let deployment_futures = discovered_hosts.into_iter().enumerate().map(|(idx, host)| {
         let orch_path = Arc::clone(&orchestrator_path);
-        let compilation_results = Arc::clone(&compilation_results);
+        let worker_binaries = Arc::clone(&worker_binaries);
         let host_contexts = Arc::clone(&host_contexts);
         let host_vault_keys = Arc::clone(&host_vault_keys);
         let progress_tx = progress_tx.clone();
@@ -572,9 +585,11 @@ async fn run_after_launch(
             let progress_status = progress_tx.clone();
 
             let result = async move {
-                let local_worker_path = compilation_results
-                    .get(host.platform)
-                    .expect("Not compiled");
+                let worker_bin = Arc::clone(
+                    worker_binaries
+                        .get(host.platform)
+                        .expect("Not compiled"),
+                );
 
                 let remote_tmp_path = format!(
                     "/tmp/.cindy-worker.{}",
@@ -614,8 +629,7 @@ async fn run_after_launch(
                     // already forwarded to the pane — so don't surface it;
                     // fall through to `exit_ok`, which reports the actual
                     // non-zero exit.
-                    let bin = std::fs::read(local_worker_path)?;
-                    let _ = stdin.write_all(&bin).await;
+                    let _ = stdin.write_all(&worker_bin).await;
                 }
                 upload.wait().await?.exit_ok()?;
 
@@ -658,7 +672,7 @@ async fn run_after_launch(
                 // the context over as a temp file (unlinked when this
                 // per-host task ends) instead — no size ceiling.
                 let context_file = tempfile::NamedTempFile::new()?;
-                std::fs::write(context_file.path(), &host_context_json)?;
+                tokio::fs::write(context_file.path(), &host_context_json).await?;
                 let mut orchestrator_cmd = tokio::process::Command::new(&*orch_path);
                 orchestrator_cmd
                     .kill_on_drop(true)
@@ -863,7 +877,10 @@ fn host_needed_vaults(
     needed
 }
 
-async fn compile_orchestrator(workspace_root: &Path) -> eyre::Result<PathBuf> {
+async fn compile_orchestrator(
+    workspace_root: &Path,
+    metadata: &cargo_metadata::Metadata,
+) -> eyre::Result<PathBuf> {
     tracing::info!("compiling orchestrator binary");
     let target_dir = workspace_root.join("target/cindy/orchestrator");
     let output = tokio::process::Command::new("cargo")
@@ -896,7 +913,7 @@ async fn compile_orchestrator(workspace_root: &Path) -> eyre::Result<PathBuf> {
     }
 
     let stdout_str = String::from_utf8(output.stdout)?;
-    let exe_path = extract_executable(&stdout_str)?
+    let exe_path = extract_executable(&stdout_str, metadata)?
         .context("Failed to extract orchestrator executable path")?;
     Ok(exe_path)
 }
@@ -914,8 +931,10 @@ async fn compile_orchestrator(workspace_root: &Path) -> eyre::Result<PathBuf> {
 /// that bin's artifact line is accepted. Virtual workspaces (no root
 /// package) can't be pinned; there we take the last non-empty bin-kind
 /// artifact, which at least excludes build scripts and libs.
-fn extract_executable(stdout: &str) -> eyre::Result<Option<PathBuf>> {
-    let metadata = cargo_metadata::MetadataCommand::new().exec()?;
+fn extract_executable(
+    stdout: &str,
+    metadata: &cargo_metadata::Metadata,
+) -> eyre::Result<Option<PathBuf>> {
     let expected_name: Option<String> = match metadata.root_package() {
         Some(pkg) => {
             let bins: Vec<&str> = pkg
@@ -1037,7 +1056,7 @@ async fn compile_remote_worker(
     // target-dir (mounted into the container at the same path), giving a host
     // path we can actually read.
     let stdout_str = String::from_utf8(output.stdout)?;
-    let exe_name = extract_executable(&stdout_str)?
+    let exe_name = extract_executable(&stdout_str, metadata)?
         .context("Failed to extract remote executable path")?
         .file_name()
         .context("remote executable path had no file name")?

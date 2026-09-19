@@ -70,20 +70,6 @@ Decided: **buster is not a target** — the fleet is VyOS 1.3+ (apt ≥
 coverage only via the `-o DPkg::Lock::Timeout` option old apt silently
 ignores, which is acceptable.
 
-### Blocking I/O on async paths in the CLI
-
-`crates/cindy-cli/src/main.rs`: `std::process::Command` for rustup at
-`:476` and `:485`, `std::fs::read` of the entire worker binary **per
-host** at `:617`, and the context-file write at `:661`. All inside async
-tasks. Use `tokio::process` / `tokio::fs`, and read the worker binary
-once per platform into an `Arc<[u8]>` rather than once per host.
-
-### `cargo metadata` spawned three-plus times per run
-
-`crates/cindy-cli/src/main.rs:170`, `:491`, `:918` — and `:918` is inside
-`extract_executable`, so it runs once per artifact extraction. The
-`Arc<Metadata>` at `:491` already exists; thread it through.
-
 ### `nix 0.31.3` future-incompat
 
 Every build prints a future-incompatibility warning for `nix`. Bump when
