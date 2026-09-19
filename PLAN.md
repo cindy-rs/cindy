@@ -61,33 +61,6 @@ for a reason that isn't visible in the code.
 
 ## Priority 1 — correctness bugs
 
-### The seal/unseal rewriter hardcodes `::cindy::`
-
-`crates/cindy-cli/src/secret.rs:287` emits `::cindy::Secret::sealed_b64`
-and `:471` emits `::cindy::secret!`. That undoes `0fa1373`, which
-specifically taught the macros to resolve the crate name so renamed
-dependencies work. A playbook with `[dependencies] infra = { package =
-"cindy" }` gets source that doesn't compile.
-
-**Approach:** resolve the name the way the macros do (`proc-macro-crate`
-against the playbook's manifest), or read it out of the `cargo metadata`
-the CLI already has. Note the CLI runs from the playbook's directory, so
-the manifest is reachable.
-
-**Done when:** the round-trip test in that module runs against a
-renamed-dependency fixture.
-
-### One unparseable `.rs` breaks `unseal` for the whole workspace
-
-`crates/cindy-cli/src/secret.rs:404` propagates tokenization errors, and
-`unseal_all` walks *every* `.rs` file under the workspace root. A single
-syntax-error test fixture anywhere makes `cindy secret unseal`
-impossible.
-
-**Approach:** skip files that don't tokenize, with a `tracing::warn!`
-naming the path. A file cindy can't parse also can't contain a sealed
-call it needs to find.
-
 ## Priority 2 — robustness and consistency
 
 ### Unbounded TUI log buffer

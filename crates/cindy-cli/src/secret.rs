@@ -144,6 +144,69 @@ fn write_new_vault_key(path: &Path) -> eyre::Result<()> {
 // seal: run orchestrator with CINDY_SEAL_SECRETS, rewrite source in place
 // ---------------------------------------------------------------------
 
+/// How each workspace member's crates refer to the `cindy` framework
+/// crate: the dependency rename from that member's manifest (`infra`
+/// in `[dependencies] infra = { package = "cindy", … }`), defaulting
+/// to `cindy`.
+///
+/// The seal/unseal rewriters splice paths into the user's source and
+/// must emit exactly this name — a hardcoded `::cindy::` breaks every
+/// renamed-dependency playbook, the same problem `0fa1373` fixed for
+/// the macros (which resolve it per-crate with `proc-macro-crate`).
+/// The CLI has the same information in one `cargo metadata --no-deps`
+/// run, which needs no dependency resolution and no network.
+struct CindyNames {
+    /// (member manifest dir, local name); the longest matching prefix
+    /// wins, so nested members resolve to the innermost one.
+    members: Vec<(PathBuf, String)>,
+}
+
+impl CindyNames {
+    fn collect(metadata: &cargo_metadata::Metadata) -> Self {
+        let members = metadata
+            .workspace_members
+            .iter()
+            .filter_map(|id| {
+                let pkg = &metadata[id];
+                let root = pkg.manifest_path.parent()?.as_std_path().to_owned();
+                let name = pkg
+                    .dependencies
+                    .iter()
+                    .find(|d| d.name == "cindy")
+                    .and_then(|d| d.rename.clone())
+                    .unwrap_or_else(|| "cindy".to_owned());
+                Some((root, name))
+            })
+            .collect();
+        Self { members }
+    }
+
+    /// The name the crate containing `file` knows cindy by. Files
+    /// outside every member — or inside one that doesn't depend on
+    /// cindy at all — fall back to `cindy`, matching what an unrenamed
+    /// playbook uses.
+    fn for_file(&self, file: &Path) -> &str {
+        self.members
+            .iter()
+            .filter(|(root, _)| file.starts_with(root))
+            .max_by_key(|(root, _)| root.components().count())
+            .map_or("cindy", |(_, name)| name.as_str())
+    }
+}
+
+/// The workspace root plus the per-crate cindy names, from a single
+/// dependency-free `cargo metadata` run.
+fn workspace_and_names() -> eyre::Result<(PathBuf, CindyNames)> {
+    let meta = cargo_metadata::MetadataCommand::new()
+        .no_deps()
+        .exec()
+        .context("`cargo metadata --no-deps` for the workspace failed")?;
+    Ok((
+        meta.workspace_root.clone().into_std_path_buf(),
+        CindyNames::collect(&meta),
+    ))
+}
+
 #[derive(Debug, serde::Deserialize)]
 struct SealRecord {
     file: String,
@@ -196,7 +259,7 @@ async fn seal_all(orchestrator_path: &Path, all: bool) -> eyre::Result<()> {
     // workspace root cargo compiled from — *not* to wherever the user
     // happens to run `cindy` from. Anchor it, so seal works from
     // subdirectories too.
-    let workspace_root = crate::workspace_root()?;
+    let (workspace_root, cindy_names) = workspace_and_names()?;
     let anchor = |file: &str| {
         let p = PathBuf::from(file);
         if p.is_absolute() {
@@ -242,7 +305,7 @@ async fn seal_all(orchestrator_path: &Path, all: bool) -> eyre::Result<()> {
     let mut affected = Vec::new();
     for (file, recs) in by_file {
         let path = anchor(&file);
-        rewrite_file_seal(&path, &recs)?;
+        rewrite_file_seal(&path, &recs, cindy_names.for_file(&path))?;
         affected.push(path);
     }
 
@@ -252,7 +315,7 @@ async fn seal_all(orchestrator_path: &Path, all: bool) -> eyre::Result<()> {
 
 /// Find each `secret!(...)` macro invocation matching a seal record
 /// and splice in a `Secret::sealed_b64(...)` call.
-fn rewrite_file_seal(path: &Path, records: &[SealRecord]) -> eyre::Result<()> {
+fn rewrite_file_seal(path: &Path, records: &[SealRecord], cindy_name: &str) -> eyre::Result<()> {
     let original = std::fs::read_to_string(path)
         .with_context(|| format!("Reading source file {}", path.display()))?;
 
@@ -284,7 +347,7 @@ fn rewrite_file_seal(path: &Path, records: &[SealRecord]) -> eyre::Result<()> {
                 )
             })?;
         let replacement = format!(
-            "::cindy::Secret::sealed_b64({:?}, {:?})",
+            "::{cindy_name}::Secret::sealed_b64({:?}, {:?})",
             rec.vault, rec.ciphertext
         );
         planned.push((m.byte_start, m.byte_end, replacement));
@@ -308,7 +371,7 @@ fn unseal_all(all: bool) -> eyre::Result<()> {
     // sealed secrets can live in workspace members, `tests/`, `build.rs`
     // — and seal (via `file!()` paths) reaches all of those, so unseal
     // must too or the round-trip is lossy.
-    let workspace_root = crate::workspace_root()?;
+    let (workspace_root, cindy_names) = workspace_and_names()?;
     let files = walk_rs_files(&workspace_root);
 
     // Phase 1: collect every sealed call site (no rewriting yet), so
@@ -369,7 +432,7 @@ fn unseal_all(all: bool) -> eyre::Result<()> {
     let mut affected = Vec::new();
     let mut total = 0usize;
     for fs in &per_file {
-        let count = unseal_sites(fs)?;
+        let count = unseal_sites(fs, cindy_names.for_file(&fs.path))?;
         tracing::info!(
             file = %fs.path.display(),
             count,
@@ -401,12 +464,25 @@ fn collect_sealed_sites(path: &Path) -> eyre::Result<FileSites> {
         .with_context(|| format!("Reading source file {}", path.display()))?;
     let line_starts = compute_line_starts(&original);
 
-    let tokens: proc_macro2::TokenStream = original.parse().map_err(|e| {
-        eyre::eyre!(
-            "Tokenising {} while looking for `Secret::sealed_b64` calls: {e}",
-            path.display(),
-        )
-    })?;
+    // A file that doesn't tokenize can't hold a sealed call worth
+    // finding, and a single stray fixture with a syntax error must not
+    // make `cindy secret unseal` impossible for the whole workspace.
+    // Warn and skip; read failures stay hard errors.
+    let tokens: proc_macro2::TokenStream = match original.parse() {
+        Ok(tokens) => tokens,
+        Err(e) => {
+            tracing::warn!(
+                "Skipping {}: doesn't tokenise as Rust ({e}), so it can't hold a \
+                 `Secret::sealed_b64` call",
+                path.display()
+            );
+            return Ok(FileSites {
+                path: path.to_owned(),
+                original,
+                sites: Vec::new(),
+            });
+        }
+    };
 
     let mut sites: Vec<SealedSite> = Vec::new();
     find_sealed_calls(&tokens, &original, &line_starts, &mut sites)
@@ -418,7 +494,7 @@ fn collect_sealed_sites(path: &Path) -> eyre::Result<FileSites> {
     })
 }
 
-fn unseal_sites(fs: &FileSites) -> eyre::Result<usize> {
+fn unseal_sites(fs: &FileSites, cindy_name: &str) -> eyre::Result<usize> {
     let FileSites {
         path,
         original,
@@ -468,7 +544,10 @@ fn unseal_sites(fs: &FileSites) -> eyre::Result<usize> {
             )
         })?;
 
-        let replacement = format!("::cindy::secret!({:?}, {})", site.vault, payload.source);
+        let replacement = format!(
+            "::{cindy_name}::secret!({:?}, {})",
+            site.vault, payload.source
+        );
         planned.push((site.byte_start, site.byte_end, replacement));
     }
 
@@ -516,7 +595,19 @@ mod keep_indices_tests {
 
 #[cfg(test)]
 mod site_snippet_tests {
-    use super::{SealedSite, site_snippet};
+    use super::{SealedSite, collect_sealed_sites, site_snippet};
+
+    /// A file with a syntax error anywhere makes `unseal` skip it with
+    /// a warning instead of failing the whole workspace walk.
+    #[test]
+    fn untokenisable_file_is_skipped_not_fatal() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("broken.rs");
+        std::fs::write(&file, "fn broken( { this is not rust").unwrap();
+
+        let collected = collect_sealed_sites(&file).unwrap();
+        assert!(collected.sites.is_empty());
+    }
 
     fn site(byte_start: usize, byte_end: usize) -> SealedSite {
         SealedSite {
@@ -586,7 +677,7 @@ mod seal_unseal_roundtrip_tests {
             vault: "rt-vault-x7".to_owned(),
             ciphertext: ciphertext_b64.clone(),
         };
-        rewrite_file_seal(&file, &[record]).unwrap();
+        rewrite_file_seal(&file, &[record], "cindy").unwrap();
         let sealed_source = std::fs::read_to_string(&file).unwrap();
         assert_eq!(
             sealed_source,
@@ -603,11 +694,84 @@ mod seal_unseal_roundtrip_tests {
         chain.insert("rt-vault-x7".to_owned(), key);
         cindy::secret::keychain::install_keys(chain);
 
-        let count = unseal_sites(&fs_sites).unwrap();
+        let count = unseal_sites(&fs_sites, "cindy").unwrap();
         assert_eq!(count, 1);
         assert_eq!(
             std::fs::read_to_string(&file).unwrap(),
             format!("::cindy::secret!(\"rt-vault-x7\", {source_tokens});\n"),
+        );
+    }
+
+    /// The done-when for the rename fix: against a real workspace whose
+    /// member depends on cindy as `infra = { package = "cindy" }`, the
+    /// rewriter resolves the local name from `cargo metadata` and the
+    /// seal/unseal round-trip emits `::infra::` paths that actually
+    /// compile in that workspace.
+    #[test]
+    fn round_trip_through_a_renamed_dependency() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path();
+        std::fs::write(
+            ws.join("Cargo.toml"),
+            "[package]\nname = \"playbook\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n\
+             [dependencies]\ninfra = { version = \"0.3\", package = \"cindy\" }\n",
+        )
+        .unwrap();
+        std::fs::create_dir(ws.join("src")).unwrap();
+        let file = ws.join("src/main.rs");
+
+        // The macro must sit at a known line/column; first on line 1.
+        let source_tokens = "Creds { user: \"u\".into(), pw: \"p\".into() }";
+        let original = format!("::infra::secret!(\"rt-vault-x8\", {source_tokens});\n");
+        std::fs::write(&file, &original).unwrap();
+
+        let meta = cargo_metadata::MetadataCommand::new()
+            .no_deps()
+            .current_dir(ws)
+            .exec()
+            .unwrap();
+        let names = CindyNames::collect(&meta);
+        assert_eq!(names.for_file(&file), "infra");
+        // Outside every member: the fallback name.
+        assert_eq!(names.for_file(Path::new("/nowhere/x.rs")), "cindy");
+
+        let key = cindy::secret::crypto::generate_vault_key();
+        let payload = cindy::secret::SealedPayload {
+            value: postcard::to_allocvec(&("u", "p")).unwrap(),
+            source: source_tokens.to_owned(),
+        };
+        let ciphertext =
+            cindy::secret::crypto::seal(&key, &postcard::to_allocvec(&payload).unwrap()).unwrap();
+        let ciphertext_b64 = base64::engine::general_purpose::STANDARD.encode(&ciphertext);
+
+        let record = SealRecord {
+            file: file.display().to_string(),
+            line: 1,
+            column: 1,
+            vault: "rt-vault-x8".to_owned(),
+            ciphertext: ciphertext_b64.clone(),
+        };
+        let name = names.for_file(&file);
+        rewrite_file_seal(&file, &[record], name).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            format!("::infra::Secret::sealed_b64(\"rt-vault-x8\", {ciphertext_b64:?});\n"),
+        );
+
+        // The collector is path-liberal, so the renamed form is found
+        // back regardless of prefix.
+        let fs_sites = collect_sealed_sites(&file).unwrap();
+        assert_eq!(fs_sites.sites.len(), 1);
+
+        let mut chain = std::collections::HashMap::new();
+        chain.insert("rt-vault-x8".to_owned(), key);
+        cindy::secret::keychain::install_keys(chain);
+
+        let count = unseal_sites(&fs_sites, names.for_file(&file)).unwrap();
+        assert_eq!(count, 1);
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            format!("::infra::secret!(\"rt-vault-x8\", {source_tokens});\n"),
         );
     }
 }
