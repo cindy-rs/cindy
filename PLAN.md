@@ -59,6 +59,18 @@ for a reason that isn't visible in the code.
   (see git history).
 - **`apt::install_all` was rejected** in favour of `impl
   Into<PackageList>`, which is what `fe3dc4e` implemented.
+- **`--forks`/`--serial` were rejected** for the current fleet: the
+  fan-out cost is SSH sessions against realistic fleet sizes, and the
+  RPC byte budget already throttles the heavy traffic — the knobs
+  advertise a slowness problem cindy doesn't have. Correction of the
+  original rationale (which said rolling deploys are expressible in
+  playbook code — they aren't): each host gets its own orchestrator
+  process with no cross-host coordination point, so "deploy 10%,
+  verify, then the rest" cannot be written today. The rejection
+  stands for a router/AP fleet; if rolling deploys ever matter,
+  `--serial N` is the shape, and it must be designed as a cross-host
+  coordination primitive (one orchestrator driving hosts in batches),
+  not a per-playbook workaround.
 
 ## Priority 1 — correctness bugs
 
