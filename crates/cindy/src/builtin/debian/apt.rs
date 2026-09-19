@@ -16,13 +16,17 @@ pub enum Presence {
     /// future reinstalls.
     Purged,
     /// `apt-get install <name>`: ensure the package is installed at
-    /// any version. If it's already installed, this is a no-op (apt
-    /// will not auto-upgrade an installed package on a bare `install`).
+    /// *some* version. Satisfied the moment dpkg records the package as
+    /// installed — cindy makes no apt call, so an available newer
+    /// candidate is deliberately *not* pulled in (pin with
+    /// [`Version`] when you care).
     Present,
     /// `apt-get install <name>=<version>`: ensure the package is
-    /// installed at exactly this version string. The version string
-    /// must match what `dpkg-query` reports for the package (including
-    /// any epoch like `1:2.3.4-1`).
+    /// installed at exactly this version string, compared with
+    /// `dpkg --compare-versions eq` semantics: epoch and revision are
+    /// significant, so `1.3.0` does *not* satisfy a dpkg-reported
+    /// `1:1.3.0` (and vice versa). Copy the exact string
+    /// `dpkg-query -W -f '${Version}'` reports.
     Version(String),
 }
 
@@ -82,6 +86,25 @@ fn apt_get() -> Command {
     c
 }
 
+/// Parse one `dpkg-query -W -f '${db:Status-Abbrev}|${Version}'` line.
+///
+/// Status-Abbrev is two characters `<desired><current>`; only the
+/// current state matters for "is it installed?". The `|` separator
+/// keeps the split unambiguous even on versions containing spaces
+/// (in theory they can't, but defence-in-depth). A version is only
+/// recorded for the fully-installed state.
+fn parse_dpkg_line(raw: &str) -> (InstallStatus, Option<String>) {
+    let (abbrev, ver) = raw.split_once('|').unwrap_or((raw, ""));
+    let current = abbrev.chars().nth(1).unwrap_or(' ');
+    let status = match current {
+        'i' => InstallStatus::Installed,
+        'c' => InstallStatus::ConfigFiles,
+        _ => InstallStatus::NotInstalled,
+    };
+    let version = matches!(status, InstallStatus::Installed).then(|| ver.trim().to_owned());
+    (status, version)
+}
+
 fn read_current_state(pkg: &str) -> crate::Result<CurrentState> {
     // Status-Abbrev is two characters: `<desired><current>`. We only
     // care about the current state for "is it installed?". The format
@@ -94,16 +117,7 @@ fn read_current_state(pkg: &str) -> crate::Result<CurrentState> {
         .context("Failed to spawn `dpkg-query`")?;
 
     let (install_status, version) = if dpkg.status.success() {
-        let raw = String::from_utf8_lossy(&dpkg.stdout);
-        let (abbrev, ver) = raw.split_once('|').unwrap_or((raw.as_ref(), ""));
-        let current = abbrev.chars().nth(1).unwrap_or(' ');
-        let status = match current {
-            'i' => InstallStatus::Installed,
-            'c' => InstallStatus::ConfigFiles,
-            _ => InstallStatus::NotInstalled,
-        };
-        let version = matches!(status, InstallStatus::Installed).then(|| ver.trim().to_owned());
-        (status, version)
+        parse_dpkg_line(&String::from_utf8_lossy(&dpkg.stdout))
     } else {
         // `dpkg-query` exits non-zero when the package is unknown to
         // dpkg. That's a perfectly valid "not installed" outcome — not
@@ -148,11 +162,13 @@ fn current_to_presence(cur: &CurrentState) -> Presence {
 /// `dpkg --compare-versions`, the only correct arbiter of dpkg version
 /// semantics (epochs, `~` pre-release ordering, etc.).
 ///
-/// This is what makes `Presence::Version("1.3.0")` idempotent against a
-/// package dpkg actually records as `1:1.3.0`: a plain string `==`
-/// would see them as different and reinstall on *every* run. We treat a
-/// spawn failure as "not equal" so a broken/absent `dpkg` degrades to
-/// re-applying rather than silently claiming satisfaction.
+/// Compared with `dpkg --compare-versions eq` so debian version
+/// semantics (epoch, revision) decide equality — but note the flip
+/// side: `1.3.0` and `1:1.3.0` are *different* versions to dpkg, so a
+/// pin missing its epoch never satisfies and apt re-runs (and errors)
+/// every time. We treat a spawn failure as "not equal" so a
+/// broken/absent `dpkg` degrades to re-applying rather than silently
+/// claiming satisfaction.
 fn dpkg_versions_equal(have: &str, want: &str) -> bool {
     Command::new("dpkg")
         .args(["--compare-versions", have, "eq", want])
@@ -351,4 +367,91 @@ fn apply(state: State) -> crate::Result<crate::builtin::Return> {
     }
 
     Ok(crate::builtin::Return::from_changed(changed))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dpkg_line_parsing_covers_all_statuses() {
+        let t = |raw: &str| parse_dpkg_line(raw);
+        assert_eq!(
+            t("ii |1:2.3.4-1"),
+            (InstallStatus::Installed, Some("1:2.3.4-1".to_owned()))
+        );
+        assert_eq!(
+            t("ii|1.0"),
+            (InstallStatus::Installed, Some("1.0".to_owned()))
+        );
+        // Version recorded only for the fully-installed state, and
+        // trimmed.
+        assert_eq!(
+            t("ii | 1.0 \n"),
+            (InstallStatus::Installed, Some("1.0".to_owned()))
+        );
+        assert_eq!(t("rc |"), (InstallStatus::ConfigFiles, None));
+        assert_eq!(t("un |"), (InstallStatus::NotInstalled, None));
+        // Unknown package: dpkg-query fails, caller passes nothing —
+        // defensive parse of garbage must not panic.
+        assert_eq!(t(""), (InstallStatus::NotInstalled, None));
+        assert_eq!(t("i"), (InstallStatus::NotInstalled, None));
+    }
+
+    #[test]
+    fn presence_satisfaction_matrix() {
+        let installed = CurrentState {
+            install_status: InstallStatus::Installed,
+            version: Some("1.0".to_owned()),
+            held: false,
+        };
+        let rc = CurrentState {
+            install_status: InstallStatus::ConfigFiles,
+            version: None,
+            held: false,
+        };
+        let gone = CurrentState {
+            install_status: InstallStatus::NotInstalled,
+            version: None,
+            held: false,
+        };
+
+        // Present: satisfied iff fully installed.
+        assert!(presence_satisfied(&installed, &Presence::Present));
+        assert!(!presence_satisfied(&rc, &Presence::Present));
+        assert!(!presence_satisfied(&gone, &Presence::Present));
+
+        // Absent tolerates left-behind config files…
+        assert!(presence_satisfied(&rc, &Presence::Absent));
+        assert!(presence_satisfied(&gone, &Presence::Absent));
+        assert!(!presence_satisfied(&installed, &Presence::Absent));
+
+        // …Purged does not.
+        assert!(!presence_satisfied(&rc, &Presence::Purged));
+        assert!(presence_satisfied(&gone, &Presence::Purged));
+
+        // Version pins on non-installed packages are never satisfied
+        // (the dpkg comparison is never even consulted).
+        assert!(!presence_satisfied(&rc, &Presence::Version("1.0".to_owned())));
+        assert!(!presence_satisfied(&gone, &Presence::Version("1.0".to_owned())));
+    }
+
+    #[test]
+    fn current_state_renders_as_the_matching_presence() {
+        let installed = CurrentState {
+            install_status: InstallStatus::Installed,
+            version: Some("2:1.2.3-4".to_owned()),
+            held: false,
+        };
+        assert_eq!(
+            current_to_presence(&installed),
+            Presence::Version("2:1.2.3-4".to_owned())
+        );
+        let rc = CurrentState {
+            install_status: InstallStatus::ConfigFiles,
+            version: None,
+            held: false,
+        };
+        assert_eq!(current_to_presence(&rc), Presence::Absent);
+    }
 }

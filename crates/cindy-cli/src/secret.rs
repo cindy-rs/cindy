@@ -546,6 +546,77 @@ mod site_snippet_tests {
     }
 }
 
+#[cfg(test)]
+mod seal_unseal_roundtrip_tests {
+    use super::*;
+    use base64::Engine as _;
+
+    /// Drive the full source-rewriting half of the seal/unseal workflow
+    /// against a real file, with a real vault key and ciphertext: a
+    /// `secret!` call gets spliced into `Secret::sealed_b64`, found back
+    /// by the collector, and decrypted back into the original source
+    /// tokens. This is the only code path that rewrites the user's
+    /// source files and the last place the plaintext exists.
+    #[test]
+    fn seal_then_unseal_restores_the_source_call() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("playbook.rs");
+
+        // The macro must sit at a known line/column for the seal record
+        // to target it; putting it first on line 1 makes column 1.
+        let source_tokens = "Creds { user: \"u\".into(), pw: \"p\".into() }";
+        let original = format!("::cindy::secret!(\"rt-vault-x7\", {source_tokens});\n");
+        std::fs::write(&file, &original).unwrap();
+
+        // Build the ciphertext exactly the way the `secret!` macro's
+        // serialize thunk (and thus the orchestrator's seal mode) does.
+        let key = cindy::secret::crypto::generate_vault_key();
+        let payload = cindy::secret::SealedPayload {
+            value: postcard::to_allocvec(&("u", "p")).unwrap(),
+            source: source_tokens.to_owned(),
+        };
+        let ciphertext = cindy::secret::crypto::seal(
+            &key,
+            &postcard::to_allocvec(&payload).unwrap(),
+        )
+        .unwrap();
+        let ciphertext_b64 =
+            base64::engine::general_purpose::STANDARD.encode(&ciphertext);
+
+        // Seal: splice the call into the sealed form.
+        let record = SealRecord {
+            file: file.display().to_string(),
+            line: 1,
+            column: 1,
+            vault: "rt-vault-x7".to_owned(),
+            ciphertext: ciphertext_b64.clone(),
+        };
+        rewrite_file_seal(&file, &[record]).unwrap();
+        let sealed_source = std::fs::read_to_string(&file).unwrap();
+        assert_eq!(
+            sealed_source,
+            format!("::cindy::Secret::sealed_b64(\"rt-vault-x7\", {ciphertext_b64:?});\n"),
+        );
+
+        // Unseal: find the sealed call back, decrypt, splice.
+        let fs_sites = collect_sealed_sites(&file).unwrap();
+        assert_eq!(fs_sites.sites.len(), 1);
+        assert_eq!(fs_sites.sites[0].vault, "rt-vault-x7");
+        assert_eq!(fs_sites.sites[0].ciphertext_b64, ciphertext_b64);
+
+        let mut chain = std::collections::HashMap::new();
+        chain.insert("rt-vault-x7".to_owned(), key);
+        cindy::secret::keychain::install_keys(chain);
+
+        let count = unseal_sites(&fs_sites).unwrap();
+        assert_eq!(count, 1);
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            format!("::cindy::secret!(\"rt-vault-x7\", {source_tokens});\n"),
+        );
+    }
+}
+
 /// Per-file line cache for building picker labels without re-reading
 /// the same source file once per record.
 #[derive(Default)]
