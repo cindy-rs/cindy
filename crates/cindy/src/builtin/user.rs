@@ -512,6 +512,35 @@ pub fn absent_with_home(name: impl Into<String>) -> crate::Result<super::Return>
     })
 }
 
+/// Reconcile an existing account towards `want`: one comparison pass
+/// builds both the diff view and the `usermod` argv. Returns whether
+/// the account changed. Used both for the plain reconcile path and
+/// after losing a create race, where the account another agent
+/// created may not match the request.
+fn reconcile_existing(name: &str, want: &Presence, observed: &Presence) -> crate::Result<bool> {
+    let have @ Presence::Present { uid: live_uid, .. } = observed else {
+        unreachable!("reconcile_existing expects a live Present account");
+    };
+    // System-ness is not independent of the UID: an account is a
+    // system account iff its UID ≤ SYS_UID_MAX. The request must agree
+    // with the UID the account will end up with — the requested `uid`
+    // if set, else the live one. A consistent `uid` + `system` pair
+    // can migrate an account across the boundary; an inconsistent one
+    // can never converge.
+    check_system_consistency(name, want, *live_uid)?;
+    let ReconcileResult { args, desired } = reconcile(want, have);
+    show_diff(name, observed.clone(), desired);
+
+    if args.is_empty() {
+        Ok(false)
+    } else {
+        let mut cmd = Command::new("usermod");
+        cmd.args(&args).args(["--", name]);
+        super::run_check_retry_locks(&mut cmd)?;
+        Ok(true)
+    }
+}
+
 fn apply(state: State) -> crate::Result<super::Return> {
     let observed = observe(&state.name)?;
 
@@ -536,32 +565,31 @@ fn apply(state: State) -> crate::Result<super::Return> {
             show_diff(&state.name, observed.clone(), want.clone());
             let mut cmd = Command::new("useradd");
             cmd.args(useradd_args(want)).args(["--", &state.name]);
-            super::run_check_retry_locks(&mut cmd)?;
-            true
+            match super::run_check_retry_locks(&mut cmd) {
+                Ok(()) => true,
+                // A concurrent run created the account between our
+                // observation and our `useradd` — the desired end
+                // state arriving by another hand, not a lock problem
+                // (that path retried already). Re-observe and
+                // reconcile what actually landed; if it is somehow
+                // still gone, the failure was real and is reported
+                // as-is.
+                Err(e) if super::is_create_race(&e) => {
+                    let now = observe(&state.name)?;
+                    match &now {
+                        present @ Presence::Present { .. } => {
+                            reconcile_existing(&state.name, want, present)?
+                        }
+                        _ => return Err(e),
+                    }
+                }
+                Err(e) => return Err(e),
+            }
         }
 
-        // Reconcile an existing account: a single comparison pass builds
-        // both the struct diff and the `usermod` argv.
-        (want @ Presence::Present { .. }, have @ Presence::Present { uid: live_uid, .. }) => {
-            // System-ness is not independent of the UID: an account is
-            // a system account iff its UID ≤ SYS_UID_MAX. The request
-            // must agree with the UID the account will end up with —
-            // the requested `uid` if set, else the live one. A
-            // consistent `uid` + `system` pair can migrate an account
-            // across the boundary; an inconsistent one can never
-            // converge.
-            check_system_consistency(&state.name, want, *live_uid)?;
-            let ReconcileResult { args, desired } = reconcile(want, have);
-            show_diff(&state.name, observed.clone(), desired);
-
-            if args.is_empty() {
-                false
-            } else {
-                let mut cmd = Command::new("usermod");
-                cmd.args(&args).args(["--", &state.name]);
-                super::run_check_retry_locks(&mut cmd)?;
-                true
-            }
+        // Reconcile an existing account.
+        (want @ Presence::Present { .. }, Presence::Present { .. }) => {
+            reconcile_existing(&state.name, want, &observed)?
         }
     };
 

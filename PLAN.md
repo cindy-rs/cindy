@@ -61,23 +61,6 @@ for a reason that isn't visible in the code.
 
 ## Priority 1 — correctness bugs
 
-### Shadow-utils: the observe→mutate race is still open
-
-`fe3dc4e` added `run_check_retry_locks`, which handles lock contention.
-It does not handle this: two concurrent runs both `observe()` "user
-absent" through nix, both spawn `useradd`, and the loser fails with
-`user 'bob' already exists`. That is correctly *not* treated as lock
-contention, so it doesn't retry — and the play fails.
-
-**Approach:** treat `already exists` (and `GID already in use`) as
-convergence rather than failure — re-observe and reconcile. Another
-agent having created the user is the desired end state, not an error.
-The alternative, a cindy-private `flock` wrapping observe+mutate, also
-works but costs a lock file; prefer the first.
-
-**Done when:** a test drives two concurrent `user::present` calls for the
-same name and both report success, one `Changed` and one `Unchanged`.
-
 ### Decompression has no output ceiling
 
 `crates/cindy/src/builtin/decompress.rs:27` decompresses into an

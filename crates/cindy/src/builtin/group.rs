@@ -213,18 +213,51 @@ fn check_system_consistency(
     Ok(())
 }
 
+/// Reconcile an existing group towards `want`: reconcile the GID, with
+/// the "new" diff view reporting system derived from the target GID —
+/// honest about the side effect of moving it across the system
+/// boundary. Any requested `system` is checked against the GID the
+/// group would keep or move to, covering both the plain reconcile
+/// path and the create-race path (where the group another agent
+/// created may sit on the wrong side of the boundary for the request).
+/// Returns whether the group changed.
+fn reconcile_existing(name: &str, want: &Presence, observed: &Presence) -> crate::Result<bool> {
+    let (
+        Presence::Present { gid: want_gid, .. },
+        Presence::Present {
+            gid: Some(have_gid),
+            ..
+        },
+    ) = (want, observed)
+    else {
+        // Observed groups always carry a GID.
+        unreachable!("reconcile_existing expects a live Present group");
+    };
+    check_system_consistency(name, want, Some(*have_gid))?;
+    match want_gid {
+        Some(w) if *w != *have_gid => {
+            show_diff(
+                name,
+                observed.clone(),
+                Presence::Present {
+                    gid: Some(*w),
+                    system: Some(*w <= sys_gid_max()),
+                },
+            );
+            super::run_check_retry_locks(Command::new("groupmod").args([
+                "--gid",
+                &w.to_string(),
+                "--",
+                name,
+            ]))?;
+            Ok(true)
+        }
+        _ => Ok(false),
+    }
+}
+
 fn apply(state: State) -> crate::Result<super::Return> {
     let observed = observe(&state.name)?;
-
-    // Reconciling an existing group: reject a `system` request that
-    // contradicts the GID the group would keep or move to — before any
-    // arm can act on a subset of the request (the GID arm used to skip
-    // this check entirely).
-    if let (want @ Presence::Present { .. }, Presence::Present { gid, .. }) =
-        (&state.presence, &observed)
-    {
-        check_system_consistency(&state.name, want, *gid)?;
-    }
 
     let changed = match (&state.presence, &observed) {
         // Want absent, already gone.
@@ -248,44 +281,32 @@ fn apply(state: State) -> crate::Result<super::Return> {
             if let Some(gid) = gid {
                 cmd.args(["--gid", &gid.to_string()]);
             }
-            super::run_check_retry_locks(cmd.args(["--", &state.name]))?;
-            true
+            match super::run_check_retry_locks(cmd.args(["--", &state.name])) {
+                Ok(()) => true,
+                // A concurrent run created the group between our
+                // observation and our `groupadd` — the desired end
+                // state arriving by another hand, not a lock problem
+                // (that path retried already). Re-observe and
+                // reconcile what actually landed; if it is somehow
+                // still gone, the failure was real and is reported
+                // as-is.
+                Err(e) if super::is_create_race(&e) => {
+                    let now = observe(&state.name)?;
+                    match &now {
+                        present @ Presence::Present { .. } => {
+                            reconcile_existing(&state.name, want, present)?
+                        }
+                        _ => return Err(e),
+                    }
+                }
+                Err(e) => return Err(e),
+            }
         }
 
-        // Want present, already present → reconcile the GID. The
-        // consistency check above the match has already guaranteed any
-        // requested `system` agrees with the resulting GID, so the
-        // "new" diff view reporting system derived from the target GID
-        // is honest about the side effect of moving it across the
-        // system boundary.
-        (
-            Presence::Present {
-                gid: Some(want), ..
-            },
-            Presence::Present {
-                gid: Some(have), ..
-            },
-        ) if want != have => {
-            show_diff(
-                &state.name,
-                observed.clone(),
-                Presence::Present {
-                    gid: Some(*want),
-                    system: Some(*want <= sys_gid_max()),
-                },
-            );
-            super::run_check_retry_locks(Command::new("groupmod").args([
-                "--gid",
-                &want.to_string(),
-                "--",
-                &state.name,
-            ]))?;
-            true
+        // Want present, already present → reconcile.
+        (want @ Presence::Present { .. }, Presence::Present { .. }) => {
+            reconcile_existing(&state.name, want, &observed)?
         }
-
-        // No GID change (and any `system` request either matched the
-        // live GID or was rejected above).
-        (Presence::Present { .. }, Presence::Present { .. }) => false,
     };
 
     Ok(super::Return::from_changed(changed))

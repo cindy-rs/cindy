@@ -309,3 +309,60 @@ pub(crate) fn run_check_retry_locks(cmd: &mut std::process::Command) -> crate::R
     // The loop either returns or bails on its final attempt.
     unreachable!("the retry loop returns or bails on attempt {LOCK_ATTEMPTS}")
 }
+
+/// Did this create failure mean "another agent won the race to create
+/// it"?
+///
+/// `run_check_retry_locks` handles two cindy runs colliding on the
+/// shadow-utils *lock*; this is the other race — both runs observe the
+/// account absent, both spawn `useradd`/`groupadd`, and the loser is
+/// told `user 'bob' already exists` / `group 'web' already exists`
+/// (or, checking the GID first, `GID '2000' already in use`). The
+/// winner having created the desired account is the desired end
+/// state, not an error, so callers re-observe and reconcile.
+///
+/// The wording match is only a pre-filter: a false positive costs the
+/// caller one re-observation, after which a still-absent account
+/// propagates the original error. A false negative just reports a
+/// race the caller would have survived — failure is loud either way.
+fn is_create_race(err: &impl std::fmt::Display) -> bool {
+    let msg = err.to_string();
+    msg.contains("already exists") || msg.contains("already in use")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn failure(stderr: &str) -> crate::Result<()> {
+        crate::bail!("\"useradd\" failed:\n--- stderr ---\n{stderr}")
+    }
+
+    #[test]
+    fn create_races_are_recognised_by_the_tools_own_words() {
+        assert!(is_create_race(
+            &failure("useradd: user 'bob' already exists\n").unwrap_err()
+        ));
+        assert!(is_create_race(
+            &failure("groupadd: group 'web' already exists\n").unwrap_err()
+        ));
+        // `groupadd --gid` can check GID availability before the name.
+        assert!(is_create_race(
+            &failure("groupadd: GID '2000' already in use\n").unwrap_err()
+        ));
+    }
+
+    #[test]
+    fn lock_contention_and_genuine_failures_are_not_create_races() {
+        // Contention has its own retry path in run_check_retry_locks.
+        assert!(!is_create_race(
+            &failure("useradd: cannot lock /etc/passwd; try again later.").unwrap_err()
+        ));
+        assert!(!is_create_race(
+            &failure("useradd: cannot create directory /home/bob").unwrap_err()
+        ));
+        assert!(!is_create_race(
+            &failure("useradd: invalid user name 'x y'").unwrap_err()
+        ));
+    }
+}
