@@ -86,8 +86,12 @@ pub fn unseal(key: &VaultKey, framed: &[u8]) -> crate::Result<Zeroizing<Vec<u8>>
         // Both layouts failed. Without this arm a future-format blob
         // dies with the bare `AEAD decryption failed` — exactly the
         // parse-failure-indistinguishable-from-corruption outcome the
-        // version byte exists to eliminate.
-        Some(&byte) if (1..0x10).contains(&byte) => anyhow_serde::Error::msg(format!(
+        // version byte exists to eliminate. The range starts above
+        // `BLOB_VERSION`: a blob carrying the *current* version that
+        // fails both layouts is a wrong key or corruption (the most
+        // common secrets failure), and must keep that error, not be
+        // sent chasing a cindy upgrade.
+        Some(&byte) if byte > BLOB_VERSION && byte < 0x10 => anyhow_serde::Error::msg(format!(
             "sealed blob reports version {byte}, which this cindy doesn't understand \
              (it knows {BLOB_VERSION}); it was probably sealed by a newer cindy — \
              upgrade and re-run"
@@ -153,7 +157,20 @@ mod tests {
         let key_a = generate_vault_key();
         let key_b = generate_vault_key();
         let ct = seal(&key_a, b"x").unwrap();
-        assert!(unseal(&key_b, &ct).is_err());
+        let err = unseal(&key_b, &ct).unwrap_err().to_string();
+        // The message IS the feature here: a wrong key on a
+        // current-format blob must report the decrypt failure, never
+        // a version claim — b268fa3 shipped exactly that regression
+        // (a self-contradictory "reports version 1 … it knows 1")
+        // because this test only asserted is_err().
+        assert!(
+            err.contains("AEAD decryption failed"),
+            "wrong-key failure must name decryption, not a version: {err}"
+        );
+        assert!(
+            !err.contains("version"),
+            "wrong key misread as a version: {err}"
+        );
     }
 
     /// Blobs sealed before the version byte existed have no prefix and
