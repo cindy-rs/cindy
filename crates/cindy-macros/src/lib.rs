@@ -58,6 +58,15 @@ fn check_remote_arg(ty: &syn::Type) -> Option<&'static str> {
 #[proc_macro_attribute]
 pub fn wire(_args: TokenStream, input: TokenStream) -> TokenStream {
     let item = parse_macro_input!(input as Item);
+    if !matches!(
+        item,
+        Item::Enum(_) | Item::Struct(_) | Item::Union(_)
+    ) {
+        return compile_err(
+            syn::spanned::Spanned::span(&item),
+            "`#[cindy::wire]` can only be applied to structs, enums, and unions",
+        );
+    }
 
     quote! {
         #[derive(
@@ -98,6 +107,52 @@ pub fn main(_args: TokenStream, input: TokenStream) -> TokenStream {
     let (attrs, vis, sig, block) = (&input.attrs, &input.vis, &input.sig, &input.block);
     let output = &sig.output;
     let inputs = &sig.inputs;
+
+    // The expansion matches on the user fn's return value to pick the
+    // exit code, so anything but a `Result` surfaces here as a cryptic
+    // type error inside generated code. Reject it at the fn instead.
+    let returns_result = match output {
+        syn::ReturnType::Default => false,
+        syn::ReturnType::Type(_, ty) => match &**ty {
+            syn::Type::Path(p) => p
+                .path
+                .segments
+                .last()
+                .is_some_and(|s| s.ident == "Result"),
+            _ => false,
+        },
+    };
+    if !returns_result {
+        return compile_err(
+            syn::spanned::Spanned::span(output),
+            "`#[cindy::main]` must return a `Result` (e.g. `-> cindy::Result<()>`): \
+             the generated wrapper matches on `Ok`/`Err` to pick the process exit code",
+        );
+    }
+    if let Some(c) = &sig.constness {
+        return compile_err(c.span, "`#[cindy::main]` functions cannot be `const`");
+    }
+    if let Some(u) = &sig.unsafety {
+        return compile_err(u.span, "`#[cindy::main]` functions cannot be `unsafe`");
+    }
+    if let Some(abi) = &sig.abi {
+        return compile_err(
+            abi.extern_token.span,
+            "`#[cindy::main]` functions cannot be declared with an ABI",
+        );
+    }
+    if let Some(v) = &sig.variadic {
+        return compile_err(
+            syn::spanned::Spanned::span(v),
+            "`#[cindy::main]` functions cannot be variadic",
+        );
+    }
+    if !sig.generics.params.is_empty() {
+        return compile_err(
+            syn::spanned::Spanned::span(&sig.generics),
+            "`#[cindy::main]` functions cannot be generic",
+        );
+    }
 
     let invoke_user_main = match inputs.len() {
         0 => quote! {
