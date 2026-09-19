@@ -417,6 +417,7 @@ dependencies = [
  "color-eyre",
  "crossterm",
  "eyre",
+ "flate2",
  "futures-util",
  "nom",
  "nucleo-matcher",

@@ -60,6 +60,13 @@ enum Subcommand {
         /// code mutates).
         #[clap(long)]
         check: bool,
+        /// Directory on the targets where the worker binary is staged
+        /// before execution (default /tmp). The worker is a throwaway
+        /// that deletes itself; but if the default is mounted noexec,
+        /// execution fails with a bare permission error — point this
+        /// at an exec-mounted path (e.g. /var/tmp).
+        #[clap(long)]
+        staging_dir: Option<String>,
     },
     Inventory {
         #[clap(long)]
@@ -408,12 +415,18 @@ async fn run_after_launch(
         }
     }
 
-    let (limit, unprivileged, check_mode) = match subcommand {
+    let (limit, unprivileged, check_mode, staging_dir) = match subcommand {
         Subcommand::Play {
             limit,
             unprivileged,
             check,
-        } => (limit, unprivileged, check),
+            staging_dir,
+        } => (
+            limit,
+            unprivileged,
+            check,
+            staging_dir.unwrap_or_else(|| "/tmp".to_owned()),
+        ),
         Subcommand::Inventory { host, json, reveal } => {
             if json {
                 // Pick the JSON source: the secrets-decrypted whole
@@ -593,20 +606,35 @@ async fn run_after_launch(
         .into_iter()
         .collect::<HashMap<_, _>>();
 
-    // Read each platform's worker binary once and share the bytes
-    // across every host's upload: a 200-host fan-out on one platform
-    // used to re-read the same ~8 MB static binary 200 times, once
-    // per deployment task, blocking the async runtime's thread each
-    // time.
+    // Read each platform's worker binary once, gzip it once, and
+    // share the compressed bytes across every host's upload: a
+    // 200-host fan-out on one platform used to re-read the same ~8 MB
+    // static binary 200 times, once per deployment task, blocking the
+    // async runtime's thread each time — and re-send it uncompressed
+    // every time. Static musl binaries compress ~2.5-3x, so the
+    // upload shrinks by the same factor; the target decompresses with
+    // `gzip -dc`, which busybox and coreutils both ship.
     let mut worker_binaries: HashMap<&'static platforms::Platform, Arc<[u8]>> = HashMap::new();
     for (platform, path) in &compilation_results {
-        worker_binaries.insert(
-            *platform,
-            tokio::fs::read(path)
-                .await
-                .map(Arc::from)
-                .with_context(|| format!("Reading worker binary {}", path.display()))?,
+        let raw = tokio::fs::read(path)
+            .await
+            .with_context(|| format!("Reading worker binary {}", path.display()))?;
+        let raw_len = raw.len();
+        let compressed = tokio::task::spawn_blocking(move || {
+            let mut encoder =
+                flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::best());
+            std::io::Write::write_all(&mut encoder, &raw).and_then(|()| encoder.finish())
+        })
+        .await
+        .context("Compressing worker binary")?
+        .context("Compressing worker binary")?;
+        tracing::debug!(
+            platform = platform.target_triple,
+            raw = raw_len,
+            compressed = compressed.len(),
+            "gzipped worker binary"
         );
+        worker_binaries.insert(*platform, Arc::from(compressed));
     }
     let worker_binaries = Arc::new(worker_binaries);
 
@@ -666,6 +694,7 @@ async fn run_after_launch(
         let worker_binaries = Arc::clone(&worker_binaries);
         let host_contexts = Arc::clone(&host_contexts);
         let host_vault_keys = Arc::clone(&host_vault_keys);
+        let staging_dir = staging_dir.clone();
         let progress_tx = progress_tx.clone();
 
         async move {
@@ -680,12 +709,19 @@ async fn run_after_launch(
                         .expect("Not compiled"),
                 );
 
+                // A throwaway name: the worker unlinks its own
+                // executable on startup, so nothing accumulates on the
+                // target. `--staging-dir` relocates it for hosts whose
+                // /tmp is mounted noexec.
                 let remote_tmp_path = format!(
-                    "/tmp/.cindy-worker.{}",
+                    "{staging_dir}/.cindy-worker.{}",
                     rand::distr::SampleString::sample_string(&rand::distr::Alphanumeric, &mut rand::rng(), 16),
                 );
 
-                // Upload worker binary executable.
+                // Upload the gzip-compressed worker, decompressing on
+                // the target (`gzip -dc` reading the pipe — busybox and
+                // coreutils both ship it, and the decompressed bytes
+                // never take a second round-trip).
                 //
                 // stdout/stderr are piped (not inherited): if `sudo` refuses
                 // — e.g. the host needs a password — its message must land in
@@ -695,7 +731,7 @@ async fn run_after_launch(
                 let mut upload = host
                     .session
                     .conditional_sudo_command(host.use_sudo, "sh")
-                    .args(["-c", &format!("umask 0266 && cat >'{remote_tmp_path}' && chmod u+x '{remote_tmp_path}'")])
+                    .args(["-c", &format!("umask 0266 && gzip -dc >'{remote_tmp_path}' && chmod u+x '{remote_tmp_path}'")])
                     .stdin(Stdio::piped())
                     .stdout(Stdio::piped())
                     .stderr(Stdio::piped())
@@ -711,6 +747,8 @@ async fn run_after_launch(
                 ));
 
                 if let Some(mut stdin) = upload.stdin().take() {
+                    // `worker_bin` is the gzipped payload (see the read
+                    // step above).
                     // If the remote command died before we finished writing
                     // (e.g. `sudo -n` exited because a password was required),
                     // the write fails with a broken pipe. That error is just a
@@ -831,10 +869,35 @@ async fn run_after_launch(
                 // The worker stays alive serving RPC; closing the pipe to it
                 // (by dropping the child, which we took its stdio out of) ends
                 // its read loop so it exits.
-                drop(remote_run);
+                // On failure, get the worker's own exit before letting
+                // it go: exit 126 is the shell's "found but couldn't
+                // execute" — the signature of a staging directory
+                // mounted noexec, which otherwise surfaces only as a
+                // cryptic "RPC connection closed". (The worker is dead
+                // in that case, so this wait is instant; in a normal
+                // play failure its stdin has already EOF'd and it
+                // exits on its own.)
                 if !orch_exit.success() {
-                    eyre::bail!("play failed (orchestrator exited with {orch_exit})");
+                    // `wait` consumes the child; its exit 126 is the
+                    // shell's "found but couldn't execute" — the
+                    // signature of a noexec staging directory, which
+                    // otherwise surfaces only as a cryptic "RPC
+                    // connection closed". (The worker is already dead
+                    // in that case, so this wait is instant; in a
+                    // normal play failure its stdin has already EOF'd
+                    // and it exits on its own.)
+                    let worker_exit = remote_run.wait().await;
+                    let worker_hint = match worker_exit {
+                        Ok(status) if status.code() == Some(126) => format!(
+                            " — the worker couldn't be executed (exit 126); if {staging_dir} \
+                             is mounted noexec, pass --staging-dir pointing at an \
+                             exec-mounted path"
+                        ),
+                        _ => String::new(),
+                    };
+                    eyre::bail!("play failed (orchestrator exited with {orch_exit}){worker_hint}");
                 }
+                drop(remote_run);
 
                 tracing::info!("Execution successfully completed.");
                 Ok::<(), eyre::Error>(())
