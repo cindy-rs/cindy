@@ -177,7 +177,7 @@ fn apply(state: State) -> crate::Result<super::Return> {
         // Want absent, currently present → delete.
         (Presence::Absent, present @ Presence::Present { .. }) => {
             show_diff(&state.name, present.clone(), Presence::Absent);
-            super::run_check(Command::new("groupdel").args(["--", &state.name]))?;
+            super::run_check_retry_locks(Command::new("groupdel").args(["--", &state.name]))?;
             true
         }
 
@@ -191,7 +191,7 @@ fn apply(state: State) -> crate::Result<super::Return> {
             if let Some(gid) = gid {
                 cmd.args(["--gid", &gid.to_string()]);
             }
-            super::run_check(cmd.args(["--", &state.name]))?;
+            super::run_check_retry_locks(cmd.args(["--", &state.name]))?;
             true
         }
 
@@ -218,7 +218,7 @@ fn apply(state: State) -> crate::Result<super::Return> {
                     system: Some(*want <= sys_gid_max()),
                 },
             );
-            super::run_check(Command::new("groupmod").args([
+            super::run_check_retry_locks(Command::new("groupmod").args([
                 "--gid",
                 &want.to_string(),
                 "--",

@@ -472,7 +472,7 @@ fn apply(state: State) -> crate::Result<super::Return> {
             if *remove_home {
                 cmd.arg("--remove");
             }
-            super::run_check(cmd.args(["--", &state.name]))?;
+            super::run_check_retry_locks(cmd.args(["--", &state.name]))?;
             true
         }
 
@@ -481,7 +481,7 @@ fn apply(state: State) -> crate::Result<super::Return> {
             show_diff(&state.name, observed.clone(), want.clone());
             let mut cmd = Command::new("useradd");
             cmd.args(useradd_args(want)).args(["--", &state.name]);
-            super::run_check(&mut cmd)?;
+            super::run_check_retry_locks(&mut cmd)?;
             true
         }
 
@@ -518,7 +518,7 @@ fn apply(state: State) -> crate::Result<super::Return> {
             } else {
                 let mut cmd = Command::new("usermod");
                 cmd.args(&args).args(["--", &state.name]);
-                super::run_check(&mut cmd)?;
+                super::run_check_retry_locks(&mut cmd)?;
                 true
             }
         }

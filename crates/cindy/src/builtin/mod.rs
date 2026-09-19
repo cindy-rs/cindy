@@ -200,3 +200,94 @@ pub(crate) fn run_check(cmd: &mut std::process::Command) -> crate::Result<()> {
     }
     Ok(())
 }
+
+/// Attempts (including the first) before a lock-contended shadow-utils
+/// call is reported as a failure.
+const LOCK_ATTEMPTS: u32 = 8;
+
+/// First backoff step; doubles each attempt up to [`LOCK_BACKOFF_CAP`].
+const LOCK_BACKOFF_BASE: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// Ceiling on a single backoff step, so eight attempts land around ten
+/// seconds rather than growing unboundedly.
+const LOCK_BACKOFF_CAP: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Does this output look like the tool telling us its global lock was
+/// already taken?
+///
+/// shadow-utils prints `cannot lock /etc/passwd; try again later.` (and
+/// the `/etc/group`, `/etc/shadow`, `/etc/gshadow` variants) and exits
+/// non-zero. Matching its own words is far more precise than matching
+/// exit codes: `useradd` uses exit 1 for *any* "can't update password
+/// file" condition, including a read-only filesystem or a corrupt file,
+/// neither of which a retry can fix.
+fn is_lock_contention(stderr: &str) -> bool {
+    let lowered = stderr.to_ascii_lowercase();
+    lowered.contains("cannot lock") || lowered.contains("try again later")
+}
+
+/// Pseudo-random fraction of `step` to add as jitter.
+///
+/// Two `cindy` runs that collide would otherwise back off in lockstep
+/// and keep colliding. The clock's sub-second component decorrelates
+/// retries within one process; the pid decorrelates them between
+/// processes — which is exactly the case here, since the contender is
+/// another operator's worker on the same host. Not worth a `rand`
+/// dependency in the framework crate for this.
+fn backoff_jitter(step: std::time::Duration) -> std::time::Duration {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| u64::from(d.subsec_nanos()));
+    let spread = (nanos ^ u64::from(std::process::id())) % 1000;
+    step.mul_f64(spread as f64 / 1000.0)
+}
+
+/// Like [`run_check`], but retries while the tool reports that it
+/// couldn't take its global lock.
+///
+/// `useradd`/`usermod`/`groupadd`/… serialise on `/etc/passwd` and
+/// `/etc/group` through `lckpwdf(3)` and, on contention, **fail fast** —
+/// they never wait, and shadow-utils offers no timeout flag to make them
+/// (unlike apt, which has `DPkg::Lock::Timeout`). So two concurrent
+/// `cindy` runs against one host — two engineers deploying at once, or
+/// one play's own `join!`ed user tasks — used to surface as a hard play
+/// failure with a confusing message.
+///
+/// Retrying is the correct response precisely *because* the tool fails
+/// fast: the lock is held only for the duration of one invocation,
+/// typically well under a second. Anything that isn't lock contention
+/// fails on the first attempt, so a genuine error is still reported
+/// immediately rather than eight backoffs later.
+pub(crate) fn run_check_retry_locks(cmd: &mut std::process::Command) -> crate::Result<()> {
+    use crate::Context as _;
+
+    let mut step = LOCK_BACKOFF_BASE;
+    for attempt in 1..=LOCK_ATTEMPTS {
+        let out = cmd
+            .output()
+            .context(format!("Failed to spawn {:?}", cmd.get_program()))?;
+        if out.status.success() {
+            return Ok(());
+        }
+
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        if !is_lock_contention(&stderr) || attempt == LOCK_ATTEMPTS {
+            crate::bail!(
+                "{:?} failed with {:?}{}:\n--- stdout ---\n{}\n--- stderr ---\n{stderr}",
+                cmd.get_program(),
+                out.status,
+                if attempt > 1 {
+                    format!(" after {attempt} attempts (the lock stayed held)")
+                } else {
+                    String::new()
+                },
+                String::from_utf8_lossy(&out.stdout),
+            );
+        }
+
+        std::thread::sleep(step + backoff_jitter(step));
+        step = (step * 2).min(LOCK_BACKOFF_CAP);
+    }
+    // The loop either returns or bails on its final attempt.
+    unreachable!("the retry loop returns or bails on attempt {LOCK_ATTEMPTS}")
+}

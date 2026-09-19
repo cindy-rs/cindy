@@ -508,11 +508,11 @@ const BUILTINS: &[BuiltinModule] = &[
     },
     BuiltinModule {
         path: "debian::apt",
-        summary: "manage a single apt package",
+        summary: "manage apt packages",
         fns: &[
             BuiltinFn {
-                sig: "install(name)",
-                desc: "Ensure the package is installed at any version.",
+                sig: "install(packages)",
+                desc: "Ensure the packages are installed at any version. Takes one name or a collection — a batch is one apt call, one lock, one dependency solve.",
             },
             BuiltinFn {
                 sig: "install_version(name, version)",
@@ -523,12 +523,12 @@ const BUILTINS: &[BuiltinModule] = &[
                 desc: "Install an exact version, then apt-mark hold it.",
             },
             BuiltinFn {
-                sig: "remove / purge (name)",
-                desc: "Remove the package (purge also drops config files).",
+                sig: "remove / purge (packages)",
+                desc: "Remove the packages (purge also drops config files).",
             },
             BuiltinFn {
                 sig: "apt(State)",
-                desc: "Full control over presence and hold state.",
+                desc: "Full control over presence and hold state, with per-package version pins.",
             },
         ],
     },
