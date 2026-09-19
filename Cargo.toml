@@ -22,7 +22,6 @@ keywords = ["ansible", "infrastructure", "iac", "management", "provisioning"]
 cindy = { path = "crates/cindy", version = "0.3.0" }
 cindy-macros = { path = "crates/cindy-macros", version = "0.3.0" }
 
-askama = "0.16"
 postcard = "1.1"
 proc-macro2 = "1.0"
 proc-macro-crate = "3"

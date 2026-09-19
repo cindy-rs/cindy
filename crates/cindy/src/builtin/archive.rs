@@ -251,7 +251,7 @@ fn apply(state: State) -> crate::Result<super::Return> {
     let (user, group) = super::current_owner_names();
     super::path::file_raw::inner(
         state.dest,
-        bytes.into(),
+        bytes,
         user,
         group,
         state.mode.unwrap_or(super::path::Mode(0o644)),

@@ -29,8 +29,3 @@ mod reveal;
 #[allow(deprecated)]
 #[path = "../../../web/src/snippets/secret.rs"]
 mod secret;
-
-// The template/secret-redaction snippet needs both the `askama` feature
-// (for the derive) and a `Secret<T>` in scope.
-#[path = "../../../web/src/snippets/template.rs"]
-mod template;

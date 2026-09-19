@@ -15,8 +15,4 @@ orchestrator = ["cindy/orchestrator"]
 remote = ["cindy/remote"]
 
 [dependencies]
-# `askama` on, because one snippet demonstrates the template-based
-# secret redaction — which is exactly the integration worth compile-
-# checking against the real library.
-cindy = { workspace = true, features = ["askama"] }
-askama = { workspace = true }
+cindy = { workspace = true }

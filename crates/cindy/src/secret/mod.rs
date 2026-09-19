@@ -331,21 +331,6 @@ pub(crate) fn revealing() -> bool {
     REVEAL_SECRETS.with(|c| c.get())
 }
 
-/// Restores `REVEAL_SECRETS` on drop.
-///
-/// A plain save/restore around the closure is wrong: if the closure
-/// panics, the flag stays set on a thread the tokio runtime will hand to
-/// the next task, and *that* task's `Debug`/`Serialize` would then emit
-/// plaintext. Unwinding through a `Drop` impl is what makes the scope
-/// actually scoped.
-struct RevealGuard(bool);
-
-impl Drop for RevealGuard {
-    fn drop(&mut self) {
-        REVEAL_SECRETS.with(|c| c.set(self.0));
-    }
-}
-
 /// Run `f` with secret revelation enabled on the current thread, then
 /// restore the previous setting. Inside the closure, `Debug` and
 /// `Serialize` of any `Secret<T>` render the *decrypted value* rather
@@ -360,84 +345,19 @@ pub fn with_revealed_secrets<R>(f: impl FnOnce() -> R) -> R {
     f()
 }
 
-/// What a secret collapses to in the redacted render pass.
-pub const REDACTION: &str = "***";
+/// Restores `REVEAL_SECRETS` on drop.
+///
+/// Saving and restoring around the call is not equivalent: if `f`
+/// panics, the restore never runs and reveal mode stays set on a thread
+/// the tokio runtime will hand to the next task — whose `Debug` /
+/// `Serialize` would then emit plaintext. Unwinding through `Drop` is
+/// what makes the scope actually scoped.
+struct RevealGuard(bool);
 
-/// Which pass of a [`render_both`] render is in flight on this thread.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum RenderMode {
-    /// Producing the bytes that will be written to the target: secrets
-    /// render as their plaintext.
-    Real,
-    /// Producing the rendering every diff and log line is built from:
-    /// secrets collapse to [`REDACTION`].
-    Redacted,
-}
-
-thread_local! {
-    /// `None` outside a framework render. Set only by [`render_both`].
-    static RENDER_MODE: std::cell::Cell<Option<RenderMode>> =
-        const { std::cell::Cell::new(None) };
-}
-
-/// Restores the previous render mode on drop — see [`RevealGuard`] for
-/// why this can't be a plain save/restore. Leaking `Real` here would be
-/// worse: the *next* redacted render on this thread would emit
-/// plaintext into a diff.
-struct RenderGuard(Option<RenderMode>);
-
-impl Drop for RenderGuard {
+impl Drop for RevealGuard {
     fn drop(&mut self) {
-        RENDER_MODE.with(|c| c.set(self.0));
+        REVEAL_SECRETS.with(|c| c.set(self.0));
     }
-}
-
-fn with_mode<T>(mode: RenderMode, f: impl FnOnce() -> T) -> T {
-    let _guard = RENDER_MODE.with(|c| RenderGuard(c.replace(Some(mode))));
-    f()
-}
-
-/// Something cindy can render to a string — twice.
-///
-/// With the `askama` feature on (the expected setup) this is implemented
-/// for every `askama::Template`, which is the entire point: a playbook
-/// writes an ordinary askama template with `Secret<T>` fields, hands it
-/// to [`path::template`](crate::builtin::path::template), and gets a
-/// redacted diff without doing anything else. The framework, not the
-/// playbook, decides what a secret renders as.
-///
-/// With the feature off, implement this yourself for whatever engine you
-/// use; the two-pass contract is all cindy needs.
-pub trait Render {
-    /// Render to a string. Called **twice** per file by
-    /// [`render_both`] — once per pass — so it must be deterministic and
-    /// free of side effects.
-    fn render(&self) -> crate::Result<String>;
-}
-
-#[cfg(feature = "askama")]
-impl<T: askama::Template> Render for T {
-    fn render(&self) -> crate::Result<String> {
-        askama::Template::render(self)
-            .map_err(|e| anyhow_serde::Error::msg(format!("askama render failed: {e}")))
-    }
-}
-
-/// Render `template` twice: once for real, once with every `Secret<T>`
-/// collapsed to [`REDACTION`]. Returns `(real, redacted)`.
-///
-/// This is how a file containing secrets can still be diffed. The caller
-/// writes `real` to the target and hands *only* `redacted` to the diff,
-/// so the plaintext never reaches the diff machinery, the operator's
-/// terminal, or the run view's scrollback.
-///
-/// The two passes are compared by the caller: when they come out
-/// byte-identical the content held no secrets at all, and the diff is
-/// exactly what it has always been.
-pub(crate) fn render_both(template: &impl Render) -> crate::Result<(String, String)> {
-    let real = with_mode(RenderMode::Real, || template.render())?;
-    let redacted = with_mode(RenderMode::Redacted, || template.render())?;
-    Ok((real, redacted))
 }
 
 impl<T: serde::de::DeserializeOwned> Secret<T> {
@@ -461,45 +381,6 @@ impl<T: serde::de::DeserializeOwned> Secret<T> {
                 payload.source.zeroize();
                 Ok(value)
             }
-        }
-    }
-}
-
-/// `Display` is what a template engine calls for `{{ secret }}`, which
-/// makes it the hinge of the whole redaction design.
-///
-/// Its output depends on the render pass in flight:
-///
-///   * inside [`render_both`]'s real pass — the decrypted value, because
-///     that pass produces the bytes written to the target;
-///   * inside its redacted pass — [`REDACTION`], because that pass
-///     produces the text every diff is built from;
-///   * outside any render — the same `<secret vault=…>` placeholder
-///     `Debug` gives.
-///
-/// That last case is the load-bearing one. A playbook that builds file
-/// content by hand (`format!("pw = {}", secret)`) instead of going
-/// through [`path::template`](crate::builtin::path::template) gets a
-/// *visibly wrong config file* — which the diff shows, and which fails
-/// at deploy time — rather than a correct file and a leaked diff. The
-/// failure mode points at the mistake instead of hiding it, and it can
-/// never emit plaintext into a diff.
-impl<T: fmt::Display + serde::de::DeserializeOwned> fmt::Display for Secret<T> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match RENDER_MODE.with(|c| c.get()) {
-            Some(RenderMode::Real) => match self.reveal_ref() {
-                Ok(value) => value.fmt(f),
-                // The render is fallible but `Display` is not, so the
-                // failure has to travel as text. It is not silent: the
-                // marker lands in the file, in the diff, and in the
-                // redacted pass's output too.
-                Err(e) => write!(f, "<secret reveal failed: {e}>"),
-            },
-            Some(RenderMode::Redacted) => f.write_str(REDACTION),
-            None => match self {
-                Self::Plain(_) => write!(f, "<secret plain>"),
-                Self::Sealed { vault, .. } => write!(f, "<secret vault={vault}>"),
-            },
         }
     }
 }
@@ -771,6 +652,21 @@ mod tests {
 
         let missing = missing_vaults(["present-vault", "absent-vault-xyz"]);
         assert_eq!(missing, vec!["absent-vault-xyz".to_owned()]);
+    }
+
+    #[test]
+    fn a_panic_inside_a_reveal_scope_does_not_leave_reveal_mode_set() {
+        // The scope has to survive unwinding: tokio hands the thread to
+        // the next task, and a leaked flag would make *its* `Debug` emit
+        // plaintext.
+        let caught = std::panic::catch_unwind(|| {
+            with_revealed_secrets(|| panic!("boom"));
+        });
+        assert!(caught.is_err(), "the panic must propagate");
+        assert!(!revealing(), "reveal mode leaked past a panicking scope");
+
+        let s: Secret<Creds> = Secret::sealed("leak-check", vec![1, 2, 3]);
+        assert_eq!(format!("{s:?}"), "<secret vault=leak-check>");
     }
 
     #[test]
