@@ -93,7 +93,7 @@ pub struct State {
     pub user: Option<String>,
     /// Owning group for the downloaded file. `None` ⇒ leave as-is.
     pub group: Option<String>,
-    /// Mode to set on the downloaded file. `None` ⇒ leave the OS default.
+    /// Mode to set on the downloaded file. `None` ⇒ `0o644`.
     pub mode: Option<super::path::Mode>,
 }
 

@@ -231,32 +231,35 @@ pub fn extract(src: impl Into<PathBuf>, dest: impl Into<PathBuf>) -> crate::Resu
     })
 }
 
-fn apply(state: State) -> crate::Result<super::Return> {
-    let format = match state.format {
-        Some(f) => f,
-        None => Format::from_path(&state.src)?,
-    };
-
-    // Establish the destination directory. An *existing* directory is
-    // left completely alone — the caller said "extract here", not "and
-    // also chown/chmod the directory", so rewriting its owner/mode to
-    // our defaults would be a destructive side effect nobody asked for.
-    // Only when `dest` is missing (or a stale file/symlink is in the
-    // way) do we go through the `path` module, which handles the
-    // transition and emits the diff, creating the dir as the worker's
-    // identity at a conventional `0o755`.
-    match std::fs::symlink_metadata(&state.dest) {
+/// Establish the destination directory. An *existing* directory is
+/// left completely alone — the caller said "extract here", not "and
+/// also chown/chmod the directory", so rewriting its owner/mode to
+/// our defaults would be a destructive side effect nobody asked for.
+/// Only when `dest` is missing (or a stale file/symlink is in the
+/// way) do we go through the `path` module, which handles the
+/// transition and emits the diff, creating the dir as the worker's
+/// identity at a conventional `0o755`.
+fn establish_dest(dest: &Path) -> crate::Result<()> {
+    match std::fs::symlink_metadata(dest) {
         Ok(meta) if meta.is_dir() => {}
         _ => {
             let (user, group) = super::current_owner_names();
             super::path::directory_raw::inner(
-                state.dest.clone(),
+                dest.to_path_buf(),
                 user,
                 group,
                 super::path::Mode(0o755),
             )?;
         }
     }
+    Ok(())
+}
+
+fn apply(state: State) -> crate::Result<super::Return> {
+    let format = match state.format {
+        Some(f) => f,
+        None => Format::from_path(&state.src)?,
+    };
 
     eprintln!(
         "unarchive {} -> {} ({:?})",
@@ -265,25 +268,30 @@ fn apply(state: State) -> crate::Result<super::Return> {
         format,
     );
 
-    // List the entries first to render a compact per-entry summary
-    // against the current destination tree, then run the bulk extractor
-    // (the listing is header/metadata only — for tar it reuses the
-    // already-decompressed bytes, so nothing is decompressed twice).
+    // Read and decode the archive *before* touching the destination, so
+    // an unreadable or corrupt source errors without leaving a
+    // half-prepared destination directory behind.
     match format {
         Format::Tar(codec) => {
             let raw = std::fs::read(&state.src)
                 .context(format!("Couldn't read {}", state.src.display()))?;
             let tar_bytes =
                 super::decompress::decompress::inner(raw, codec.unwrap_or(super::Codec::Store))?;
-            render_summary(&list_tar(&tar_bytes)?, &state.dest);
+            let entries = list_tar(&tar_bytes)?;
+            establish_dest(&state.dest)?;
+            render_summary(&entries, &state.dest);
             extract_tar(&tar_bytes, &state.dest)?;
         }
         Format::Zip => {
-            render_summary(&list_zip(&state.src)?, &state.dest);
+            let entries = list_zip(&state.src)?;
+            establish_dest(&state.dest)?;
+            render_summary(&entries, &state.dest);
             extract_zip(&state.src, &state.dest)?;
         }
         Format::SevenZ => {
-            render_summary(&list_7z(&state.src)?, &state.dest);
+            let entries = list_7z(&state.src)?;
+            establish_dest(&state.dest)?;
+            render_summary(&entries, &state.dest);
             extract_7z(&state.src, &state.dest)?;
         }
     }

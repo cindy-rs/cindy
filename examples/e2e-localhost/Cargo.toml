@@ -32,4 +32,4 @@ serde_json = { workspace = true }
 [dev-dependencies]
 serde_json = { workspace = true }
 tempfile = "3.27"
-sha2 = "0.10"
+sha2 = "0.11"

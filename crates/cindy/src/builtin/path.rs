@@ -439,14 +439,16 @@ fn state_matches(old: &OldState, desired: &State) -> bool {
 fn resolve_uid(name: &str) -> crate::Result<nix::unistd::Uid> {
     match nix::unistd::User::from_name(name) {
         Ok(Some(user)) => Ok(user.uid),
-        _ => crate::bail!("Invalid user: {name}"),
+        Ok(None) => crate::bail!("no such user: {name}"),
+        Err(e) => crate::bail!("user lookup for {name:?} failed: {e}"),
     }
 }
 
 fn resolve_gid(name: &str) -> crate::Result<nix::unistd::Gid> {
     match nix::unistd::Group::from_name(name) {
         Ok(Some(group)) => Ok(group.gid),
-        _ => crate::bail!("Invalid group: {name}"),
+        Ok(None) => crate::bail!("no such group: {name}"),
+        Err(e) => crate::bail!("group lookup for {name:?} failed: {e}"),
     }
 }
 

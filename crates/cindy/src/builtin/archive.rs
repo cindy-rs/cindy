@@ -26,7 +26,7 @@ pub struct State {
     pub dest: PathBuf,
     /// Archive format. `None` ⇒ infer from `dest`'s extension.
     pub format: Option<Format>,
-    /// Mode to set on the produced archive. `None` ⇒ OS default.
+    /// Mode to set on the produced archive. `None` ⇒ `0o644`.
     pub mode: Option<super::path::Mode>,
 }
 
@@ -115,6 +115,11 @@ fn add_to_zip<W: std::io::Write + std::io::Seek>(
             add_to_zip(zip, &entry.path(), &name.join(entry.file_name()), options)?;
         }
     } else {
+        // Preserve unix permissions like the tar writer does, so an
+        // extracted zip tree keeps its exec bits.
+        #[cfg(unix)]
+        let options =
+            options.unix_permissions(std::os::unix::fs::PermissionsExt::mode(&meta.permissions()));
         zip.start_file(name_str.clone(), options)
             .context(format!("Couldn't start zip entry {name_str}"))?;
         let bytes = std::fs::read(source).context(format!("Couldn't read {}", source.display()))?;
