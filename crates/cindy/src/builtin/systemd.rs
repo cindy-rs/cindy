@@ -99,8 +99,17 @@ impl UnitState {
     /// `true` when calling `EnableUnitFiles` would actually do something.
     /// `Indirect` counts: enabling an indirect unit creates the links its
     /// `Also=`/template default names, exactly like `systemctl enable`.
+    /// `Linked`/`Alias` count too — `systemctl enable` acts on those, so we
+    /// must as well instead of reporting a lying no-op.
     fn needs_enable_call(self) -> bool {
-        matches!(self, Self::Disabled | Self::Indirect)
+        matches!(
+            self,
+            Self::Disabled
+                | Self::Indirect
+                | Self::Linked
+                | Self::LinkedRuntime
+                | Self::Alias
+        )
     }
 
     /// Unit-file states that have no `[Install]` section to en/disable:
@@ -176,6 +185,21 @@ async fn read_file_state(
         }
         Err(e) if is_no_such_unit(&e) => Ok(None),
         Err(e) => Err(e).context(format!("GetUnitFileState({name}) failed")),
+    }
+}
+
+/// Best-effort restore of a mask lifted moments ago, so a rejected
+/// reconcile leaves the host as it found it.
+async fn rollback_mask(
+    manager: &ManagerProxy<'_>,
+    unit_files: &[String],
+    initial_unit_state: Option<UnitState>,
+) {
+    if initial_unit_state.is_some_and(UnitState::is_masked) {
+        let runtime = matches!(initial_unit_state, Some(UnitState::MaskedRuntime));
+        let _ = manager
+            .mask_unit_files(unit_files.to_vec(), runtime, true)
+            .await;
     }
 }
 
@@ -552,19 +576,21 @@ async fn apply(state: State) -> crate::Result<super::Return> {
                     // The mask is a `/dev/null` symlink at this path. Anything
                     // already there conflicts: a symlink (a previous mask or an
                     // admin link) is replaced safely by `mask_unit_files`, but a
-                    // *real* file or directory (an admin-authored unit / drop-in)
-                    // has to be removed first. `mask` is an explicit, unambiguous
+                    // *real* file or directory (an admin-authored unit) has to
+                    // be removed first. `mask` is an explicit, unambiguous
                     // request to mask the unit, so we remove whatever is in the
                     // way rather than refusing.
-                    let meta = std::fs::symlink_metadata(&unit_path).ok();
+                    let meta = tokio::fs::symlink_metadata(&unit_path).await.ok();
                     if let Some(meta) = meta.as_ref()
                         && !meta.file_type().is_symlink()
                     {
                         if meta.is_dir() {
-                            std::fs::remove_dir_all(&unit_path)
+                            tokio::fs::remove_dir_all(&unit_path)
+                                .await
                                 .context("Failed to clear conflicting directory at mask target")?;
                         } else {
-                            std::fs::remove_file(&unit_path)
+                            tokio::fs::remove_file(&unit_path)
+                                .await
                                 .context("Failed to clear conflicting file at mask target")?;
                         }
                     }
@@ -587,9 +613,18 @@ async fn apply(state: State) -> crate::Result<super::Return> {
                     changed = true;
                     current_file_state = read_file_state(&manager, &unit_name).await?;
                 }
-                if current_file_state.is_some_and(UnitState::is_uninstallable) {
+                if current_file_state == Some(UnitState::Bad) {
+                    rollback_mask(&manager, &unit_files, initial_unit_state).await;
                     crate::bail!(
-                        "`{unit_name}` is {:?}: it has no [Install] section, so there is                          nothing to disable — if you want it unable to run, mask it",
+                        "`{unit_name}` is in the `bad` unit-file state (broken symlink or \
+                         unreadable unit file); fix or remove it before managing enablement"
+                    );
+                }
+                if current_file_state.is_some_and(UnitState::is_uninstallable) {
+                    rollback_mask(&manager, &unit_files, initial_unit_state).await;
+                    crate::bail!(
+                        "`{unit_name}` is {:?}: it has no [Install] section, so there is \
+                         nothing to disable — if you want it unable to run, mask it",
                         current_file_state.unwrap(),
                     );
                 }
@@ -613,9 +648,19 @@ async fn apply(state: State) -> crate::Result<super::Return> {
                     changed = true;
                     current_file_state = read_file_state(&manager, &unit_name).await?;
                 }
-                if current_file_state.is_some_and(UnitState::is_uninstallable) {
+                if current_file_state == Some(UnitState::Bad) {
+                    rollback_mask(&manager, &unit_files, initial_unit_state).await;
                     crate::bail!(
-                        "`{unit_name}` is {:?}: it has no [Install] section, so `enable`                          would silently do nothing — static/generated units are always                          available; just start it (or write a real unit file)",
+                        "`{unit_name}` is in the `bad` unit-file state (broken symlink or \
+                         unreadable unit file); fix or remove it before managing enablement"
+                    );
+                }
+                if current_file_state.is_some_and(UnitState::is_uninstallable) {
+                    rollback_mask(&manager, &unit_files, initial_unit_state).await;
+                    crate::bail!(
+                        "`{unit_name}` is {:?}: it has no [Install] section, so `enable` \
+                         would silently do nothing — static/generated units are always \
+                         available; just start it (or write a real unit file)",
                         current_file_state.unwrap(),
                     );
                 }
@@ -693,4 +738,97 @@ async fn apply(state: State) -> crate::Result<super::Return> {
     }
 
     Ok(super::Return::from_changed(changed))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unit_file_state_parsing() {
+        let cases = [
+            ("enabled", UnitState::Enabled),
+            ("enabled-runtime", UnitState::EnabledRuntime),
+            ("linked", UnitState::Linked),
+            ("linked-runtime", UnitState::LinkedRuntime),
+            ("alias", UnitState::Alias),
+            ("masked", UnitState::Masked),
+            ("masked-runtime", UnitState::MaskedRuntime),
+            ("static", UnitState::Static),
+            ("disabled", UnitState::Disabled),
+            ("generated", UnitState::Generated),
+            ("transient", UnitState::Transient),
+            ("indirect", UnitState::Indirect),
+            ("bad", UnitState::Bad),
+            ("", UnitState::Bad),
+        ];
+        for (s, want) in cases {
+            assert_eq!(s.parse::<UnitState>().unwrap(), want, "{s:?}");
+        }
+        assert!("nope".parse::<UnitState>().is_err());
+    }
+
+    #[test]
+    fn enable_is_attempted_for_every_state_systemctl_would_act_on() {
+        for state in [
+            UnitState::Disabled,
+            UnitState::Indirect,
+            UnitState::Linked,
+            UnitState::LinkedRuntime,
+            UnitState::Alias,
+        ] {
+            assert!(state.needs_enable_call(), "{state:?}");
+        }
+        for state in [
+            UnitState::Enabled,
+            UnitState::EnabledRuntime,
+            UnitState::Masked,
+            UnitState::MaskedRuntime,
+            UnitState::Static,
+            UnitState::Generated,
+            UnitState::Transient,
+            UnitState::Bad,
+        ] {
+            assert!(!state.needs_enable_call(), "{state:?}");
+        }
+    }
+
+    #[test]
+    fn disable_is_attempted_only_for_linked_states() {
+        for state in [
+            UnitState::Enabled,
+            UnitState::EnabledRuntime,
+            UnitState::Linked,
+            UnitState::LinkedRuntime,
+            UnitState::Alias,
+        ] {
+            assert!(state.needs_disable_call(), "{state:?}");
+        }
+        for state in [
+            UnitState::Disabled,
+            UnitState::Indirect,
+            UnitState::Static,
+            UnitState::Masked,
+            UnitState::Bad,
+        ] {
+            assert!(!state.needs_disable_call(), "{state:?}");
+        }
+    }
+
+    #[test]
+    fn uninstallable_states_are_exactly_the_install_less_ones() {
+        for state in [UnitState::Static, UnitState::Generated, UnitState::Transient] {
+            assert!(state.is_uninstallable(), "{state:?}");
+        }
+        for state in [
+            UnitState::Enabled,
+            UnitState::Disabled,
+            UnitState::Linked,
+            UnitState::Alias,
+            UnitState::Masked,
+            UnitState::Bad,
+        ] {
+            assert!(!state.is_uninstallable(), "{state:?}");
+        }
+    }
 }
