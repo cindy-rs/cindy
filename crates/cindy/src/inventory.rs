@@ -80,9 +80,11 @@ pub struct InventoryDump {
 ///
 /// The infallible impl serialises through and renders `Debug`. The
 /// fallible impl does the same on `Ok`, prints the debug rendering of
-/// the error to stderr and exits 1 on `Err`. Either way the CLI reads
-/// a clean `InventoryDump` from FD 1 — no `{"Ok": {...}}` wrapper for
-/// it to peel.
+/// the error to stderr and exits 1 on `Err`. A `V` whose `Serialize`
+/// impl fails is treated like the `Err` case — reported on stderr,
+/// exit 1 — rather than a panic. Either way the CLI reads a clean
+/// `InventoryDump` from FD 1 — no `{"Ok": {...}}` wrapper for it to
+/// peel.
 #[doc(hidden)]
 pub trait IntoInventoryDump {
     fn into_inventory_dump(self) -> InventoryDump;
@@ -102,27 +104,46 @@ fn build_debug_map<V: std::fmt::Debug>(
     debug
 }
 
+/// Fallible core of [`IntoInventoryDump::into_inventory_dump`]: build
+/// the dump from a serialisable, `Debug`-able inventory. Kept separate
+/// from the trait impl so the serialisation-failure path is testable
+/// — the impl turns an error into a stderr report + exit 1 (matching
+/// the `Result` impl's `Err` arm), which can't be exercised in-process.
+fn try_into_inventory_dump<V: serde::Serialize + std::fmt::Debug>(
+    inv: Inventory<V>,
+) -> ::std::result::Result<InventoryDump, serde_json::Error> {
+    let json = serde_json::to_value(&inv)?;
+
+    if std::env::var_os("CINDY_REVEAL_SECRETS").is_some() {
+        ::std::result::Result::Ok(crate::secret::with_revealed_secrets(|| {
+            let debug = build_debug_map(&inv);
+            let json_revealed = serde_json::to_value(&inv).map_err(|e| e.to_string());
+            InventoryDump {
+                json,
+                debug,
+                json_revealed: Some(json_revealed),
+            }
+        }))
+    } else {
+        ::std::result::Result::Ok(InventoryDump {
+            json,
+            debug: build_debug_map(&inv),
+            json_revealed: None,
+        })
+    }
+}
+
 impl<V: serde::Serialize + serde::de::DeserializeOwned + std::fmt::Debug> IntoInventoryDump
     for Inventory<V>
 {
     fn into_inventory_dump(self) -> InventoryDump {
-        let json = serde_json::to_value(&self).expect("Failed to serialise `Inventory<V>` to JSON");
-
-        if std::env::var_os("CINDY_REVEAL_SECRETS").is_some() {
-            crate::secret::with_revealed_secrets(|| {
-                let debug = build_debug_map(&self);
-                let json_revealed = serde_json::to_value(&self).map_err(|e| e.to_string());
-                InventoryDump {
-                    json,
-                    debug,
-                    json_revealed: Some(json_revealed),
-                }
-            })
-        } else {
-            InventoryDump {
-                json,
-                debug: build_debug_map(&self),
-                json_revealed: None,
+        match try_into_inventory_dump(self) {
+            Ok(dump) => dump,
+            Err(e) => {
+                ::std::eprintln!(
+                    "`#[cindy::inventory]` failed to serialise the inventory to JSON: {e:?}"
+                );
+                ::std::process::exit(1);
             }
         }
     }
@@ -250,5 +271,24 @@ mod tests {
 
         let inv = Inventory::new([a, b, c, d]);
         assert_eq!(inv.hosts.len(), 4);
+    }
+
+    #[test]
+    fn failing_serialize_is_an_error_not_a_panic() {
+        // `#[cindy::inventory]` vars are user types; a `Serialize` impl
+        // that errors (custom impls, non-string map keys) used to
+        // `expect()`-panic inside the dump. The fallible core must
+        // surface it as an error for the trait impl to report + exit.
+        #[derive(Debug, serde::Deserialize)]
+        struct FailsSerialize;
+
+        impl serde::Serialize for FailsSerialize {
+            fn serialize<S: serde::Serializer>(&self, _: S) -> Result<S::Ok, S::Error> {
+                Err(serde::ser::Error::custom("boom"))
+            }
+        }
+
+        let inv = Inventory::new([Host::new("boom", [] as [&str; 0], FailsSerialize)]);
+        assert!(try_into_inventory_dump(inv).is_err());
     }
 }
