@@ -289,3 +289,77 @@ fn worker_death_fails_fast() {
     );
     let _ = remote.wait();
 }
+
+/// The worker's RPC byte budget must gate dispatch: with the budget
+/// forced to 64 KiB, a fan-out of eight ~40 KiB calls may only run
+/// one at a time. The play's probes observe their own concurrency and
+/// fail the run if it ever exceeds 1 (see `CINDY_E2E_BUDGET` in
+/// src/main.rs).
+#[test]
+fn backpressure_serialises_oversized_fanout() {
+    let tmp = tempfile::tempdir().expect("create temp dir");
+
+    let host_context = serde_json::json!({
+        "name": "localhost",
+        "tags": ["example:e2e"],
+        "vars": {
+            "work_dir": tmp.path().join("work"),
+            "fetch_url": "http://127.0.0.1/",
+            "fetch_sha256": "",
+        }
+    });
+
+    let orchestrator_bin = build_variant("orchestrator");
+    let remote_bin_src = build_variant("remote");
+    let remote_bin = tmp.path().join("remote-worker");
+    std::fs::copy(&remote_bin_src, &remote_bin).expect("copy remote worker");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mut perms = std::fs::metadata(&remote_bin).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&remote_bin, perms).unwrap();
+    }
+
+    let mut remote = Command::new(&remote_bin)
+        .env("CINDY_RPC_BUDGET", "65536")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .expect("spawn remote worker");
+
+    let mut orchestrator = Command::new(&orchestrator_bin)
+        .env("CINDY_HOST_CONTEXT", host_context.to_string())
+        .env("CINDY_E2E_BUDGET", "1")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .expect("spawn orchestrator");
+
+    let mut o_out = orchestrator.stdout.take().unwrap();
+    let mut r_in = remote.stdin.take().unwrap();
+    let mut r_out = remote.stdout.take().unwrap();
+    let mut o_in = orchestrator.stdin.take().unwrap();
+
+    let pump_o_to_r = std::thread::spawn(move || {
+        let _ = std::io::copy(&mut o_out, &mut r_in);
+        drop(r_in);
+    });
+    let pump_r_to_o = std::thread::spawn(move || {
+        let _ = std::io::copy(&mut r_out, &mut o_in);
+        drop(o_in);
+    });
+
+    let orch_status = orchestrator.wait().expect("wait orchestrator");
+    let _ = pump_o_to_r.join();
+    let _ = pump_r_to_o.join();
+    let _ = remote.wait();
+
+    assert!(
+        orch_status.success(),
+        "orchestrator exited with failure: {orch_status:?} — the byte budget \
+         failed to serialise an oversized fan-out"
+    );
+}

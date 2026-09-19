@@ -31,6 +31,25 @@ fn inventory() -> cindy::Inventory<Vars> {
     }
 }
 
+/// RPC fan-out probe for the backpressure e2e scenario: sleeps long
+/// enough that overlapping executions would certainly be observed,
+/// and reports data integrity plus the highest concurrency seen so
+/// far.
+#[cindy::remote]
+fn budget_probe(data: Vec<u8>) -> (usize, usize) {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static CONCURRENT: AtomicUsize = AtomicUsize::new(0);
+    static MAX_SEEN: AtomicUsize = AtomicUsize::new(0);
+
+    let now = CONCURRENT.fetch_add(1, Ordering::SeqCst) + 1;
+    MAX_SEEN.fetch_max(now, Ordering::SeqCst);
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    CONCURRENT.fetch_sub(1, Ordering::SeqCst);
+
+    (data.len(), MAX_SEEN.load(Ordering::SeqCst))
+}
+
 #[cindy::main]
 async fn main(host: cindy::Host<Vars>) -> cindy::Result<()> {
     use cindy::builtin;
@@ -45,6 +64,29 @@ async fn main(host: cindy::Host<Vars>) -> cindy::Result<()> {
             builtin::command::State::default(),
         )
         .await?;
+        return Ok(());
+    }
+
+    // Backpressure regression scenario (see tests/e2e.rs): the harness
+    // squeezes the worker's RPC byte budget down to 64 KiB while this
+    // play fans out eight ~40 KiB calls. At most one fits the budget
+    // at a time, so the probes must execute strictly serially — a
+    // leaked budget gate shows up as concurrent executions in the
+    // probes' own observations.
+    if std::env::var_os("CINDY_E2E_BUDGET").is_some() {
+        let blob = vec![7u8; 40 * 1024];
+        let results =
+            futures_util::future::join_all((0..8).map(|_| budget_probe(blob.clone()))).await;
+        for (len, max_concurrent) in results {
+            if len != blob.len() {
+                cindy::bail!("budget probe data mangled: {len} != {}", blob.len());
+            }
+            if max_concurrent != 1 {
+                cindy::bail!(
+                    "worker ran {max_concurrent} probes concurrently under a 64 KiB budget"
+                );
+            }
+        }
         return Ok(());
     }
 
