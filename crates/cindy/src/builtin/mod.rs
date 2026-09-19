@@ -215,15 +215,33 @@ const LOCK_BACKOFF_CAP: std::time::Duration = std::time::Duration::from_secs(2);
 /// Does this output look like the tool telling us its global lock was
 /// already taken?
 ///
-/// shadow-utils prints `cannot lock /etc/passwd; try again later.` (and
-/// the `/etc/group`, `/etc/shadow`, `/etc/gshadow` variants) and exits
-/// non-zero. Matching its own words is far more precise than matching
-/// exit codes: `useradd` uses exit 1 for *any* "can't update password
-/// file" condition, including a read-only filesystem or a corrupt file,
-/// neither of which a retry can fix.
+/// Matched on the tools' own words rather than their exit codes, which
+/// are far too coarse: `useradd` uses exit 1 for *any* "can't update
+/// password file" condition, including a read-only filesystem or a
+/// corrupt file, and retrying those only delays the report.
+///
+/// Two families of phrasing, because two families of tool serialise on a
+/// global lock:
+///
+/// - shadow-utils (`useradd`, `usermod`, `groupadd`, …):
+///   `cannot lock /etc/passwd; try again later.`, and the `/etc/group`,
+///   `/etc/shadow`, `/etc/gshadow` variants.
+/// - apt's own tools (`apt-mark`), which never say "cannot lock":
+///   `Could not get lock /var/lib/dpkg/lock-frontend`,
+///   `Unable to acquire the dpkg frontend lock`, and older apt's
+///   `open (11: Resource temporarily unavailable)`.
 fn is_lock_contention(stderr: &str) -> bool {
+    const MARKERS: [&str; 5] = [
+        // shadow-utils
+        "cannot lock",
+        "try again later",
+        // apt
+        "could not get lock",
+        "unable to acquire the dpkg frontend lock",
+        "temporarily unavailable",
+    ];
     let lowered = stderr.to_ascii_lowercase();
-    lowered.contains("cannot lock") || lowered.contains("try again later")
+    MARKERS.iter().any(|m| lowered.contains(m))
 }
 
 /// Pseudo-random fraction of `step` to add as jitter.

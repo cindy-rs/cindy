@@ -699,9 +699,18 @@ fn apply(state: State) -> crate::Result<crate::builtin::Return> {
 
 /// `apt-mark <subcommand> -- <packages>`, argv-only (no shell) like
 /// every other process launch in the framework.
+///
+/// `apt-mark` is an apt tool and reads the same config space, so it gets
+/// the dpkg lock timeout too. It is also wrapped in
+/// [`run_check_retry_locks`] at every call site, because unlike
+/// `apt-get` it isn't documented to honour the timeout — belt and
+/// braces, since the retry costs nothing when the first attempt works.
 fn apt_mark(subcommand: &str, packages: &[String]) -> Box<Command> {
     let mut cmd = Box::new(Command::new("apt-mark"));
-    cmd.arg(subcommand).arg("--");
+    cmd.arg("-o")
+        .arg(format!("DPkg::Lock::Timeout={DPKG_LOCK_TIMEOUT_SECS}"))
+        .arg(subcommand)
+        .arg("--");
     for name in packages {
         cmd.arg(name);
     }
@@ -1038,14 +1047,35 @@ mod tests {
     }
 
     #[test]
-    fn lock_contention_is_recognised_from_shadows_own_words() {
+    fn lock_contention_is_recognised_for_both_tool_families() {
         use crate::builtin::is_lock_contention;
+
+        // shadow-utils.
         assert!(is_lock_contention(
             "useradd: cannot lock /etc/passwd; try again later.\n"
         ));
         assert!(is_lock_contention("groupmod: cannot lock /etc/group.\n"));
-        // Genuine errors must not be retried.
+
+        // apt's tools, which never say "cannot lock" — the reason the
+        // matcher can't just carry shadow's wording.
+        assert!(is_lock_contention(
+            "E: Could not get lock /var/lib/dpkg/lock-frontend. It is held by process 42\n"
+        ));
+        assert!(is_lock_contention(
+            "E: Unable to acquire the dpkg frontend lock (/var/lib/dpkg/lock-frontend), \
+             is another process using it?\n"
+        ));
+        assert!(is_lock_contention(
+            "E: Could not open lock file - open (11: Resource temporarily unavailable)\n"
+        ));
+
+        // Genuine errors must fail on the first attempt, not eight
+        // backoffs later.
         assert!(!is_lock_contention("useradd: user 'bob' already exists\n"));
+        assert!(!is_lock_contention(
+            "E: Unable to locate package nosuchpkg\n"
+        ));
+        assert!(!is_lock_contention("dpkg: error: read-only file system\n"));
         assert!(!is_lock_contention(""));
     }
 }
