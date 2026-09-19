@@ -79,7 +79,33 @@ check.audit:
   needs: [image.build]
   image: *image
   script:
+    # Framework lockfile first; then the site's (separate nested
+    # workspace, only reachable explicitly).
     - cargo audit
+    - cargo audit --file web/Cargo.lock
+check.web:
+  # The marketing site (web/): its own nested workspace, so this is the
+  # only job that sees it. Compiles it for wasm — dioxus-code highlights
+  # the snippets at compile time, so this catches site-side rot of the
+  # same files examples/snippet-check type-checks against the library.
+  # Deploy stays manual (dx build), unchanged by the monorepo merge.
+  stage: stageless
+  needs: [image.build]
+  image: *image
+  cache:
+    - key:
+        files: [web/Cargo.lock]
+        prefix: ${CI_JOB_NAME}
+      paths:
+        - .cargo/registry/index/
+        - .cargo/registry/cache/
+        - web/target/
+  script:
+    # dx (the real site build) compiles tailwind.css into
+    # assets/tailwind.css; raw cargo only needs the file to exist —
+    # its content doesn't affect compilation.
+    - cp web/tailwind.css web/assets/tailwind.css
+    - cargo check --manifest-path web/Cargo.toml --target wasm32-unknown-unknown
 check.test:
   extends: .rust-cache
   stage: stageless

@@ -8,7 +8,9 @@ fn inventory() -> cindy::Inventory<Vars> {
     cindy::Inventory::new([cindy::Host::new(
         "host.example.net",
         ["proxy", "prague"],
-        Vars { greeting: "Hello".into() },
+        Vars {
+            greeting: "Hello".into(),
+        },
     )])
 }
 

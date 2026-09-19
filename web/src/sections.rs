@@ -156,7 +156,7 @@ pub fn Example() -> Element {
                         span { class: "ml-2 font-mono text-xs text-zinc-500", "src/main.rs" }
                     }
                     dioxus_code::Code {
-                        src: dioxus_code::code!("../cindy/examples/website-minimal/src/main.rs"),
+                        src: dioxus_code::code!("../examples/website-minimal/src/main.rs"),
                         theme: dioxus_code::Theme::AYU_DARK,
                     }
                 }

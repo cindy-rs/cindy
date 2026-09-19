@@ -12,6 +12,10 @@ dioxus = { version = "0.7", features = ["web", "router"] }
 # grammar for the shell snippet — other languages are opt-in like this.
 dioxus-code = { version = "0.1", features = ["lang-bash"] }
 
+# Detach from the enclosing framework workspace (the root Cargo.toml
+# also excludes this directory; both directions spelled out).
+[workspace]
+
 [profile.release]
 opt-level = "z"
 lto = true

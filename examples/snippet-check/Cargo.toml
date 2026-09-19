@@ -1,0 +1,18 @@
+[package]
+name = "snippet-check"
+description = "Compile guard: the website's code snippets, built against the real cindy library."
+publish = false
+version.workspace = true
+rust-version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+# Dual-feature, like the e2e harness: plain `cargo check --workspace`
+# type-checks both macro halves of every snippet.
+default = ["orchestrator", "remote"]
+orchestrator = ["cindy/orchestrator"]
+remote = ["cindy/remote"]
+
+[dependencies]
+cindy = { workspace = true }

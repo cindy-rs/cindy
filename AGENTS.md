@@ -46,6 +46,13 @@ cargo test -p e2e-localhost    # e2e suite; slow (builds two binaries), hermetic
   progress (ratatui), manages vaults (`cindy secret seal/unseal`).
 - `examples/e2e-localhost` — hermetic end-to-end harness; the only integration
   coverage.
+- `examples/snippet-check` — compile guard: `#[path]`-includes
+  `web/src/snippets/*.rs` so the site's code examples can't drift from the real
+  `cindy` API. Nothing executes; edit the snippets in `web/`, not here.
+- `web/` — the cindy.rs marketing/docs site (Dioxus). Its own nested workspace,
+  excluded from the root one — the coupling to the framework is editorial (docs
+  prose + snippets), not crates. `dx` builds it; `assets/tailwind.css` is
+  generated from `tailwind.css` (gitignored).
 
 ## Architecture invariants
 

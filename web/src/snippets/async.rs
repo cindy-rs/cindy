@@ -12,4 +12,8 @@ async fn fetch_url(url: String) -> cindy::Result<String> {
 }
 
 // Either way, the orchestrator call is a future:
-let name = hostname().await?;
+async fn demo() -> cindy::Result<()> {
+    let name = hostname().await?;
+    println!("{name}");
+    Ok(())
+}
