@@ -18,14 +18,28 @@ use tokio::io::AsyncWriteExt as _;
 /// `main` declares.
 #[doc(hidden)]
 pub fn host_context<H: serde::de::DeserializeOwned>() -> H {
-    let json = std::env::var("CINDY_HOST_CONTEXT").expect(
-        "CINDY_HOST_CONTEXT not set!\n\
-         The orchestrator process is meant to be launched by the `cindy` command line tool. \
-         If you're trying to run the binary directly, set CINDY_HOST_CONTEXT to a \
-         JSON-serialised `cindy::Host<V>` first.",
-    );
-    serde_json::from_str(&json)
-        .expect("CINDY_HOST_CONTEXT was not valid JSON for the declared `cindy::Host<V>` type")
+    let json = match std::env::var("CINDY_HOST_CONTEXT") {
+        Ok(v) => v,
+        Err(_) => {
+            eprintln!(
+                "\x1b[31mCINDY_HOST_CONTEXT not set!\n\
+                 The orchestrator process is meant to be launched by the `cindy` command line \
+                 tool. If you're trying to run the binary directly, set CINDY_HOST_CONTEXT to \
+                 a JSON-serialised `cindy::Host<V>` first.\x1b[0m"
+            );
+            std::process::exit(1);
+        }
+    };
+    match serde_json::from_str(&json) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!(
+                "\x1b[31mCINDY_HOST_CONTEXT was not valid JSON for the declared \
+                 `cindy::Host<V>` type: {e}\x1b[0m"
+            );
+            std::process::exit(1);
+        }
+    }
 }
 
 /// Print an error in red and exit 1. The orchestrator's stderr is the

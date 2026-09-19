@@ -4,8 +4,12 @@
 //!     compact tagged blob (`{ vault, ciphertext }`).
 //!   * Reveals the inner `T` only on an explicit `.reveal()` call,
 //!     using a per-vault key looked up at runtime.
-//!   * Refuses to leak the plaintext via `Debug`/`Display`. Drops with
-//!     `zeroize` so plaintext doesn't linger in freed memory.
+//!   * Refuses to leak the plaintext via `Debug`/`Display`. The
+//!     plaintext buffers on the reveal path are wiped with `zeroize`
+//!     after use (the decrypted `SealedPayload`, the raw key bytes
+//!     handed to the keychain); transport frames and the sealed
+//!     ciphertext form are *not* scrubbed — treat swapped/coredumped
+//!     memory as out of scope for this design.
 //!
 //! There are two states the type lives in over its lifecycle. **Plain**
 //! is only meant to exist transiently in source code that hasn't been
@@ -19,6 +23,7 @@ use std::fmt;
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use serde::{Deserializer, Serializer};
+use zeroize::Zeroize as _;
 
 pub mod crypto;
 pub mod keychain;
@@ -200,10 +205,9 @@ where
 pub fn preflight(role: &str, host_context_json: Option<&str>) -> crate::Result<()> {
     let mut needed: std::collections::BTreeSet<String> = registered_vaults().into_iter().collect();
 
-    if let Some(json) = host_context_json
-        && let Ok(value) =
-            crate::__reexports::serde_json::from_str::<crate::__reexports::serde_json::Value>(json)
-    {
+    if let Some(json) = host_context_json {
+        let value: crate::__reexports::serde_json::Value = crate::__reexports::serde_json::from_str(json)
+            .context("host context was not valid JSON during vault preflight")?;
         crate::inventory::collect_sealed_vaults(&value, &mut needed);
     }
 
@@ -296,7 +300,7 @@ impl<T: serde::de::DeserializeOwned> Secret<T> {
             Self::Sealed { vault, ciphertext } => {
                 let key = keychain::get_vault_key(&vault)?;
                 let plaintext = crypto::unseal(&key, &ciphertext)?;
-                let payload: SealedPayload =
+                let mut payload: SealedPayload =
                     postcard::from_bytes(&plaintext).context(format!(
                             "couldn't deserialise SealedPayload for vault `{vault}`. \
                              If this secret was sealed by an older cindy version, \
@@ -304,6 +308,8 @@ impl<T: serde::de::DeserializeOwned> Secret<T> {
                         ))?;
                 let value: T = postcard::from_bytes(&payload.value)
                     .context(format!("couldn't deserialise inner T for vault `{vault}`"))?;
+                payload.value.zeroize();
+                payload.source.zeroize();
                 Ok(value)
             }
         }
@@ -353,11 +359,12 @@ impl<T: serde::de::DeserializeOwned> Secret<T> {
             Self::Sealed { vault, ciphertext } => {
                 let key = keychain::get_vault_key(vault)?;
                 let plaintext = crypto::unseal(&key, ciphertext)?;
-                let payload: SealedPayload = postcard::from_bytes(&plaintext).context(format!(
-                    "couldn't deserialise SealedPayload for vault `{vault}`"
-                ))?;
+                let mut payload: SealedPayload = postcard::from_bytes(&plaintext)
+                    .context(format!("couldn't deserialise SealedPayload for vault `{vault}`"))?;
                 let value: T = postcard::from_bytes(&payload.value)
                     .context(format!("couldn't deserialise inner T for vault `{vault}`"))?;
+                payload.value.zeroize();
+                payload.source.zeroize();
                 Ok(value)
             }
         }
