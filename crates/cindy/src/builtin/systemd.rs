@@ -45,6 +45,12 @@ pub struct State {
     pub enablement: Option<Enablement>,
     /// Desired runtime/active state. `None` = don't touch the running state.
     pub runtime: Option<RuntimeAction>,
+    /// How long to wait for a queued start/stop/restart/reload job to
+    /// finish before declaring it stuck. `None` ⇒ 90s (systemd's own
+    /// per-unit job default). Raise it for units that legitimately take
+    /// minutes to settle — a database after crash recovery, a heavy
+    /// `ExecStartPre` chain.
+    pub job_timeout: Option<std::time::Duration>,
 }
 
 /// Default `Diff` impl renders `State` via `{:#?}` + a unified line diff.
@@ -198,15 +204,45 @@ async fn rollback_mask(
     }
 }
 
+/// Worker-global system-bus connection. A play touching N units used to
+/// open N connections to the bus (one per builtin call — and intent
+/// verbs like [`start`] call `apply` per unit); pooling keeps the bus's
+/// per-connection setup out of fan-outs. The system bus can't change
+/// within one worker process. Init failures are cached as strings and
+/// re-raised per call, so a host with no bus at all still fails every
+/// call with the real error.
+static SYSTEM_BUS: tokio::sync::OnceCell<Result<zbus::Connection, String>> =
+    tokio::sync::OnceCell::const_new();
+
+async fn system_bus() -> crate::Result<&'static zbus::Connection> {
+    SYSTEM_BUS
+        .get_or_init(|| async { zbus::Connection::system().await.map_err(|e| e.to_string()) })
+        .await
+        .as_ref()
+        .map_err(|e| anyhow_serde::Error::msg(e.clone()))
+}
+
 async fn read_active_state(
     manager: &ManagerProxy<'_>,
     conn: &zbus::Connection,
     name: &str,
 ) -> crate::Result<Option<ActiveState>> {
-    let path = match manager.load_unit(name.to_owned()).await {
-        Ok(p) => p,
-        Err(e) if is_no_such_unit(&e) => return Ok(None),
-        Err(e) => return Err(e).context(format!("LoadUnit({name}) failed")),
+    // GetUnit is the non-mutating lookup: it resolves the unit's object
+    // path without loading it. LoadUnit *queues a load job* — a
+    // mutation smuggled into a read path (it can transiently load a
+    // unit just by being observed, and load a unit the admin
+    // deliberately never loads). Some units legitimately have no object
+    // until loaded (a disabled static unit on a fresh boot), so fall
+    // back to LoadUnit only when GetUnit can't resolve one. systemd
+    // signals that both as a NoSuchUnit error and as the manager's
+    // root path ("/"), depending on version.
+    let path = match manager.get_unit(name.to_owned()).await {
+        Ok(p) if p.as_str() != "/" => p,
+        _ => match manager.load_unit(name.to_owned()).await {
+            Ok(p) => p,
+            Err(e) if is_no_such_unit(&e) => return Ok(None),
+            Err(e) => return Err(e).context(format!("LoadUnit({name}) failed")),
+        },
     };
 
     let unit = UnitProxy::builder(conn)
@@ -229,9 +265,9 @@ async fn read_active_state(
 }
 
 /// How long to wait for a queued start/stop/restart/reload job to
-/// finish before declaring it stuck. systemd's own default per-unit job
-/// timeout is 90s; match it.
-const JOB_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(90);
+/// finish before declaring it stuck, when the request doesn't say.
+/// systemd's own default per-unit job timeout is 90s; match it.
+const DEFAULT_JOB_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(90);
 
 /// Wait for `job` to complete and check how it went.
 ///
@@ -247,6 +283,7 @@ async fn wait_job(
     job: &zbus_systemd::zvariant::OwnedObjectPath,
     unit: &str,
     verb: &str,
+    timeout: std::time::Duration,
 ) -> crate::Result<()> {
     use zbus_systemd::zbus::export::futures_core::Stream as _;
 
@@ -262,14 +299,12 @@ async fn wait_job(
         }
     };
 
-    let result = tokio::time::timeout(JOB_TIMEOUT, removal)
-        .await
-        .map_err(|_| {
-            anyhow_serde::Error::msg(format!(
-                "timed out after {JOB_TIMEOUT:?} waiting for the {verb} job on `{unit}` \
+    let result = tokio::time::timeout(timeout, removal).await.map_err(|_| {
+        anyhow_serde::Error::msg(format!(
+            "timed out after {timeout:?} waiting for the {verb} job on `{unit}` \
                  to finish (check `journalctl -u {unit}`)"
-            ))
-        })??;
+        ))
+    })??;
 
     match result.as_str() {
         "done" | "skipped" => Ok(()),
@@ -296,10 +331,8 @@ async fn wait_job(
 /// ```
 #[crate::remote]
 pub async fn daemon_reload() -> crate::Result<()> {
-    let conn = zbus::Connection::system()
-        .await
-        .context("Couldn't connect to the system bus")?;
-    let manager = ManagerProxy::new(&conn)
+    let conn = system_bus().await?;
+    let manager = ManagerProxy::new(conn)
         .await
         .context("Couldn't construct Manager proxy")?;
     manager.reload().await.context("Daemon-reload failed")?;
@@ -335,6 +368,7 @@ pub async fn enable(name: impl Into<String>) -> crate::Result<super::Return> {
         name,
         enablement: Some(Enablement::Enabled),
         runtime: None,
+        job_timeout: None,
     })
     .await
 }
@@ -347,6 +381,7 @@ pub async fn disable(name: impl Into<String>) -> crate::Result<super::Return> {
         name,
         enablement: Some(Enablement::Disabled),
         runtime: None,
+        job_timeout: None,
     })
     .await
 }
@@ -365,6 +400,7 @@ pub async fn mask(name: impl Into<String>) -> crate::Result<super::Return> {
         // Masking lives on the enablement axis; `runtime` stays `None`
         // so we never hit the "masked + runtime" guard.
         runtime: None,
+        job_timeout: None,
     })
     .await
 }
@@ -379,6 +415,7 @@ pub async fn start(name: impl Into<String>) -> crate::Result<super::Return> {
         name,
         enablement: None,
         runtime: Some(RuntimeAction::Started),
+        job_timeout: None,
     })
     .await
 }
@@ -391,6 +428,7 @@ pub async fn stop(name: impl Into<String>) -> crate::Result<super::Return> {
         name,
         enablement: None,
         runtime: Some(RuntimeAction::Stopped),
+        job_timeout: None,
     })
     .await
 }
@@ -404,6 +442,7 @@ pub async fn restart(name: impl Into<String>) -> crate::Result<super::Return> {
         name,
         enablement: None,
         runtime: Some(RuntimeAction::Restarted),
+        job_timeout: None,
     })
     .await
 }
@@ -416,6 +455,7 @@ pub async fn reload(name: impl Into<String>) -> crate::Result<super::Return> {
         name,
         enablement: None,
         runtime: Some(RuntimeAction::Reloaded),
+        job_timeout: None,
     })
     .await
 }
@@ -430,6 +470,7 @@ pub async fn enable_and_start(name: impl Into<String>) -> crate::Result<super::R
         name,
         enablement: Some(Enablement::Enabled),
         runtime: Some(RuntimeAction::Started),
+        job_timeout: None,
     })
     .await
 }
@@ -442,6 +483,7 @@ pub async fn disable_and_stop(name: impl Into<String>) -> crate::Result<super::R
         name,
         enablement: Some(Enablement::Disabled),
         runtime: Some(RuntimeAction::Stopped),
+        job_timeout: None,
     })
     .await
 }
@@ -483,10 +525,8 @@ async fn apply(state: State) -> crate::Result<super::Return> {
         );
     }
 
-    let conn = zbus::Connection::system()
-        .await
-        .context("Couldn't connect to the system bus")?;
-    let manager = ManagerProxy::new(&conn)
+    let conn = system_bus().await?;
+    let manager = ManagerProxy::new(conn)
         .await
         .context("Couldn't construct Manager proxy")?;
 
@@ -500,7 +540,7 @@ async fn apply(state: State) -> crate::Result<super::Return> {
     // `if path(...).await?.changed() { daemon_reload().await?; }`.
 
     let initial_unit_state = read_file_state(&manager, &unit_name).await?;
-    let initial_active_state = read_active_state(&manager, &conn, &unit_name).await?;
+    let initial_active_state = read_active_state(&manager, conn, &unit_name).await?;
 
     // Observe the two axes independently.
     let observed_runtime = if initial_active_state
@@ -526,10 +566,14 @@ async fn apply(state: State) -> crate::Result<super::Return> {
         name: state.name.clone(),
         enablement: observed_enablement,
         runtime: Some(observed_runtime),
+        job_timeout: None,
     };
     let new_view = State {
         name: state.name.clone(),
         enablement: state.enablement.or(observed_enablement),
+        // `job_timeout` is a knob, not an observable axis — both views
+        // carry `None` so it never shows up in a diff.
+        job_timeout: None,
         // `Restarted`/`Reloaded` are unconditional actions, not a steady
         // state — they always leave the unit running, so the *post* state is
         // `Started` for diff purposes.
@@ -689,7 +733,7 @@ async fn apply(state: State) -> crate::Result<super::Return> {
 
     if let Some(runtime_action) = state.runtime {
         let active = if changed {
-            read_active_state(&manager, &conn, &unit_name).await?
+            read_active_state(&manager, conn, &unit_name).await?
         } else {
             initial_active_state
         };
@@ -747,7 +791,14 @@ async fn apply(state: State) -> crate::Result<super::Return> {
         };
 
         if let Some((job, verb)) = job {
-            wait_job(&mut jobs, &job, &unit_name, verb).await?;
+            wait_job(
+                &mut jobs,
+                &job,
+                &unit_name,
+                verb,
+                state.job_timeout.unwrap_or(DEFAULT_JOB_TIMEOUT),
+            )
+            .await?;
             if matches!(
                 runtime_action,
                 RuntimeAction::Restarted | RuntimeAction::Reloaded
