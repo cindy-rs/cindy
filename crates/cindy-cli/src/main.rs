@@ -60,13 +60,6 @@ enum Subcommand {
         /// code mutates).
         #[clap(long)]
         check: bool,
-        /// Directory on the targets where the worker binary is staged
-        /// before execution (default /tmp). The worker is a throwaway
-        /// that deletes itself; but if the default is mounted noexec,
-        /// execution fails with a bare permission error — point this
-        /// at an exec-mounted path (e.g. /var/tmp).
-        #[clap(long)]
-        staging_dir: Option<String>,
     },
     Inventory {
         #[clap(long)]
@@ -196,6 +189,51 @@ fn ssh_fingerprint(blob_b64: &str) -> Option<String> {
         .ok()?;
     let digest = sha2::Sha256::digest(&blob);
     Some(base64::engine::general_purpose::STANDARD_NO_PAD.encode(digest))
+}
+
+/// Staging candidates in preference order. `/tmp` is the traditional
+/// default; `/var/tmp` is its rarely-noexec sibling (it usually lives
+/// on the root filesystem, while `/tmp` is what hardening guides and
+/// systemd tmp.mount flag).
+const STAGING_CANDIDATES: [&str; 2] = ["/tmp", "/var/tmp"];
+
+/// The first staging candidate whose mount allows execution, per the
+/// target's `/proc/mounts`. Unparseable input or no matching mount
+/// falls back to the last candidate — the exec-126 diagnosis is the
+/// backstop when even that can't run.
+fn staging_dir_from_mounts(mounts: &str) -> &'static str {
+    STAGING_CANDIDATES
+        .iter()
+        .find(|candidate| mount_allows_exec(mounts, candidate))
+        .copied()
+        .unwrap_or(STAGING_CANDIDATES[STAGING_CANDIDATES.len() - 1])
+}
+
+/// `true` unless the longest mount point containing `path` is mounted
+/// `noexec`. `/proc/mounts` fields: device, mount point, fstype,
+/// options (comma-separated), …
+fn mount_allows_exec(mounts: &str, path: &str) -> bool {
+    mounts
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split_whitespace();
+            let _device = fields.next()?;
+            let point = fields.next()?;
+            let _fstype = fields.next()?;
+            let options = fields.next()?;
+            Some((point, options))
+        })
+        .filter(|(point, _)| {
+            // Prefix match on path boundaries: `/tmp` must not match a
+            // hypothetical `/tmpfoo` mount.
+            path == *point
+                || path
+                    .strip_prefix(point)
+                    .is_some_and(|rest| rest.starts_with('/'))
+        })
+        .max_by_key(|(point, _)| point.len())
+        .map(|(_, options)| !options.split(',').any(|opt| opt == "noexec"))
+        .unwrap_or(true)
 }
 
 /// The inventory as pulled from the orchestrator: the type-erased
@@ -415,18 +453,12 @@ async fn run_after_launch(
         }
     }
 
-    let (limit, unprivileged, check_mode, staging_dir) = match subcommand {
+    let (limit, unprivileged, check_mode) = match subcommand {
         Subcommand::Play {
             limit,
             unprivileged,
             check,
-            staging_dir,
-        } => (
-            limit,
-            unprivileged,
-            check,
-            staging_dir.unwrap_or_else(|| "/tmp".to_owned()),
-        ),
+        } => (limit, unprivileged, check),
         Subcommand::Inventory { host, json, reveal } => {
             if json {
                 // Pick the JSON source: the secrets-decrypted whole
@@ -694,7 +726,6 @@ async fn run_after_launch(
         let worker_binaries = Arc::clone(&worker_binaries);
         let host_contexts = Arc::clone(&host_contexts);
         let host_vault_keys = Arc::clone(&host_vault_keys);
-        let staging_dir = staging_dir.clone();
         let progress_tx = progress_tx.clone();
 
         async move {
@@ -709,10 +740,34 @@ async fn run_after_launch(
                         .expect("Not compiled"),
                 );
 
+                // Pick a staging directory this host can actually
+                // execute from: hardened boxes mount /tmp noexec, and
+                // picking it operator-side (a --staging-dir flag) puts
+                // per-host trivia in a global flag. The target's own
+                // mounts are the authority — read /proc/mounts (one
+                // cheap roundtrip, world-readable, no sudo) and take
+                // the first candidate whose mount allows exec.
+                let mounts = host
+                    .session
+                    .command("cat")
+                    .arg("/proc/mounts")
+                    .output()
+                    .await
+                    .ok()
+                    .filter(|out| out.status.success());
+                let staging_dir = mounts
+                    .as_ref()
+                    .map(|out| staging_dir_from_mounts(&String::from_utf8_lossy(&out.stdout)))
+                    .unwrap_or("/tmp");
+                if staging_dir != "/tmp" {
+                    tracing::debug!(
+                        "staging worker under {staging_dir} — /tmp is noexec or unavailable"
+                    );
+                }
+
                 // A throwaway name: the worker unlinks its own
                 // executable on startup, so nothing accumulates on the
-                // target. `--staging-dir` relocates it for hosts whose
-                // /tmp is mounted noexec.
+                // target.
                 let remote_tmp_path = format!(
                     "{staging_dir}/.cindy-worker.{}",
                     rand::distr::SampleString::sample_string(&rand::distr::Alphanumeric, &mut rand::rng(), 16),
@@ -888,10 +943,10 @@ async fn run_after_launch(
                     // and it exits on its own.)
                     let worker_exit = remote_run.wait().await;
                     let worker_hint = match worker_exit {
-                        Ok(status) if status.code() == Some(126) => format!(
-                            " — the worker couldn't be executed (exit 126); if {staging_dir} \
-                             is mounted noexec, pass --staging-dir pointing at an \
-                             exec-mounted path"
+                        Ok(status) if status.code() == Some(126) => String::from(
+                            " — the worker couldn't be executed (exit 126): no staging \
+                             directory on this host allows execution (tried /tmp and \
+                             /var/tmp); one of them must be exec-mounted",
                         ),
                         _ => String::new(),
                     };
@@ -1242,5 +1297,52 @@ mod tests {
     #[test]
     fn garbage_blobs_yield_no_fingerprint() {
         assert!(ssh_fingerprint("not base64!!").is_none());
+    }
+
+    use super::{mount_allows_exec, staging_dir_from_mounts};
+
+    const MOUNTS: &str = concat!(
+        "proc /proc proc rw,nosuid,nodev,noexec,relatime 0 0\n",
+        "devtmpfs /dev devtmpfs rw,nosuid,size=... 0 0\n",
+        "/dev/sda2 / ext4 rw,relatime 0 0\n",
+        "tmpfs /tmp tmpfs rw,nosuid,nodev,noexec,relatime 0 0\n",
+        "/dev/sda3 /var ext4 rw,relatime 0 0\n",
+        "/dev/sda1 /boot vfat rw,noexec 0 0\n",
+    );
+
+    #[test]
+    fn exec_allowed_follows_the_longest_mount_prefix() {
+        // /tmp is directly noexec.
+        assert!(!mount_allows_exec(MOUNTS, "/tmp"));
+        // /var/tmp inherits /var's exec-allowing options (longest
+        // prefix wins over /).
+        assert!(mount_allows_exec(MOUNTS, "/var/tmp"));
+        // /boot is noexec; /home falls through to /.
+        assert!(!mount_allows_exec(MOUNTS, "/boot/efi"));
+        assert!(mount_allows_exec(MOUNTS, "/home/me"));
+    }
+
+    #[test]
+    fn prefix_matching_respects_path_boundaries() {
+        // A mount at /tmp2 must not make judgements about /tmp.
+        let mounts = "tmpfs /tmp2 tmpfs rw,noexec 0 0\n/dev/sda1 / ext4 rw 0 0\n";
+        assert!(mount_allows_exec(mounts, "/tmp"));
+        assert!(!mount_allows_exec(mounts, "/tmp2/x"));
+    }
+
+    #[test]
+    fn staging_dir_skips_noexec_tmp() {
+        assert_eq!(staging_dir_from_mounts(MOUNTS), "/var/tmp");
+        // A host where /tmp is fine keeps the traditional default.
+        let plain = "/dev/sda1 / ext4 rw,relatime 0 0\ntmpfs /tmp tmpfs rw 0 0\n";
+        assert_eq!(staging_dir_from_mounts(plain), "/tmp");
+        // Nothing exec-mounted at all: last candidate + the 126
+        // diagnosis as backstop.
+        let locked = "/dev/sda1 / ext4 rw,noexec 0 0\ntmpfs /tmp tmpfs rw,noexec 0 0\n";
+        assert_eq!(staging_dir_from_mounts(locked), "/var/tmp");
+        // Garbage/empty: no mounts parsed means no noexec evidence —
+        // keep the traditional default (the deployment path does the
+        // same when it can't read /proc/mounts at all).
+        assert_eq!(staging_dir_from_mounts(""), "/tmp");
     }
 }
