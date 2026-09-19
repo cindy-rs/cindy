@@ -61,27 +61,6 @@ for a reason that isn't visible in the code.
 
 ## Priority 1 — correctness bugs
 
-### `group.rs`: the system-ness guard is unreachable when a GID is pinned
-
-`crates/cindy/src/builtin/group.rs:212` — the GID-change arm has guard
-`if want != have` and sits *above* the arm at `:241` that carries the
-system-ness `bail!`. Rust matches top-down, and the GID arm never reads
-`system`. So:
-
-| Desired | Live group | Result |
-|---|---|---|
-| `{gid: None, system: Some(true)}` | gid 1500, non-system | **errors** |
-| `{gid: Some(2000), system: Some(true)}` | gid 1500, non-system | **silently runs `groupmod --gid 2000`**, group stays non-system |
-
-The second row is the stronger request and the one where crossing the
-boundary matters, and it's the one that skips the check. Worse, the GID
-arm's own diff view computes `system: Some(*want <= sys_gid_max())` —
-so it renders a diff that contradicts the request it was handed, and
-proceeds anyway. `user.rs:507` does this correctly: its check runs
-*before* reconciliation, so it catches every combination.
-
-**Blocked on a decision** — see [Needs a decision](#needs-a-decision).
-
 ### Shadow-utils: the observe→mutate race is still open
 
 `fe3dc4e` added `run_check_retry_locks`, which handles lock contention.
@@ -165,12 +144,10 @@ swallows mutex poisoning by silently falling back to a disk read, where
 
 ### `apt-get` on pre-2.1.10 apt
 
-`fe3dc4e` passes `-o DPkg::Lock::Timeout`, which buster's apt 1.8 accepts
-and ignores. `apt-get` itself is still called through plain `run_check`
-(`crates/cindy/src/builtin/debian/apt.rs:672`). Wrapping it in
-`run_check_retry_locks` covers old apt too and is safe — a lock
-acquisition failure means apt did nothing at all. Only worth doing if
-buster is a target; ask.
+Decided: **buster is not a target** — the fleet is VyOS 1.3+ (apt ≥
+2.2.4) and OpenWrt (no apt). `apt-get` keeps plain `run_check_retry_locks`
+coverage only via the `-o DPkg::Lock::Timeout` option old apt silently
+ignores, which is acceptable.
 
 ### Doc drift
 
@@ -321,15 +298,5 @@ the shadow-utils race above lives, so that item and this one pair well.
 
 Ask the human; don't pick for them.
 
-1. **`group.rs` system-ness semantics.** Either (a) mirror `user.rs` and
-   hoist the check above the GID arm, so `system` uniformly means
-   "assert this" and moving a GID across the boundary requires dropping
-   the field; or (b) treat an explicit `gid` as *the* mechanism for
-   changing system-ness, in which case the error message at `:241` must
-   say so instead of claiming `groupmod` can't do it. (a) is
-   recommended — (b) makes `system` mean two different things depending
-   on whether a sibling field is set.
-2. **Is buster (apt < 2.1.10) a target?** Decides whether `apt-get` gets
-   the retry wrapper.
-3. **Is `--check` wanted for 0.4?** It's the item whose cost grows
+1. **Is `--check` wanted for 0.4?** It's the item whose cost grows
    fastest with delay.

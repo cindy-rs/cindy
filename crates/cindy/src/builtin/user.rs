@@ -72,13 +72,15 @@ pub enum Presence {
         /// GECOS / comment field (full name etc.). `None` ⇒ untouched.
         comment: Option<String>,
         /// Create as a system account (UID from the system range, no
-        /// per-user group skeleton by default). Only consulted when the
-        /// account is **created** — an account's system-ness is fixed by
-        /// its UID at creation and isn't migratable without delete +
-        /// recreate (which would orphan its files). `None` (the default)
-        /// leaves an existing account's system-ness alone; a `Some(..)`
-        /// that disagrees with the live account errors instead of
-        /// silently never converging.
+        /// per-user group skeleton by default). Only steers UID
+        /// allocation when the account is **created**. For an existing
+        /// account, system-ness is not an independent attribute: an
+        /// account is a system account iff its UID ≤ `SYS_UID_MAX`. A
+        /// `Some(..)` must therefore agree with the UID the account
+        /// will have after reconciliation — the requested `uid` if
+        /// set, else the live one — and a disagreement errors instead
+        /// of silently never converging. `None` (the default) lets it
+        /// follow the UID.
         system: Option<bool>,
     },
 }
@@ -174,6 +176,53 @@ fn observe(name: &str) -> crate::Result<Presence> {
         // a requested mismatch can be detected (see `apply`).
         system: Some(user.uid.as_raw() <= sys_uid_max()),
     })
+}
+
+/// The desired `system` flag vs the UID the account would actually end
+/// up with — the requested `uid` if set, else `fallback_uid` (the live
+/// UID when reconciling an existing account). Returns the offending
+/// `(want_system, effective_uid)` when they contradict: an account is
+/// a system account iff its UID ≤ `sys_uid_max`, so e.g. `system:
+/// Some(true)` together with a UID above the boundary is a request
+/// that can never converge.
+fn system_conflict(
+    want: &Presence,
+    fallback_uid: Option<u32>,
+    sys_uid_max: u32,
+) -> Option<(bool, u32)> {
+    let Presence::Present {
+        uid: want_uid,
+        system: Some(want_system),
+        ..
+    } = want
+    else {
+        return None;
+    };
+    let effective_uid = want_uid.or(fallback_uid)?;
+    if (effective_uid <= sys_uid_max) != *want_system {
+        Some((*want_system, effective_uid))
+    } else {
+        None
+    }
+}
+
+/// Reject a `system` request that contradicts the UID it implies, with
+/// an error that states the derived rule instead of a tool limitation.
+fn check_system_consistency(
+    name: &str,
+    want: &Presence,
+    fallback_uid: Option<u32>,
+) -> crate::Result<()> {
+    if let Some((want_system, effective_uid)) = system_conflict(want, fallback_uid, sys_uid_max()) {
+        let side = if want_system { "at or below" } else { "above" };
+        crate::bail!(
+            "user `{name}`: `system: Some({want_system})` contradicts UID {effective_uid} — \
+             an account is a system account iff its UID ≤ SYS_UID_MAX ({}). System-ness \
+             follows the UID: drop the `system` field, or pick a UID {side} that boundary.",
+            sys_uid_max()
+        );
+    }
+    Ok(())
 }
 
 /// Reconcile the desired `Present` attributes against the observed
@@ -314,7 +363,12 @@ fn reconcile(want: &Presence, have: &Presence) -> ReconcileResult {
             shell,
             home,
             comment,
-            system: (*system).or(*o_system),
+            // Diff view: system-ness follows the final (post-reconcile)
+            // UID — the same derived rule `apply` enforces — so a UID
+            // move across the boundary renders the flip it causes.
+            system: system
+                .or_else(|| uid.map(|u| u <= sys_uid_max()))
+                .or(*o_system),
         },
     }
 }
@@ -478,6 +532,7 @@ fn apply(state: State) -> crate::Result<super::Return> {
 
         // Create a new account: every requested attribute applies.
         (want @ Presence::Present { .. }, Presence::Absent { .. }) => {
+            check_system_consistency(&state.name, want, None)?;
             show_diff(&state.name, observed.clone(), want.clone());
             let mut cmd = Command::new("useradd");
             cmd.args(useradd_args(want)).args(["--", &state.name]);
@@ -487,29 +542,15 @@ fn apply(state: State) -> crate::Result<super::Return> {
 
         // Reconcile an existing account: a single comparison pass builds
         // both the struct diff and the `usermod` argv.
-        (
-            want @ Presence::Present { system, .. },
-            have @ Presence::Present {
-                system: observed_system,
-                ..
-            },
-        ) => {
-            // System-ness is fixed at creation (UID range); `usermod`
-            // cannot migrate it. An explicit request that disagrees with
-            // the live account would otherwise print a diff that never
-            // applies — error instead.
-            if let Some(want_system) = *system
-                && let Some(live_system) = *observed_system
-                && want_system != live_system
-            {
-                crate::bail!(
-                    "user `{}` exists with system={live_system}, but the desired \
-                     state says system={want_system}: usermod cannot move an account \
-                     between the system and regular UID ranges. Drop the `system` \
-                     field from the desired state, or delete and recreate the account.",
-                    state.name
-                );
-            }
+        (want @ Presence::Present { .. }, have @ Presence::Present { uid: live_uid, .. }) => {
+            // System-ness is not independent of the UID: an account is
+            // a system account iff its UID ≤ SYS_UID_MAX. The request
+            // must agree with the UID the account will end up with —
+            // the requested `uid` if set, else the live one. A
+            // consistent `uid` + `system` pair can migrate an account
+            // across the boundary; an inconsistent one can never
+            // converge.
+            check_system_consistency(&state.name, want, *live_uid)?;
             let ReconcileResult { args, desired } = reconcile(want, have);
             show_diff(&state.name, observed.clone(), desired);
 
@@ -553,8 +594,11 @@ mod tests {
     }
 
     fn observed(system: bool) -> Presence {
+        // Keep the fixture honest with the derived rule: a system
+        // account carries a UID below SYS_UID_MAX (999 in these tests).
+        let uid = if system { 500 } else { 1000 };
         want(
-            Some(1000),
+            Some(uid),
             Some("users"),
             Some(Groups::Exact(vec!["docker".into()])),
             Some("/bin/bash"),
@@ -562,6 +606,10 @@ mod tests {
             Some("Alice"),
             Some(system),
         )
+    }
+
+    fn sys_want(uid: Option<u32>, system: Option<bool>) -> Presence {
+        want(uid, None, None, None, None, None, system)
     }
 
     fn args_of(res: &ReconcileResult) -> Vec<String> {
@@ -613,7 +661,7 @@ mod tests {
         assert_eq!(
             res.desired,
             want(
-                Some(1000),
+                Some(500),
                 Some("users"),
                 Some(Groups::Exact(vec!["docker".into()])),
                 Some("/bin/bash"),
@@ -621,6 +669,68 @@ mod tests {
                 Some("Alice"),
                 Some(true),
             )
+        );
+    }
+
+    /// The consistency rule `apply` enforces before reconciling or
+    /// creating: `system` must agree with the UID the account would end
+    /// up with — the requested `uid` if set, else the live one.
+    #[test]
+    fn system_request_must_agree_with_the_resulting_uid() {
+        const MAX: u32 = 999;
+
+        // Assertions against the UID the account keeps…
+        assert!(system_conflict(&sys_want(None, Some(true)), Some(1500), MAX).is_some());
+        assert!(system_conflict(&sys_want(None, Some(false)), Some(500), MAX).is_some());
+        // …and against a pinned one on the wrong side of the boundary.
+        assert!(system_conflict(&sys_want(Some(2000), Some(true)), Some(1500), MAX).is_some());
+        assert!(system_conflict(&sys_want(Some(500), Some(false)), Some(1500), MAX).is_some());
+        // Create-side: only an explicitly pinned UID can conflict.
+        assert!(system_conflict(&sys_want(Some(2000), Some(true)), None, MAX).is_some());
+        assert!(system_conflict(&sys_want(None, Some(true)), None, MAX).is_none());
+        assert!(system_conflict(&sys_want(None, Some(false)), None, MAX).is_none());
+
+        // Consistent requests pass, including a migration across the
+        // boundary with an explicit, agreeing `system`.
+        assert!(system_conflict(&sys_want(Some(500), Some(true)), Some(1500), MAX).is_none());
+        assert!(system_conflict(&sys_want(Some(2000), Some(false)), Some(1500), MAX).is_none());
+        assert!(system_conflict(&sys_want(Some(MAX), Some(true)), None, MAX).is_none());
+        // `None` never conflicts — system-ness just follows the UID.
+        assert!(system_conflict(&sys_want(None, None), Some(1500), MAX).is_none());
+        assert!(system_conflict(&sys_want(Some(500), None), Some(1500), MAX).is_none());
+    }
+
+    /// A UID move across the boundary flips system-ness in the diff
+    /// view even when the request never mentions `system`.
+    #[test]
+    fn reconcile_derives_system_from_the_moved_uid() {
+        let res = reconcile(&sys_want(Some(500), None), &observed(false));
+        assert!(args_of(&res).contains(&"--uid".to_string()));
+        assert_eq!(
+            res.desired,
+            Presence::Present {
+                uid: Some(500),
+                group: Some("users".into()),
+                groups: Some(Groups::Exact(vec!["docker".into()])),
+                shell: Some("/bin/bash".into()),
+                home: Some("/home/alice".into()),
+                comment: Some("Alice".into()),
+                system: Some(true),
+            }
+        );
+
+        let res = reconcile(&sys_want(Some(1500), None), &observed(true));
+        assert_eq!(
+            res.desired,
+            Presence::Present {
+                uid: Some(1500),
+                group: Some("users".into()),
+                groups: Some(Groups::Exact(vec!["docker".into()])),
+                shell: Some("/bin/bash".into()),
+                home: Some("/home/alice".into()),
+                comment: Some("Alice".into()),
+                system: Some(false),
+            }
         );
     }
 

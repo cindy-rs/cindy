@@ -19,22 +19,22 @@ pub enum Presence {
     Absent,
     /// `groupadd` / `groupmod`: ensure the group exists. `gid` pins the
     /// numeric GID (`None` ⇒ let the system allocate one on create, and
-    /// leave it alone on an existing group). `system` only affects
-    /// creation (picks a GID from the system range); it can't be
-    /// changed after the fact.
+    /// leave it alone on an existing group). `system` steers the GID
+    /// range on create and must stay consistent with the resulting GID
+    /// afterwards (see the field docs).
     Present {
         /// Desired numeric GID. `None` ⇒ system-allocated on create,
         /// untouched on an existing group.
         gid: Option<u32>,
         /// Create as a system group (GID from the system range). Only
-        /// consulted when the group is being **created** — a group's
-        /// system-ness is fixed by its GID at creation and cannot be
-        /// changed afterwards without deleting and recreating it (which
-        /// would orphan every file owned by the old GID). `None` (the
-        /// default) leaves an existing group's system-ness alone; a
-        /// `Some(..)` that disagrees with the live group errors instead
-        /// of silently never converging. This matches Ansible's `group`
-        /// module.
+        /// steers GID allocation when the group is **created**. For an
+        /// existing group, system-ness is not an independent attribute:
+        /// a group is a system group iff its GID ≤ `SYS_GID_MAX`. A
+        /// `Some(..)` must therefore agree with the GID the group will
+        /// have after reconciliation — the requested `gid` if set,
+        /// else the live one — and a disagreement errors instead of
+        /// silently never converging. `None` (the default) lets it
+        /// follow the GID.
         system: Option<bool>,
     },
 }
@@ -167,8 +167,64 @@ pub fn absent(name: impl Into<String>) -> crate::Result<super::Return> {
     })
 }
 
+/// The desired `system` flag vs the GID the group would actually end
+/// up with — the requested `gid` if set, else `fallback_gid` (the live
+/// GID when reconciling an existing group). Returns the offending
+/// `(want_system, effective_gid)` when they contradict: a group is a
+/// system group iff its GID ≤ `sys_gid_max`, so e.g. `system:
+/// Some(true)` together with a GID above the boundary is a request
+/// that can never converge.
+fn system_conflict(
+    want: &Presence,
+    fallback_gid: Option<u32>,
+    sys_gid_max: u32,
+) -> Option<(bool, u32)> {
+    let Presence::Present {
+        gid: want_gid,
+        system: Some(want_system),
+    } = want
+    else {
+        return None;
+    };
+    let effective_gid = want_gid.or(fallback_gid)?;
+    if (effective_gid <= sys_gid_max) != *want_system {
+        Some((*want_system, effective_gid))
+    } else {
+        None
+    }
+}
+
+/// Reject a `system` request that contradicts the GID it implies, with
+/// an error that states the derived rule instead of a tool limitation.
+fn check_system_consistency(
+    name: &str,
+    want: &Presence,
+    fallback_gid: Option<u32>,
+) -> crate::Result<()> {
+    if let Some((want_system, effective_gid)) = system_conflict(want, fallback_gid, sys_gid_max()) {
+        let side = if want_system { "at or below" } else { "above" };
+        crate::bail!(
+            "group `{name}`: `system: Some({want_system})` contradicts GID {effective_gid} — \
+             a group is a system group iff its GID ≤ SYS_GID_MAX ({}). System-ness follows \
+             the GID: drop the `system` field, or pick a GID {side} that boundary.",
+            sys_gid_max()
+        );
+    }
+    Ok(())
+}
+
 fn apply(state: State) -> crate::Result<super::Return> {
     let observed = observe(&state.name)?;
+
+    // Reconciling an existing group: reject a `system` request that
+    // contradicts the GID the group would keep or move to — before any
+    // arm can act on a subset of the request (the GID arm used to skip
+    // this check entirely).
+    if let (want @ Presence::Present { .. }, Presence::Present { gid, .. }) =
+        (&state.presence, &observed)
+    {
+        check_system_consistency(&state.name, want, *gid)?;
+    }
 
     let changed = match (&state.presence, &observed) {
         // Want absent, already gone.
@@ -183,6 +239,7 @@ fn apply(state: State) -> crate::Result<super::Return> {
 
         // Want present, currently absent → create.
         (want @ Presence::Present { gid, system }, Presence::Absent) => {
+            check_system_consistency(&state.name, want, None)?;
             show_diff(&state.name, Presence::Absent, want.clone());
             let mut cmd = Command::new("groupadd");
             if *system == Some(true) {
@@ -195,13 +252,12 @@ fn apply(state: State) -> crate::Result<super::Return> {
             true
         }
 
-        // Want present, already present → reconcile the GID only. We
-        // never migrate system-ness (see `Presence::Present::system`);
-        // an explicit request that disagrees with the live group errors
-        // instead of silently never converging. The "new" diff view
-        // reports system inferred from the target GID purely so the
-        // rendered diff is honest about the side effect of moving the
-        // GID across the system boundary.
+        // Want present, already present → reconcile the GID. The
+        // consistency check above the match has already guaranteed any
+        // requested `system` agrees with the resulting GID, so the
+        // "new" diff view reporting system derived from the target GID
+        // is honest about the side effect of moving it across the
+        // system boundary.
         (
             Presence::Present {
                 gid: Some(want), ..
@@ -227,28 +283,52 @@ fn apply(state: State) -> crate::Result<super::Return> {
             true
         }
 
-        (
-            Presence::Present { system, .. },
-            Presence::Present {
-                system: observed_system,
-                ..
-            },
-        ) => {
-            if let Some(want_system) = *system
-                && let Some(live_system) = *observed_system
-                && want_system != live_system
-            {
-                crate::bail!(
-                    "group `{}` exists with system={live_system}, but the desired \
-                     state says system={want_system}: groupmod cannot move a group \
-                     between the system and regular GID ranges. Drop the `system` \
-                     field from the desired state, or delete and recreate the group.",
-                    state.name
-                );
-            }
-            false
-        }
+        // No GID change (and any `system` request either matched the
+        // live GID or was rejected above).
+        (Presence::Present { .. }, Presence::Present { .. }) => false,
     };
 
     Ok(super::Return::from_changed(changed))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn want(gid: Option<u32>, system: Option<bool>) -> Presence {
+        Presence::Present { gid, system }
+    }
+
+    /// The consistency rule the hoisted check enforces: `system` must
+    /// agree with the GID the group would end up with. The GID-change
+    /// arm used to sit above the check and never saw `system` at all.
+    #[test]
+    fn system_request_must_agree_with_the_resulting_gid() {
+        const MAX: u32 = 999;
+
+        // The two rows PLAN.md flagged: reachable before only without a
+        // pinned GID.
+        assert!(system_conflict(&want(None, Some(true)), Some(1500), MAX).is_some());
+        assert!(system_conflict(&want(Some(2000), Some(true)), Some(1500), MAX).is_some());
+
+        // The flip side: non-system asserted against a system GID.
+        assert!(system_conflict(&want(Some(500), Some(false)), Some(1500), MAX).is_some());
+        assert!(system_conflict(&want(None, Some(false)), Some(500), MAX).is_some());
+
+        // Consistent requests pass, including a migration across the
+        // boundary with an explicit, agreeing `system`.
+        assert!(system_conflict(&want(Some(500), Some(true)), Some(1500), MAX).is_none());
+        assert!(system_conflict(&want(Some(2000), Some(false)), Some(1500), MAX).is_none());
+        assert!(system_conflict(&want(Some(1500), Some(false)), Some(1500), MAX).is_none());
+        assert!(system_conflict(&want(Some(MAX), Some(true)), Some(1500), MAX).is_none());
+
+        // `None` never conflicts — system-ness just follows the GID.
+        assert!(system_conflict(&want(None, None), Some(1500), MAX).is_none());
+        assert!(system_conflict(&want(Some(500), None), Some(1500), MAX).is_none());
+
+        // Create-side: only an explicitly pinned GID can conflict.
+        assert!(system_conflict(&want(Some(2000), Some(true)), None, MAX).is_some());
+        assert!(system_conflict(&want(None, Some(true)), None, MAX).is_none());
+        assert!(system_conflict(&want(None, Some(false)), None, MAX).is_none());
+    }
 }
