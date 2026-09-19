@@ -158,9 +158,10 @@ pub fn wire(_args: TokenStream, input: TokenStream) -> TokenStream {
 ///
 /// 1. `async fn main() -> Result<()>` - legacy, no host context.
 /// 2. `async fn main(host: cindy::Host<V>) -> Result<()>` - the macro
-///    reads the `CINDY_HOST_CONTEXT` env var (JSON serialized
-///    `cindy::Host<V>` produced by the CLI for this particular target)
-///    and hands it pre-parsed to the body. Any `Serialize +
+///    reads the host context the CLI injected for this particular
+///    target (a JSON-serialised `cindy::Host<V>`; see
+///    `cindy::entry::host_context` for the hand-off channel) and hands
+///    it pre-parsed to the body. Any `Serialize +
 ///    DeserializeOwned` `V` works; use `cindy::Host<()>` if you only
 ///    need `name`/`tags`.
 ///

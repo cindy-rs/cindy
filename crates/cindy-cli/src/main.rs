@@ -345,7 +345,11 @@ async fn run_after_launch(
                         .context("orchestrator dump omitted revealed JSON despite `--reveal`")?
                     {
                         Ok(v) => v,
-                        Err(e) => return Err(eyre::eyre!("failed to reveal secrets for JSON output: {e}")),
+                        Err(e) => {
+                            return Err(eyre::eyre!(
+                                "failed to reveal secrets for JSON output: {e}"
+                            ));
+                        }
                     }
                 } else {
                     serde_json::to_value(&inventory)?
@@ -643,14 +647,30 @@ async fn run_after_launch(
                     .await?;
 
                 // The orchestrator runs locally (operator's machine), so
-                // env is a fine channel for both its host context and the
-                // vault keys. It installs the keys for its own
-                // orchestrator-side reveals and forwards them to the
-                // worker over the RPC handshake.
-                let mut orchestrator_run = tokio::process::Command::new(&*orch_path)
+                // env is a fine channel for the vault keys (it installs
+                // them for its own orchestrator-side reveals and
+                // forwards them to the worker over the RPC handshake).
+                // The host context, however, can exceed what env can
+                // carry: the kernel caps a single env var at MAX_ARG_STRLEN
+                // (~128 KiB), and a host whose `vars` embed large blobs
+                // (certificates, whole config files) used to make this
+                // spawn fail with a bare E2BIG. Hand the context over
+                // as a temp file (unlinked when this per-host task
+                // ends) instead. The inline env copy for small
+                // contexts only exists so orchestrators built against
+                // an older cindy — which read just the env var — keep
+                // working.
+                let context_file = tempfile::NamedTempFile::new()?;
+                std::fs::write(context_file.path(), &host_context_json)?;
+                let mut orchestrator_cmd = tokio::process::Command::new(&*orch_path);
+                orchestrator_cmd
                     .kill_on_drop(true)
-                    .env("CINDY_HOST_CONTEXT", &host_context_json)
-                    .env("CINDY_VAULT_KEYS", &vault_keys_json)
+                    .env("CINDY_HOST_CONTEXT_FILE", context_file.path())
+                    .env("CINDY_VAULT_KEYS", &vault_keys_json);
+                if host_context_json.len() <= 64 * 1024 {
+                    orchestrator_cmd.env("CINDY_HOST_CONTEXT", &host_context_json);
+                }
+                let mut orchestrator_run = orchestrator_cmd
                     .stdin(std::process::Stdio::piped())
                     .stdout(std::process::Stdio::piped())
                     .stderr(std::process::Stdio::piped())

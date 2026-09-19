@@ -15,8 +15,9 @@
 //! is only meant to exist transiently in source code that hasn't been
 //! sealed yet (and at runtime in dev/tests); the `cindy secret seal`
 //! workflow rewrites these into the **Sealed** form. The sealed form
-//! is what the CLI actually serialises, deserialises, ships through
-//! `CINDY_HOST_CONTEXT`, and so on.
+//! is what the CLI actually serialises, deserialises, and ships to the
+//! orchestrator process through the host-context hand-off (see
+//! `cindy::entry`), and so on.
 
 use std::fmt;
 

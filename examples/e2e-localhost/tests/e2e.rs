@@ -96,6 +96,12 @@ fn e2e_localhost_play() {
             "work_dir": work_dir,
             "fetch_url": fetch_url,
             "fetch_sha256": fetch_sha256,
+            // Regression for MAX_ARG_STRLEN: a host context bigger
+            // than the ~128 KiB a single env var can hold must still
+            // reach the orchestrator. It travels via temp file
+            // (`CINDY_HOST_CONTEXT_FILE`), exactly like the CLI hands
+            // it over for large contexts.
+            "padding": "x".repeat(150 * 1024),
         }
     });
 
@@ -124,8 +130,13 @@ fn e2e_localhost_play() {
         .spawn()
         .expect("spawn remote worker");
 
+    // Hand the context over the same way the CLI does: a temp file,
+    // with the env var pointing at its path.
+    let context_file = tempfile::NamedTempFile::new().expect("create context file");
+    std::fs::write(context_file.path(), host_context.to_string()).expect("write host context");
+
     let mut orchestrator = Command::new(&orchestrator_bin)
-        .env("CINDY_HOST_CONTEXT", host_context.to_string())
+        .env("CINDY_HOST_CONTEXT_FILE", context_file.path())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
@@ -229,6 +240,8 @@ fn worker_death_fails_fast() {
         .expect("spawn remote worker");
 
     let mut orchestrator = Command::new(&orchestrator_bin)
+        // Deliberately the legacy inline env hand-off: keeps coverage
+        // for the `CINDY_HOST_CONTEXT` fallback path.
         .env("CINDY_HOST_CONTEXT", host_context.to_string())
         .env("CINDY_E2E_SLEEP", "1")
         .stdin(Stdio::piped())

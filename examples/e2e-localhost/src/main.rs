@@ -5,13 +5,18 @@ pub struct Vars {
     work_dir: PathBuf,
     fetch_url: String,
     fetch_sha256: String,
+    /// Bulk payload holder: the e2e test stuffs >128 KiB into it to
+    /// prove the host-context hand-off survives contexts too large
+    /// for a single env var (kernel `MAX_ARG_STRLEN`).
+    #[serde(default)]
+    padding: String,
 }
 
 #[cindy::inventory]
 fn inventory() -> cindy::Inventory<Vars> {
-    // The test overrides this via `CINDY_HOST_CONTEXT`; the inventory
-    // body just needs to exist and type-check. Defaults are harmless
-    // placeholders.
+    // The test overrides this via the host-context hand-off; the
+    // inventory body just needs to exist and type-check. Defaults are
+    // harmless placeholders.
     cindy::Inventory {
         hosts: vec![cindy::Host {
             name: "localhost".into(),
@@ -20,6 +25,7 @@ fn inventory() -> cindy::Inventory<Vars> {
                 work_dir: std::env::temp_dir().join("cindy-e2e"),
                 fetch_url: "http://127.0.0.1/".into(),
                 fetch_sha256: String::new(),
+                padding: String::new(),
             },
         }],
     }
