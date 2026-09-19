@@ -14,29 +14,24 @@ use std::process::exit;
 use tokio::io::AsyncWriteExt as _;
 
 /// Load the raw host-context JSON (a JSON `cindy::Host<V>`, injected
-/// per-target by the CLI).
-///
-/// Preferred channel: `CINDY_HOST_CONTEXT_FILE`, a path to a temp file
-/// the CLI writes — a single env var is capped at ~128 KiB by the
-/// kernel (`MAX_ARG_STRLEN`), which real `vars` payloads (embedded
-/// certificates, whole config files) can exceed. Fallback: the legacy
-/// inline `CINDY_HOST_CONTEXT` env var (small contexts from older
-/// CLIs; direct debugging runs of the orchestrator binary).
+/// per-target by the CLI) from the `CINDY_HOST_CONTEXT_FILE` temp
+/// file. A single env var is capped at ~128 KiB by the kernel
+/// (`MAX_ARG_STRLEN`), which real `vars` payloads — embedded
+/// certificates, whole config files — can exceed; a file has no such
+/// ceiling.
 fn load_context_json() -> Option<String> {
-    if let Ok(path) = std::env::var("CINDY_HOST_CONTEXT_FILE") {
-        return Some(match std::fs::read_to_string(&path) {
-            Ok(json) => json,
-            Err(e) => {
-                eprintln!(
-                    "\x1b[31mfailed to read the host context file `{path}`: {e}\n\
-                     The orchestrator process is meant to be launched by the `cindy` command \
-                     line tool.\x1b[0m"
-                );
-                std::process::exit(1);
-            }
-        });
-    }
-    std::env::var("CINDY_HOST_CONTEXT").ok()
+    let path = std::env::var("CINDY_HOST_CONTEXT_FILE").ok()?;
+    Some(match std::fs::read_to_string(&path) {
+        Ok(json) => json,
+        Err(e) => {
+            eprintln!(
+                "\x1b[31mfailed to read the host context file `{path}`: {e}\n\
+                 The orchestrator process is meant to be launched by the `cindy` command line \
+                 tool.\x1b[0m"
+            );
+            std::process::exit(1);
+        }
+    })
 }
 
 /// Parse the host context into the host type the user's `main`
@@ -49,9 +44,8 @@ pub fn host_context<H: serde::de::DeserializeOwned>() -> H {
             eprintln!(
                 "\x1b[31mhost context not set!\n\
                  The orchestrator process is meant to be launched by the `cindy` command line \
-                 tool. If you're trying to run the binary directly, set CINDY_HOST_CONTEXT to \
-                 a JSON-serialised `cindy::Host<V>` (or CINDY_HOST_CONTEXT_FILE to a path \
-                 holding one) first.\x1b[0m"
+                 tool. If you're trying to run the binary directly, point CINDY_HOST_CONTEXT_FILE \
+                 at a JSON-serialised `cindy::Host<V>` first.\x1b[0m"
             );
             std::process::exit(1);
         }
@@ -60,7 +54,7 @@ pub fn host_context<H: serde::de::DeserializeOwned>() -> H {
         Ok(v) => v,
         Err(e) => {
             eprintln!(
-                "\x1b[31mCINDY_HOST_CONTEXT was not valid JSON for the declared \
+                "\x1b[31mthe host context was not valid JSON for the declared \
                  `cindy::Host<V>` type: {e}\x1b[0m"
             );
             std::process::exit(1);

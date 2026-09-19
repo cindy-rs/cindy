@@ -239,10 +239,13 @@ fn worker_death_fails_fast() {
         .spawn()
         .expect("spawn remote worker");
 
+    // Hand the context over the same way the CLI does: a temp file,
+    // with the env var pointing at its path.
+    let context_file = tempfile::NamedTempFile::new().expect("create context file");
+    std::fs::write(context_file.path(), host_context.to_string()).expect("write host context");
+
     let mut orchestrator = Command::new(&orchestrator_bin)
-        // Deliberately the legacy inline env hand-off: keeps coverage
-        // for the `CINDY_HOST_CONTEXT` fallback path.
-        .env("CINDY_HOST_CONTEXT", host_context.to_string())
+        .env("CINDY_HOST_CONTEXT_FILE", context_file.path())
         .env("CINDY_E2E_SLEEP", "1")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -329,8 +332,13 @@ fn backpressure_serialises_oversized_fanout() {
         .spawn()
         .expect("spawn remote worker");
 
+    // Hand the context over the same way the CLI does: a temp file,
+    // with the env var pointing at its path.
+    let context_file = tempfile::NamedTempFile::new().expect("create context file");
+    std::fs::write(context_file.path(), host_context.to_string()).expect("write host context");
+
     let mut orchestrator = Command::new(&orchestrator_bin)
-        .env("CINDY_HOST_CONTEXT", host_context.to_string())
+        .env("CINDY_HOST_CONTEXT_FILE", context_file.path())
         .env("CINDY_E2E_BUDGET", "1")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())

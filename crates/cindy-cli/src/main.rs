@@ -651,15 +651,12 @@ async fn run_after_launch(
                 // them for its own orchestrator-side reveals and
                 // forwards them to the worker over the RPC handshake).
                 // The host context, however, can exceed what env can
-                // carry: the kernel caps a single env var at MAX_ARG_STRLEN
-                // (~128 KiB), and a host whose `vars` embed large blobs
-                // (certificates, whole config files) used to make this
-                // spawn fail with a bare E2BIG. Hand the context over
-                // as a temp file (unlinked when this per-host task
-                // ends) instead. The inline env copy for small
-                // contexts only exists so orchestrators built against
-                // an older cindy — which read just the env var — keep
-                // working.
+                // carry: the kernel caps a single env var at
+                // MAX_ARG_STRLEN (~128 KiB), and a host whose `vars`
+                // embed large blobs (certificates, whole config files)
+                // used to make this spawn fail with a bare E2BIG. Hand
+                // the context over as a temp file (unlinked when this
+                // per-host task ends) instead — no size ceiling.
                 let context_file = tempfile::NamedTempFile::new()?;
                 std::fs::write(context_file.path(), &host_context_json)?;
                 let mut orchestrator_cmd = tokio::process::Command::new(&*orch_path);
@@ -667,9 +664,6 @@ async fn run_after_launch(
                     .kill_on_drop(true)
                     .env("CINDY_HOST_CONTEXT_FILE", context_file.path())
                     .env("CINDY_VAULT_KEYS", &vault_keys_json);
-                if host_context_json.len() <= 64 * 1024 {
-                    orchestrator_cmd.env("CINDY_HOST_CONTEXT", &host_context_json);
-                }
                 let mut orchestrator_run = orchestrator_cmd
                     .stdin(std::process::Stdio::piped())
                     .stdout(std::process::Stdio::piped())
