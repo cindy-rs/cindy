@@ -16,7 +16,6 @@
 
 use std::process::Command;
 
-use crate as cindy;
 use crate::Context;
 
 /// Desired supplementary-group membership.

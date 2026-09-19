@@ -13,7 +13,6 @@
 //! carries no `mode` (the Linux kernel ignores symlink permissions),
 //! and an absent path carries nothing.
 
-use crate as cindy;
 use crate::Context;
 
 use std::io::Write as _;

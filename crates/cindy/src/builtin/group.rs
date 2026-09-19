@@ -8,7 +8,6 @@
 
 use std::process::Command;
 
-use crate as cindy;
 use crate::Context;
 
 /// Whether the group should exist, and how.
@@ -232,7 +231,7 @@ fn apply(state: State) -> crate::Result<super::Return> {
         }
 
         (
-            want @ Presence::Present { system, .. },
+            Presence::Present { system, .. },
             Presence::Present {
                 system: observed_system,
                 ..

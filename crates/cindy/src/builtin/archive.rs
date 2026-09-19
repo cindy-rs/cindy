@@ -11,7 +11,6 @@
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
-use crate as cindy;
 use crate::Context;
 
 use super::Format;

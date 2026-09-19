@@ -3,7 +3,6 @@ use std::str::FromStr;
 use zbus_systemd::systemd1::{JobRemovedStream, ManagerProxy, UnitProxy};
 use zbus_systemd::zbus;
 
-use crate as cindy;
 use crate::Context;
 
 /// Desired **active** (runtime) state of a unit — independent of whether it's

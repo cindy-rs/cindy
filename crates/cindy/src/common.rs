@@ -1,4 +1,3 @@
-use crate as cindy;
 
 use uuid::Uuid;
 

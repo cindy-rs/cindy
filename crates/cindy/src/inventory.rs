@@ -1,4 +1,3 @@
-use crate as cindy;
 
 /// The entire fleet as the user's [`cindy::inventory`] function declares
 /// it.
@@ -67,7 +66,7 @@ pub fn collect_sealed_vaults(
 /// a secrets-decrypted JSON (or an error string if a vault key was
 /// missing). Outside reveal mode `json_revealed` is `None`.
 #[derive(serde::Serialize, serde::Deserialize)]
-#[serde(crate = "cindy::__reexports::serde")]
+#[serde(crate = "crate::__reexports::serde")]
 #[doc(hidden)]
 pub struct InventoryDump {
     pub json: serde_json::Value,
@@ -160,7 +159,7 @@ inventory::collect!(RegisteredInventory);
 /// through `serde_json::Value`. That keeps the CLI ignorant of your
 /// project's types while still letting your code reach typed vars.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-#[serde(crate = "cindy::__reexports::serde")]
+#[serde(crate = "crate::__reexports::serde")]
 pub struct Host<V = ()> {
     /// Operator-facing host name. Whatever the CLI calls this target —
     /// typically the SSH host alias.

@@ -14,7 +14,6 @@ use std::io::Write as _;
 // Only referenced by the macro-generated RPC/dispatch code under the
 // `remote`/`orchestrator` features; unused in the plain build.
 #[allow(unused_imports)]
-use crate as cindy;
 use crate::Context;
 
 use super::Codec;

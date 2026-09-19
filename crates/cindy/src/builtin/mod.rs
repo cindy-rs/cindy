@@ -1,4 +1,3 @@
-use crate as cindy;
 
 pub mod archive;
 pub mod command;

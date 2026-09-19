@@ -15,7 +15,6 @@ use std::path::PathBuf;
 
 use sha2::Digest as _;
 
-use crate as cindy;
 use crate::Context;
 
 /// A digest to verify a downloaded file against. Pairing the algorithm

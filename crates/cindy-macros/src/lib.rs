@@ -31,6 +31,69 @@ fn compile_err(span: proc_macro2::Span, msg: &str) -> TokenStream {
     syn::Error::new(span, msg).to_compile_error().into()
 }
 
+/// How generated code must refer to the `cindy` framework crate:
+/// `crate` when the macros are expanding inside cindy itself (its
+/// builtins), otherwise whatever name the invoking crate knows the
+/// dependency by — `cindy`, or the rename from
+/// `[dependencies] whatever = { package = "cindy", … }`.
+///
+/// Attribute macros can't see the path they were *invoked* with, so
+/// emitting a hardcoded `cindy::…` breaks every renamed-dependency
+/// user; resolving the name from the manifest (via `proc-macro-crate`)
+/// is the standard workaround.
+#[derive(Clone)]
+enum Cindy {
+    Itself,
+    Dep(String),
+}
+
+impl Cindy {
+    /// Path prefix for generated item references. No leading `::` on
+    /// the `Itself` arm — `::crate` isn't a valid path.
+    fn ts(&self) -> proc_macro2::TokenStream {
+        match self {
+            Cindy::Itself => quote! { crate },
+            Cindy::Dep(name) => {
+                let ident = syn::Ident::new(name, proc_macro2::Span::call_site());
+                quote! { ::#ident }
+            }
+        }
+    }
+
+    /// Same prefix as a string, for `#[serde(crate = "…")]`-style
+    /// attributes that take paths as string literals.
+    fn path_str(&self) -> String {
+        match self {
+            Cindy::Itself => "crate".to_owned(),
+            Cindy::Dep(name) => format!("::{name}"),
+        }
+    }
+}
+
+fn resolve_cindy() -> Result<Cindy, syn::Error> {
+    use proc_macro_crate::{FoundCrate, crate_name};
+
+    // One manifest read per rustc invocation; expansion of a crate
+    // full of builtins would otherwise re-parse Cargo.toml per macro.
+    static CACHE: std::sync::OnceLock<Result<Cindy, String>> = std::sync::OnceLock::new();
+    CACHE
+        .get_or_init(|| match crate_name("cindy") {
+            Ok(FoundCrate::Itself) => Ok(Cindy::Itself),
+            Ok(FoundCrate::Name(name)) => Ok(Cindy::Dep(name)),
+            Err(e) => Err(e.to_string()),
+        })
+        .clone()
+        .map_err(|e| {
+            syn::Error::new(
+                proc_macro2::Span::call_site(),
+                format!(
+                    "couldn't resolve the `cindy` crate for generated code ({e}); \
+                     is `cindy` a dependency of this crate?"
+                ),
+            )
+        })
+}
+
 /// Reject argument types that cannot cross the RPC wire, with a
 /// message at the argument's span. Only top-level `impl Trait` and
 /// references are checked — the realistic misuses; anything more exotic
@@ -68,13 +131,20 @@ pub fn wire(_args: TokenStream, input: TokenStream) -> TokenStream {
         );
     }
 
+    let cindy = match resolve_cindy() {
+        Ok(c) => c,
+        Err(e) => return e.to_compile_error().into(),
+    };
+    let c = cindy.ts();
+    let serde_crate = format!(r#"{}::__reexports::serde"#, cindy.path_str());
+
     quote! {
         #[derive(
             ::std::fmt::Debug,
-            cindy::__reexports::serde::Serialize,
-            cindy::__reexports::serde::Deserialize
+            #c::__reexports::serde::Serialize,
+            #c::__reexports::serde::Deserialize
         )]
-        #[serde(crate = "cindy::__reexports::serde")]
+        #[serde(crate = #serde_crate)]
         #item
     }
     .into()
@@ -154,15 +224,22 @@ pub fn main(_args: TokenStream, input: TokenStream) -> TokenStream {
         );
     }
 
+    let cindy = match resolve_cindy() {
+        Ok(c) => c,
+        Err(e) => return e.to_compile_error().into(),
+    };
+    let c = cindy.ts();
+    let tokio_crate = format!(r#"{}::__reexports::tokio"#, cindy.path_str());
+
     let invoke_user_main = match inputs.len() {
         0 => quote! {
-            cindy::__reexports::tokio::spawn(__user_main())
+            #c::__reexports::tokio::spawn(__user_main())
         },
         1 => match &inputs[0] {
             // The host type is inferred from `__user_main`'s signature,
             // so `entry::host_context` needs no explicit turbofish.
             FnArg::Typed(_) => quote! {
-                cindy::__reexports::tokio::spawn(__user_main(cindy::entry::host_context()))
+                #c::__reexports::tokio::spawn(__user_main(#c::entry::host_context()))
             },
             FnArg::Receiver(r) => {
                 return compile_err(
@@ -181,7 +258,7 @@ pub fn main(_args: TokenStream, input: TokenStream) -> TokenStream {
 
     quote! {
         #(#attrs)*
-        #[cindy::__reexports::tokio::main(crate = "cindy::__reexports::tokio")]
+        #[#c::__reexports::tokio::main(crate = #tokio_crate)]
         #vis async fn main() {
             // A featureless build used to compile to a silent no-op
             // `main`; catch it at compile time instead. The `cindy`
@@ -197,7 +274,7 @@ pub fn main(_args: TokenStream, input: TokenStream) -> TokenStream {
             );
 
             #[allow(unused_variables)]
-            let (rpc_in, rpc_out) = cindy::common::quarantine_stdio();
+            let (rpc_in, rpc_out) = #c::common::quarantine_stdio();
 
             // Remote-only builds skip the user's body entirely; the
             // worker just runs the RPC dispatch loop. Vault keys arrive
@@ -206,7 +283,7 @@ pub fn main(_args: TokenStream, input: TokenStream) -> TokenStream {
             // in the target's `ps`.
             #[cfg(all(feature = "remote", not(feature = "orchestrator")))]
             {
-                cindy::remote::rpc(rpc_in, rpc_out).await;
+                #c::remote::rpc(rpc_in, rpc_out).await;
                 ::std::process::exit(0);
             }
 
@@ -221,7 +298,7 @@ pub fn main(_args: TokenStream, input: TokenStream) -> TokenStream {
             {
                 async fn __user_main(#inputs) #output #block
 
-                cindy::entry::orchestrator_init(rpc_in, rpc_out).await;
+                #c::entry::orchestrator_init(rpc_in, rpc_out).await;
 
                 match #invoke_user_main.await {
                     ::std::result::Result::Ok(::std::result::Result::Ok(_)) => {
@@ -284,11 +361,17 @@ pub fn inventory(_args: TokenStream, input: TokenStream) -> TokenStream {
         );
     }
 
+    let cindy = match resolve_cindy() {
+        Ok(c) => c,
+        Err(e) => return e.to_compile_error().into(),
+    };
+    let c = cindy.ts();
+
     let invocation = if asyncness.is_some() {
         quote! { #function_ident().await }
     } else {
         quote! {
-            match cindy::__reexports::tokio::task::spawn_blocking(move || #function_ident())
+            match #c::__reexports::tokio::task::spawn_blocking(move || #function_ident())
                 .await
             {
                 Ok(v) => v,
@@ -301,10 +384,10 @@ pub fn inventory(_args: TokenStream, input: TokenStream) -> TokenStream {
         #(#attrs)*
         #vis #asyncness fn #function_ident () #output #block
 
-        cindy::__reexports::inventory::submit! {
-            cindy::inventory::RegisteredInventory {
+        #c::__reexports::inventory::submit! {
+            #c::inventory::RegisteredInventory {
                 dump: || ::std::boxed::Box::pin(async move {
-                    cindy::inventory::IntoInventoryDump::into_inventory_dump(#invocation)
+                    #c::inventory::IntoInventoryDump::into_inventory_dump(#invocation)
                 }),
             }
         }
@@ -339,6 +422,12 @@ pub fn remote(_args: TokenStream, input: TokenStream) -> TokenStream {
             "`#[cindy::remote]` functions cannot be generic",
         );
     }
+
+    let cindy = match resolve_cindy() {
+        Ok(c) => c,
+        Err(e) => return e.to_compile_error().into(),
+    };
+    let c = cindy.ts();
 
     let function_ident = &sig.ident;
     let asyncness = &sig.asyncness;
@@ -380,7 +469,7 @@ pub fn remote(_args: TokenStream, input: TokenStream) -> TokenStream {
         quote! { #function_ident::inner( #(#arg_idents),* ).await }
     } else {
         quote! {
-            match cindy::__reexports::tokio::task::spawn_blocking(move || {
+            match #c::__reexports::tokio::task::spawn_blocking(move || {
                 #function_ident::inner( #(#arg_idents),* )
             })
             .await
@@ -427,25 +516,25 @@ For documentation about the actual function, please refer to [`{function_ident}`
         #[doc = #outer_docstring]
         #(#attrs)*
         #vis fn #function_ident (#inputs) -> impl ::std::future::Future<Output = #return_type> {
-            cindy::orchestrator::call(
+            #c::orchestrator::call(
                 #function_ident::__CINDY_REMOTE_ID,
-                cindy::__reexports::postcard::to_allocvec(&( #(#arg_idents),* ))
+                #c::__reexports::postcard::to_allocvec(&( #(#arg_idents),* ))
                     .expect("Failed to serialize args"),
             )
         }
 
         #[cfg(feature = "remote")]
-        cindy::__reexports::inventory::submit! {
-            cindy::remote::RemoteFn {
+        #c::__reexports::inventory::submit! {
+            #c::remote::RemoteFn {
                 id: #function_ident::__CINDY_REMOTE_ID,
                 function: |args_bytes| {
                     let ( #(#arg_idents),* ): ( #(#arg_types),* ) =
-                        cindy::__reexports::postcard::from_bytes(&args_bytes)
+                        #c::__reexports::postcard::from_bytes(&args_bytes)
                         .expect("Failed to deserialize args");
 
                     ::std::boxed::Box::pin(async move {
                         let result = #invocation;
-                        cindy::__reexports::postcard::to_allocvec(&result)
+                        #c::__reexports::postcard::to_allocvec(&result)
                             .expect("Failed to serialize return value")
                     })
                 },
@@ -498,6 +587,13 @@ pub fn action(_args: TokenStream, input: TokenStream) -> TokenStream {
     let ident = &sig.ident;
     let raw_ident = format_ident!("{ident}_raw");
     let is_async = sig.asyncness.is_some();
+
+    let cindy = match resolve_cindy() {
+        Ok(c) => c,
+        Err(e) => return e.to_compile_error().into(),
+    };
+    let c = cindy.ts();
+
     let (maybe_async, maybe_await) = if is_async {
         (quote! { async }, quote! { .await })
     } else {
@@ -553,7 +649,7 @@ pub fn action(_args: TokenStream, input: TokenStream) -> TokenStream {
         // (1) The real, wire-level entry point: a `#[remote]` fn with concrete
         // args, carrying the author's body verbatim.
         #[doc(hidden)]
-        #[cindy::remote]
+        #[#c::remote]
         #vis #maybe_async fn #raw_ident (#(#raw_inputs),*) -> #return_type #block
 
         // (2) Orchestrator shim: convert args, drive the remote worker.

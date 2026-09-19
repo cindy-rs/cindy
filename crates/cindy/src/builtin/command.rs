@@ -22,7 +22,6 @@
 //!     .exit_ok()?; // non-zero exit fails the play, with stdout/stderr attached
 //! ```
 
-use crate as cindy;
 use crate::Context;
 
 /// Captured result of the executed process.
