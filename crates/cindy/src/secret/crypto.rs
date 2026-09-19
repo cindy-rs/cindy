@@ -46,6 +46,14 @@ pub fn generate_vault_key() -> VaultKey {
 /// marker ~1/256 of the time. Decoding therefore tries v1 on marker
 /// match and falls back to the legacy layout when that fails — one
 /// rejected decrypt attempt on those few old blobs, nothing otherwise.
+///
+/// When both layouts fail and the leading byte is a small value other
+/// than this version, decoding reports "unknown version" rather than a
+/// bare decrypt failure: versions are sequential small integers, so
+/// that shape is most plausibly a blob sealed by a *newer* cindy. A
+/// large leading byte is more likely a corrupt legacy blob (whose
+/// random nonce dominates the space) and keeps the decrypt-failure
+/// error.
 pub const BLOB_VERSION: u8 = 1;
 
 /// Encrypt `plaintext` with `key`, returning
@@ -74,7 +82,18 @@ pub fn unseal(key: &VaultKey, framed: &[u8]) -> crate::Result<Zeroizing<Vec<u8>>
     {
         return Ok(plaintext);
     }
-    aead_decrypt(key, framed)
+    aead_decrypt(key, framed).map_err(|decrypt_failure| match framed.first() {
+        // Both layouts failed. Without this arm a future-format blob
+        // dies with the bare `AEAD decryption failed` — exactly the
+        // parse-failure-indistinguishable-from-corruption outcome the
+        // version byte exists to eliminate.
+        Some(&byte) if (1..0x10).contains(&byte) => anyhow_serde::Error::msg(format!(
+            "sealed blob reports version {byte}, which this cindy doesn't understand \
+             (it knows {BLOB_VERSION}); it was probably sealed by a newer cindy — \
+             upgrade and re-run"
+        )),
+        _ => decrypt_failure,
+    })
 }
 
 /// Decrypt `nonce ‖ ciphertext ‖ tag` with the vault key.
@@ -173,13 +192,27 @@ mod tests {
         assert_eq!(&*recovered, pt);
     }
 
-    /// An unknown future version is a named error, not silent garbage.
+    /// An unknown future version is a named error, not silent garbage
+    /// or a bare decrypt failure.
     #[test]
     fn unknown_version_fails_loudly() {
         let key = generate_vault_key();
         let mut ct = seal(&key, b"x").unwrap();
         ct[0] = 0x02;
-        assert!(unseal(&key, &ct).is_err());
+        let err = unseal(&key, &ct).unwrap_err().to_string();
+        assert!(
+            err.contains("version") && err.contains("2"),
+            "future-version blob must name the version: {err}"
+        );
+        // A large leading byte that fails both layouts reads as
+        // corruption, not a version claim — legacy nonces dominate
+        // that space.
+        ct[0] = 0xab;
+        let err = unseal(&key, &ct).unwrap_err().to_string();
+        assert!(
+            !err.contains("version"),
+            "corrupt blob misread as a version: {err}"
+        );
     }
 
     #[test]
