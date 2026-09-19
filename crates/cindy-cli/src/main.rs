@@ -117,6 +117,80 @@ async fn forward_stderr(
     }
 }
 
+/// Make `KnownHosts::Add`'s trust-on-first-use visible: when `target`
+/// has no entry in the user's known_hosts, scan its host keys and log
+/// their fingerprints before connecting.
+///
+/// `Add` maps to `StrictHostKeyChecking=accept-new`: an unknown key is
+/// accepted and recorded with no operator-visible fingerprint (ssh's
+/// own "Permanently added" warning names neither the key type nor its
+/// hash, and the openssh crate surfaces nothing at all). The scan and
+/// the connect are two connections, so a race between them is
+/// theoretically possible — but the accept-new model already trusts
+/// whatever the connect-time handshake presents; this only records it.
+/// Non-fatal by design: an unreachable or keyscan-less host fails at
+/// the real connect with the real error.
+async fn log_tofu_fingerprints(target: &str) {
+    // `target` may carry `user@` and `:port`; keygen matches on the
+    // bare host ssh itself uses, keyscan takes `-p` for the port.
+    let rest = target.split_once('@').map_or(target, |(_, rest)| rest);
+    let (host, port) = match rest.rsplit_once(':') {
+        Some((host, port)) if port.chars().all(|c| c.is_ascii_digit()) => (host, port),
+        _ => (rest, "22"),
+    };
+
+    let already_known = tokio::process::Command::new("ssh-keygen")
+        .args(["-F", host])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .await
+        .map(|out| out.status.success())
+        .unwrap_or(false);
+    if already_known {
+        return;
+    }
+
+    let mut scan = tokio::process::Command::new("ssh-keyscan");
+    scan.args(["-T", "3"]).stdin(std::process::Stdio::null());
+    if port != "22" {
+        scan.args(["-p", port]);
+    }
+    let Ok(scan) = scan.arg(host).output().await else {
+        return;
+    };
+    for line in String::from_utf8_lossy(&scan.stdout).lines() {
+        // `<host> <key type> <base64 key blob>`
+        let mut fields = line.split_whitespace();
+        let (Some(_), Some(key_type), Some(blob)) = (fields.next(), fields.next(), fields.next())
+        else {
+            continue;
+        };
+        if let Some(fp) = ssh_fingerprint(blob) {
+            tracing::warn!(
+                "TOFU: no known_hosts entry for {target} — accepting {key_type} key \
+                 SHA256:{fp}; audit with `ssh-keygen -lf ~/.ssh/known_hosts` if this \
+                 is a first connection"
+            );
+        }
+    }
+}
+
+/// `SHA256:<unpadded base64 of SHA256(key blob)>` — the same digest
+/// `ssh-keygen -lf` prints, so logged lines can be diffed against
+/// known_hosts entries by eye.
+fn ssh_fingerprint(blob_b64: &str) -> Option<String> {
+    use base64::Engine as _;
+    use sha2::Digest as _;
+
+    let blob = base64::engine::general_purpose::STANDARD
+        .decode(blob_b64)
+        .ok()?;
+    let digest = sha2::Sha256::digest(&blob);
+    Some(base64::engine::general_purpose::STANDARD_NO_PAD.encode(digest))
+}
+
 /// The inventory as pulled from the orchestrator: the type-erased
 /// `Inventory<Value>` used for `--limit` targeting, plus the per-host
 /// (and whole-inventory) `Debug` renderings the orchestrator produced
@@ -428,6 +502,7 @@ async fn run_after_launch(
         // OpenSSH's default ServerAliveCountMax of 3, a silent peer tears
         // the session down after ~30s, which EOFs the RPC pump and fails
         // the play's in-flight calls promptly.
+        log_tofu_fingerprints(&host.name).await;
         let session = openssh::SessionBuilder::default()
             .known_hosts_check(openssh::KnownHosts::Add)
             .connect_timeout(std::time::Duration::from_secs(30))
@@ -1083,4 +1158,26 @@ async fn compile_remote_worker(
         .join(exe_name);
 
     Ok(exe_path)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ssh_fingerprint;
+
+    /// The digest must byte-for-byte match `ssh-keygen -lf`, so a logged
+    /// TOFU line can be diffed against known_hosts by eye. Vector from a
+    /// throwaway keypair, generated and verified with ssh-keygen.
+    #[test]
+    fn fingerprint_matches_ssh_keygen_output() {
+        let blob = "AAAAC3NzaC1lZDI1NTE5AAAAILlMXkXIBP+8Yp+UVVfJhj1qOdI63aGooccZ7n3EatNf";
+        assert_eq!(
+            ssh_fingerprint(blob).as_deref(),
+            Some("JdZS5vaJvF8MTUNvj7i4DTMyF6HEv84gFgOmDE2CNeQ")
+        );
+    }
+
+    #[test]
+    fn garbage_blobs_yield_no_fingerprint() {
+        assert!(ssh_fingerprint("not base64!!").is_none());
+    }
 }
