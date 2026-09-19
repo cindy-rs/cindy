@@ -206,15 +206,32 @@ async fn main() -> eyre::Result<()> {
     // knows the targets. `Inventory`/`Secret` runs print to stdout and must
     // not take over the screen, so they keep `view` as `None`.
     let (progress_tx, progress_rx) = tokio::sync::mpsc::unbounded_channel::<progress::Msg>();
-    let view = is_play.then(|| tokio::spawn(progress::run(progress_rx)));
+    // Quitting the run view aborts an in-flight play: the view flips this on
+    // exit and `main` tears the deployment down (see the select below).
+    let (abort_tx, mut abort_rx) = tokio::sync::watch::channel(false);
+    let view = is_play.then(|| {
+        let abort_tx = abort_tx.clone();
+        tokio::spawn(progress::run(progress_rx, abort_tx))
+    });
 
     // Everything below can fail with `?`/`bail!`. While the `play` view owns
     // the alternate screen, returning early would leave the terminal in raw
     // mode with the alt-screen still up. So we run the whole flow in an inner
     // block, capture its result, then *always* close the channel and await
     // the view (letting it restore the terminal) before propagating.
-    let result: eyre::Result<()> =
-        run_after_launch(args.subcommand, workspace_root, progress_tx.clone()).await;
+    //
+    // If the operator quits the view mid-play, `abort_rx` fires and the
+    // `select!` drops `run_after_launch` mid-flight. That is the abort path:
+    // every child process is spawned `kill_on_drop`, so the local
+    // orchestrators die, the SSH sessions drop, and the workers EOF out of
+    // their RPC loops and exit.
+    let result: eyre::Result<()> = tokio::select! {
+        biased;
+        r = run_after_launch(args.subcommand, workspace_root, progress_tx.clone()) => r,
+        _ = abort_rx.changed() => Err(eyre::eyre!(
+            "play aborted from the run view; in-flight deployments were torn down"
+        )),
+    };
 
     // An infrastructure error (SSH discovery, compile, rustup, …) aborts
     // the run before the hosts produced anything worth inspecting — often
@@ -600,6 +617,7 @@ async fn run_after_launch(
                 // orchestrator-side reveals and forwards them to the
                 // worker over the RPC handshake.
                 let mut orchestrator_run = tokio::process::Command::new(&*orch_path)
+                    .kill_on_drop(true)
                     .env("CINDY_HOST_CONTEXT", &host_context_json)
                     .env("CINDY_VAULT_KEYS", &vault_keys_json)
                     .stdin(std::process::Stdio::piped())
@@ -800,6 +818,7 @@ async fn compile_orchestrator(workspace_root: &Path) -> eyre::Result<PathBuf> {
     tracing::info!("compiling orchestrator binary");
     let target_dir = workspace_root.join("target/cindy/orchestrator");
     let output = tokio::process::Command::new("cargo")
+        .kill_on_drop(true)
         .args([
             "build",
             "--release",
@@ -839,7 +858,8 @@ async fn compile_remote_worker(
     // cargo's container-relative `executable` field.
     let target_dir = workspace_root.join(format!("target/cindy/remote/{}", platform.target_triple));
     let mut cmd = tokio::process::Command::new("cross");
-    cmd.args([
+    cmd.kill_on_drop(true)
+        .args([
         "build",
         "--release",
         "--message-format=json",

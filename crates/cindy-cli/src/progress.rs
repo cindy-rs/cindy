@@ -3,9 +3,11 @@
 //! Each deployment future reports into an mpsc channel: stderr lines and
 //! the final status (derived purely from why its stdio closed — no special
 //! wire protocol). When stderr is a tty we draw a two-pane TUI (host list +
-//! selected host's output) that stays up until the user quits with `q`→`y`.
-//! When it isn't (CI, pipe, `> log`), we fall back to today's prefixed
-//! line-stream so nothing about non-interactive use changes.
+//! selected host's output). Quitting the TUI while hosts are still running
+//! aborts the play: the `abort` channel is flipped on exit and `main` tears
+//! the deployments down. When stderr isn't a tty (CI, pipe, `> log`), we
+//! fall back to today's prefixed line-stream so nothing about
+//! non-interactive use changes.
 
 use std::io::IsTerminal as _;
 
@@ -199,9 +201,12 @@ struct OutputScroll {
 /// (potentially slow) compile/discovery phase the log pane already reflects
 /// the CLI's `tracing` output, so it never looks frozen. Returns when the
 /// user quits (tty) or the channel closes after all hosts finish (non-tty).
-pub async fn run(rx: tokio::sync::mpsc::UnboundedReceiver<Msg>) {
+pub async fn run(
+    rx: tokio::sync::mpsc::UnboundedReceiver<Msg>,
+    abort: tokio::sync::watch::Sender<bool>,
+) {
     if std::io::stderr().is_terminal() {
-        if let Err(e) = tui(rx).await {
+        if let Err(e) = tui(rx, abort).await {
             eprintln!("progress view error: {e:?}");
         }
     } else {
@@ -246,12 +251,15 @@ async fn stream(mut rx: tokio::sync::mpsc::UnboundedReceiver<Msg>) {
     }
 }
 
-async fn tui(mut rx: tokio::sync::mpsc::UnboundedReceiver<Msg>) -> eyre::Result<()> {
+async fn tui(
+    mut rx: tokio::sync::mpsc::UnboundedReceiver<Msg>,
+    abort: tokio::sync::watch::Sender<bool>,
+) -> eyre::Result<()> {
     enable_raw_mode()?;
     execute!(std::io::stderr(), EnterAlternateScreen, EnableMouseCapture)?;
 
     let mut hosts: Vec<Host> = Vec::new();
-    let result = tui_loop(&mut hosts, &mut rx).await;
+    let result = tui_loop(&mut hosts, &mut rx, &abort).await;
 
     let _ = disable_raw_mode();
     let _ = execute!(std::io::stderr(), DisableMouseCapture, LeaveAlternateScreen);
@@ -262,6 +270,7 @@ async fn tui(mut rx: tokio::sync::mpsc::UnboundedReceiver<Msg>) -> eyre::Result<
 async fn tui_loop(
     hosts: &mut Vec<Host>,
     rx: &mut tokio::sync::mpsc::UnboundedReceiver<Msg>,
+    abort: &tokio::sync::watch::Sender<bool>,
 ) -> eyre::Result<()> {
     let backend = CrosstermBackend::new(std::io::stderr());
     let mut terminal = Terminal::new(backend)?;
@@ -344,17 +353,23 @@ async fn tui_loop(
                         }
                     }
                     Some(Ok(Event::Key(key))) if key.kind == KeyEventKind::Press => {
-                        // Ctrl-C quits immediately, no confirmation — raw
-                        // mode swallows the signal, and nothing reads as
-                        // "stuck" quite like a TUI that ignores Ctrl-C.
+                        // Ctrl-C aborts the play immediately, no
+                        // confirmation — raw mode swallows the signal, and
+                        // nothing reads as "stuck" quite like a TUI that
+                        // ignores Ctrl-C. The `abort` flip is what actually
+                        // stops the deployments (see `main`).
                         if key.modifiers.contains(KeyModifiers::CONTROL)
                             && key.code == KeyCode::Char('c')
                         {
+                            let _ = abort.send(true);
                             return Ok(());
                         }
                         if confirm_quit {
                             match key.code {
-                                KeyCode::Char('y') => return Ok(()),
+                                KeyCode::Char('y') => {
+                                    let _ = abort.send(true);
+                                    return Ok(());
+                                }
                                 _ => confirm_quit = false,
                             }
                             continue;
@@ -520,9 +535,10 @@ fn draw_legend(f: &mut ratatui::Frame, area: Rect, hosts: &[Host], counts: &Coun
             ))
         }
     } else {
-        // `q: quit` leads so it survives clipping on narrow terminals.
+        // `q: abort` leads so it survives clipping on narrow terminals:
+        // while hosts are running, quitting aborts them.
         Line::from(Span::styled(
-            " q: quit · Tab: host · f: failed · j/k scroll · h/l pan · PgUp/Dn · Home/End · +/- log",
+            " q: abort · Tab: host · f: failed · j/k scroll · h/l pan · PgUp/Dn · Home/End · +/- log",
             Style::default().fg(Color::DarkGray),
         ))
     };
@@ -641,12 +657,12 @@ fn draw_list(
     draw_confirm_quit(f, area, confirm_quit);
 }
 
-/// Red `quit? y/n` prompt overlaid on the bottom edge of the list pane.
+/// Red `abort? y/n` prompt overlaid on the bottom edge of the list pane.
 fn draw_confirm_quit(f: &mut ratatui::Frame, area: Rect, confirm_quit: bool) {
     if !confirm_quit {
         return;
     }
-    let hint = Paragraph::new("quit? y/n (Esc cancels)").style(Style::default().fg(Color::Red));
+    let hint = Paragraph::new("abort play? y/n (Esc cancels)").style(Style::default().fg(Color::Red));
     let bar = Rect {
         x: area.x + 1,
         y: area.y + area.height.saturating_sub(1),
@@ -783,8 +799,8 @@ mod tests {
         assert!(screen.contains("waiting for hosts…"), "{screen}");
         assert!(screen.contains("compiling & discovering"), "{screen}");
         // Key hints, not a result banner, while nothing is terminal.
-        // `q: quit` leads the hint line so it can't be clipped away.
-        assert!(screen.contains("q: quit"), "{screen}");
+        // `q: abort` leads the hint line so it can't be clipped away.
+        assert!(screen.contains("q: abort"), "{screen}");
     }
 
     #[test]
