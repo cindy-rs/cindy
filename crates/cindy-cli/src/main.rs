@@ -857,6 +857,9 @@ async fn compile_remote_worker(
         cmd.arg("-Zbuild-std");
     }
 
+    // Append to user-exported opts instead of clobbering them.
+    let mut container_opts = std::env::var("CROSS_CONTAINER_OPTS").unwrap_or_default();
+
     if let Some(pkg) = metadata.packages.iter().find(|p| p.name == "cindy")
         && pkg.source.is_none()
         && let Some(pkg_dir) = pkg.manifest_path.parent()
@@ -866,10 +869,14 @@ async fn compile_remote_worker(
             .exec()?;
         let framework_workspace = metadata.workspace_root;
 
-        cmd.env(
-            "CROSS_CONTAINER_OPTS",
-            format!("-v {framework_workspace}:{framework_workspace}"),
-        );
+        container_opts.push_str(&format!(" -v {framework_workspace}:{framework_workspace}"));
+    }
+
+    // A host-configured rustc-wrapper leaks into the build container.
+    cmd.args(["--config", r#"build.rustc-wrapper="""#]);
+
+    if !container_opts.trim().is_empty() {
+        cmd.env("CROSS_CONTAINER_OPTS", container_opts.trim());
     }
 
     let output = cmd.output().await?;
