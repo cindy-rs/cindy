@@ -345,7 +345,7 @@ async fn run_after_launch(
                         .context("orchestrator dump omitted revealed JSON despite `--reveal`")?
                     {
                         Ok(v) => v,
-                        Err(e) => eyre::bail!("failed to reveal secrets for JSON output: {e}"),
+                        Err(e) => return Err(eyre::eyre!("failed to reveal secrets for JSON output: {e}")),
                     }
                 } else {
                     serde_json::to_value(&inventory)?
@@ -868,7 +868,7 @@ async fn compile_orchestrator(workspace_root: &Path) -> eyre::Result<PathBuf> {
         .await?;
 
     if !output.status.success() {
-        eyre::bail!("{}", String::from_utf8_lossy(&output.stderr))
+        eyre::bail!("{}", String::from_utf8_lossy(&output.stderr));
     }
 
     // On success cargo's stderr still carries the warnings — with
@@ -1010,7 +1010,7 @@ async fn compile_remote_worker(
 
     let output = cmd.output().await?;
     if !output.status.success() {
-        eyre::bail!("{}", String::from_utf8_lossy(&output.stderr))
+        eyre::bail!("{}", String::from_utf8_lossy(&output.stderr));
     }
     for line in String::from_utf8_lossy(&output.stderr).lines() {
         if !line.trim().is_empty() {

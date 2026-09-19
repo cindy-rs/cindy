@@ -549,7 +549,6 @@ mod site_snippet_tests {
 #[cfg(test)]
 mod seal_unseal_roundtrip_tests {
     use super::*;
-    use base64::Engine as _;
 
     /// Drive the full source-rewriting half of the seal/unseal workflow
     /// against a real file, with a real vault key and ciphertext: a

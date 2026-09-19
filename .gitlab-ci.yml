@@ -1,0 +1,92 @@
+# Modeled on the pdns-etcd-backend pipeline: one buildkit-built toolchain
+# image per commit, then stageless check jobs. Differences from that
+# pipeline: no private git deps (no url rewrite), no dind needed (the
+# e2e suite is hermetic pipes-only), and no release-binary job — cindy
+# ships via crates.io.
+.yaml-anchors:
+  image_docker_dind: &image_docker_dind
+    name: docker.io/docker:29.7.1-dind
+    alias: docker
+
+  image_build: &image
+    name: ${CI_REGISTRY_IMAGE}/build:${CI_COMMIT_SHA}
+
+  image_buildkit: &image_buildkit
+    name: moby/buildkit:v0.32.0-rootless
+    entrypoint: [""]
+
+# ---
+
+stages: [stageless]
+
+variables:
+  CARGO_NET_GIT_FETCH_WITH_CLI: true
+  CARGO_HOME: ${CI_PROJECT_DIR}/.cargo # for caching
+
+.rust-cache:
+  cache:
+    - key:
+        files: [Cargo.lock]
+        prefix: ${CI_JOB_NAME}
+      paths:
+        - .cargo/registry/index/
+        - .cargo/registry/cache/
+        - .cargo/git/db/
+        - target/
+
+.docker-auth:
+  before_script:
+    - mkdir -p "${HOME}/.docker"
+    - |
+      auth="$(printf '%s:%s' "$CI_REGISTRY_USER" "$CI_REGISTRY_PASSWORD" | base64 | tr -d '\n')"
+      printf '{"auths":{"%s":{"auth":"%s"}}}' "$CI_REGISTRY" "$auth" > "${HOME}/.docker/config.json"
+
+.buildkit:
+  extends: .docker-auth
+  image: *image_buildkit
+  variables:
+    BUILDKITD_FLAGS: --oci-worker-no-process-sandbox
+
+image.build:
+  extends: .buildkit
+  stage: stageless
+  script:
+    - |
+      buildctl-daemonless.sh build \
+        --frontend dockerfile.v0 \
+        --local context="${CI_PROJECT_DIR}" \
+        --local dockerfile="${CI_PROJECT_DIR}" \
+        --opt filename=Containerfile.build \
+        --import-cache type=registry,ref=${CI_REGISTRY_IMAGE}/build:buildcache \
+        --export-cache type=registry,ref=${CI_REGISTRY_IMAGE}/build:buildcache,mode=max \
+        --output type=image,name=${CI_REGISTRY_IMAGE}/build:${CI_COMMIT_SHA},push=true
+
+check.fmt:
+  stage: stageless
+  needs: [image.build]
+  image: *image
+  script:
+    - cargo fmt --check
+check.clippy:
+  extends: .rust-cache
+  stage: stageless
+  needs: [image.build]
+  image: *image
+  script:
+    - cargo clippy --workspace --all-targets -- -D warnings
+check.audit:
+  stage: stageless
+  needs: [image.build]
+  image: *image
+  script:
+    - cargo audit
+check.test:
+  extends: .rust-cache
+  stage: stageless
+  needs: [image.build]
+  image: *image
+  script:
+    # Includes examples/e2e-localhost: the hermetic end-to-end harness
+    # (spawns a local orchestrator+worker pair over pipes; no SSH, no
+    # containers, no network beyond a loopback HTTP server for fetch).
+    - cargo test --workspace

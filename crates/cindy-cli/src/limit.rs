@@ -77,7 +77,7 @@ fn parse(input: &str) -> eyre::Result<Expr<'_>> {
     let (rest, expr) = or_expr(input).map_err(|e| eyre::eyre!("{e:?}"))?;
     let rest = rest.trim();
     if !rest.is_empty() {
-        eyre::bail!("trailing input after expression: {rest:?}")
+        eyre::bail!("trailing input after expression: {rest:?}");
     }
     Ok(expr)
 }

@@ -314,7 +314,7 @@ fn reconcile(want: &Presence, have: &Presence) -> ReconcileResult {
             shell,
             home,
             comment,
-            system: system.clone().or_else(|| o_system.clone()),
+            system: (*system).or(*o_system),
         },
     }
 }
