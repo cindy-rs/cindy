@@ -70,23 +70,6 @@ Decided: **buster is not a target** — the fleet is VyOS 1.3+ (apt ≥
 coverage only via the `-o DPkg::Lock::Timeout` option old apt silently
 ignores, which is acceptable.
 
-### Doc drift
-
-Three comments that describe code that doesn't exist:
-
-- `crates/cindy/src/secret/crypto.rs:10` says the wire layout is what
-  `encrypt_in_place_detached` produces. The code calls `encrypt`.
-- `crates/cindy/src/secret/mod.rs:427` says `Plain` values "serialise by
-  encrypting on the fly". They don't — the impl returns an error. This
-  one matters: it's a claim about behaviour in the security-critical
-  module.
-- `crates/cindy/src/builtin/systemd.rs:356` says `mask` removes a real
-  unit file "or drop-in" that is in the way. Only a path named exactly
-  `<unit>` is checked; `<unit>.service.d/` is untouched. Either handle
-  drop-ins or fix the sentence. Note separately that `mask` deletes an
-  admin-authored unit file with no warning and no diff — deliberate per
-  the comment, but worth a loud line on stderr when it happens.
-
 ### Blocking I/O on async paths in the CLI
 
 `crates/cindy-cli/src/main.rs`: `std::process::Command` for rustup at

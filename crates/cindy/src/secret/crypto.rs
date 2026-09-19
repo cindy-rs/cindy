@@ -7,8 +7,8 @@
 //! different ciphertexts.
 //!
 //! Wire layout: `nonce (12 bytes) || ciphertext (N bytes) || tag (16 bytes)`,
-//! which is what `chacha20poly1305`'s default `encrypt_in_place_detached`
-//! produces concatenated.
+//! assembled by hand in [`seal`] from the AEAD's `encrypt` output
+//! (`ciphertext || tag`) plus the fresh nonce it was encrypted under.
 
 use chacha20poly1305::{
     AeadCore, ChaCha20Poly1305, KeyInit, Nonce,

@@ -353,8 +353,10 @@ pub async fn disable(name: impl Into<String>) -> crate::Result<super::Return> {
 
 /// Mask `name`, preventing any *future* start. Note masking does **not**
 /// stop a currently running instance — combine with [`stop`] for that.
-/// If a real unit file or drop-in is in the way, it is removed to
-/// complete the mask. Orchestrator: `mask(name).await?`.
+/// If a real (non-symlink) unit file is in the way at the mask target,
+/// it is removed to complete the mask — loudly, on stderr; note a
+/// `<unit>.service.d/` drop-in directory is *not* touched. Orchestrator:
+/// `mask(name).await?`.
 #[crate::action]
 pub async fn mask(name: impl Into<String>) -> crate::Result<super::Return> {
     apply(State {
@@ -573,6 +575,14 @@ async fn apply(state: State) -> crate::Result<super::Return> {
                     if let Some(meta) = meta.as_ref()
                         && !meta.file_type().is_symlink()
                     {
+                        // Deliberate, but never silent: an admin-authored
+                        // file vanishing with no trace in the run view is
+                        // indistinguishable from a bug.
+                        let kind = if meta.is_dir() { "directory" } else { "file" };
+                        eprintln!(
+                            "mask: removing admin-authored {kind} {} to complete the mask",
+                            unit_path.display()
+                        );
                         if meta.is_dir() {
                             tokio::fs::remove_dir_all(&unit_path)
                                 .await

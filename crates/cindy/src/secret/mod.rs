@@ -424,11 +424,12 @@ impl<T: Clone> Clone for Secret<T> {
 // ---- serde ---------------------------------------------------------
 //
 // The on-the-wire shape is **always** the sealed form. `Plain` values
-// serialise by encrypting on the fly (so JSON dumps from a dev `main`
-// don't leak plaintext to disk). The `vault` lookup pulls a vault key from
-// the keychain at serialisation time — note this means *Plain* secrets
-// can't be serialised by code that doesn't have the vault key loaded;
-// that's a deliberate guardrail, not a bug.
+// *refuse* to serialise — serialising one would either leak plaintext
+// to disk or silently fake a sealed blob, so it's a hard error naming
+// the fix (`cindy secret seal`). The one deliberate exception is
+// reveal mode (`with_revealed_secrets`, used by
+// `cindy inventory --reveal --json`), which serialises the decrypted
+// plaintext value in place of the blob — opt-in, operator-facing.
 //
 // Deserialisation always produces `Sealed`; revealing requires an
 // explicit `.reveal()` call.
