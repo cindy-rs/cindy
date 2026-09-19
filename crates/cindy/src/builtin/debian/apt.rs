@@ -1,6 +1,5 @@
 use std::process::Command;
 
-use crate as cindy;
 use crate::Context;
 
 /// Desired install/remove status of a package.
@@ -326,10 +325,15 @@ fn apply(state: State) -> crate::Result<crate::builtin::Return> {
 
     // Step 1: unhold if (a) the caller asked for it, or (b) a presence
     // change is needed on a held package. The latter is transparent —
-    // step 3 re-holds afterwards if `final_held` ends up true.
+    // step 3 re-holds afterwards if `final_held` ends up true. When the
+    // caller didn't ask for the release, remember it: if the presence
+    // change then fails, restore the hold so the failed call leaves the
+    // host as it found it.
+    let mut transparently_unheld = false;
     if effective_held && (state.hold == Some(false) || presence_needs_change) {
         run_check(Command::new("apt-mark").args(["unhold", "--", &state.name]))?;
         effective_held = false;
+        transparently_unheld = state.hold != Some(false);
         changed = true;
     }
 
@@ -337,15 +341,15 @@ fn apply(state: State) -> crate::Result<crate::builtin::Return> {
     if let Some(presence) = state.presence.as_ref()
         && !presence_satisfied(&cur, presence)
     {
-        match presence {
+        let result = match presence {
             Presence::Absent => {
-                run_check(apt_get().args(["remove", "--", &state.name]))?;
+                run_check(apt_get().args(["remove", "--", &state.name]))
             }
             Presence::Purged => {
-                run_check(apt_get().args(["purge", "--", &state.name]))?;
+                run_check(apt_get().args(["purge", "--", &state.name]))
             }
             Presence::Present => {
-                run_check(apt_get().args(["install", "--", &state.name]))?;
+                run_check(apt_get().args(["install", "--", &state.name]))
             }
             Presence::Version(v) => {
                 // `--allow-downgrades`: pinning to an exact version must
@@ -353,8 +357,14 @@ fn apply(state: State) -> crate::Result<crate::builtin::Return> {
                 // back a bad release is the flagship use of `Version`);
                 // plain `install pkg=older` refuses to downgrade.
                 let spec = format!("{}={}", state.name, v);
-                run_check(apt_get().args(["install", "--allow-downgrades", "--", &spec]))?;
+                run_check(apt_get().args(["install", "--allow-downgrades", "--", &spec]))
             }
+        };
+        if let Err(e) = result {
+            if transparently_unheld {
+                let _ = run_check(Command::new("apt-mark").args(["hold", "--", &state.name]));
+            }
+            return Err(e);
         }
         changed = true;
     }
