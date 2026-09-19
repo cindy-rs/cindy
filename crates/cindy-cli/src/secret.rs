@@ -575,13 +575,9 @@ mod seal_unseal_roundtrip_tests {
             value: postcard::to_allocvec(&("u", "p")).unwrap(),
             source: source_tokens.to_owned(),
         };
-        let ciphertext = cindy::secret::crypto::seal(
-            &key,
-            &postcard::to_allocvec(&payload).unwrap(),
-        )
-        .unwrap();
-        let ciphertext_b64 =
-            base64::engine::general_purpose::STANDARD.encode(&ciphertext);
+        let ciphertext =
+            cindy::secret::crypto::seal(&key, &postcard::to_allocvec(&payload).unwrap()).unwrap();
+        let ciphertext_b64 = base64::engine::general_purpose::STANDARD.encode(&ciphertext);
 
         // Seal: splice the call into the sealed form.
         let record = SealRecord {

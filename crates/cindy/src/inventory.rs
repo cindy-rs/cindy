@@ -1,4 +1,3 @@
-
 /// The entire fleet as the user's [`cindy::inventory`] function declares
 /// it.
 #[crate::wire]

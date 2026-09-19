@@ -121,10 +121,7 @@ fn check_remote_arg(ty: &syn::Type) -> Option<&'static str> {
 #[proc_macro_attribute]
 pub fn wire(_args: TokenStream, input: TokenStream) -> TokenStream {
     let item = parse_macro_input!(input as Item);
-    if !matches!(
-        item,
-        Item::Enum(_) | Item::Struct(_) | Item::Union(_)
-    ) {
+    if !matches!(item, Item::Enum(_) | Item::Struct(_) | Item::Union(_)) {
         return compile_err(
             syn::spanned::Spanned::span(&item),
             "`#[cindy::wire]` can only be applied to structs, enums, and unions",
@@ -184,11 +181,7 @@ pub fn main(_args: TokenStream, input: TokenStream) -> TokenStream {
     let returns_result = match output {
         syn::ReturnType::Default => false,
         syn::ReturnType::Type(_, ty) => match &**ty {
-            syn::Type::Path(p) => p
-                .path
-                .segments
-                .last()
-                .is_some_and(|s| s.ident == "Result"),
+            syn::Type::Path(p) => p.path.segments.last().is_some_and(|s| s.ident == "Result"),
             _ => false,
         },
     };

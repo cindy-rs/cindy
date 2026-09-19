@@ -342,15 +342,9 @@ fn apply(state: State) -> crate::Result<crate::builtin::Return> {
         && !presence_satisfied(&cur, presence)
     {
         let result = match presence {
-            Presence::Absent => {
-                run_check(apt_get().args(["remove", "--", &state.name]))
-            }
-            Presence::Purged => {
-                run_check(apt_get().args(["purge", "--", &state.name]))
-            }
-            Presence::Present => {
-                run_check(apt_get().args(["install", "--", &state.name]))
-            }
+            Presence::Absent => run_check(apt_get().args(["remove", "--", &state.name])),
+            Presence::Purged => run_check(apt_get().args(["purge", "--", &state.name])),
+            Presence::Present => run_check(apt_get().args(["install", "--", &state.name])),
             Presence::Version(v) => {
                 // `--allow-downgrades`: pinning to an exact version must
                 // also work when the installed version is *newer* (rolling
@@ -442,8 +436,14 @@ mod tests {
 
         // Version pins on non-installed packages are never satisfied
         // (the dpkg comparison is never even consulted).
-        assert!(!presence_satisfied(&rc, &Presence::Version("1.0".to_owned())));
-        assert!(!presence_satisfied(&gone, &Presence::Version("1.0".to_owned())));
+        assert!(!presence_satisfied(
+            &rc,
+            &Presence::Version("1.0".to_owned())
+        ));
+        assert!(!presence_satisfied(
+            &gone,
+            &Presence::Version("1.0".to_owned())
+        ));
     }
 
     #[test]

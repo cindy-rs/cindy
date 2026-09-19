@@ -103,11 +103,7 @@ impl UnitState {
     fn needs_enable_call(self) -> bool {
         matches!(
             self,
-            Self::Disabled
-                | Self::Indirect
-                | Self::Linked
-                | Self::LinkedRuntime
-                | Self::Alias
+            Self::Disabled | Self::Indirect | Self::Linked | Self::LinkedRuntime | Self::Alias
         )
     }
 
@@ -816,7 +812,11 @@ mod tests {
 
     #[test]
     fn uninstallable_states_are_exactly_the_install_less_ones() {
-        for state in [UnitState::Static, UnitState::Generated, UnitState::Transient] {
+        for state in [
+            UnitState::Static,
+            UnitState::Generated,
+            UnitState::Transient,
+        ] {
             assert!(state.is_uninstallable(), "{state:?}");
         }
         for state in [

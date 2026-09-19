@@ -206,8 +206,9 @@ pub fn preflight(role: &str, host_context_json: Option<&str>) -> crate::Result<(
     let mut needed: std::collections::BTreeSet<String> = registered_vaults().into_iter().collect();
 
     if let Some(json) = host_context_json {
-        let value: crate::__reexports::serde_json::Value = crate::__reexports::serde_json::from_str(json)
-            .context("host context was not valid JSON during vault preflight")?;
+        let value: crate::__reexports::serde_json::Value =
+            crate::__reexports::serde_json::from_str(json)
+                .context("host context was not valid JSON during vault preflight")?;
         crate::inventory::collect_sealed_vaults(&value, &mut needed);
     }
 
@@ -359,8 +360,9 @@ impl<T: serde::de::DeserializeOwned> Secret<T> {
             Self::Sealed { vault, ciphertext } => {
                 let key = keychain::get_vault_key(vault)?;
                 let plaintext = crypto::unseal(&key, ciphertext)?;
-                let mut payload: SealedPayload = postcard::from_bytes(&plaintext)
-                    .context(format!("couldn't deserialise SealedPayload for vault `{vault}`"))?;
+                let mut payload: SealedPayload = postcard::from_bytes(&plaintext).context(
+                    format!("couldn't deserialise SealedPayload for vault `{vault}`"),
+                )?;
                 let value: T = postcard::from_bytes(&payload.value)
                     .context(format!("couldn't deserialise inner T for vault `{vault}`"))?;
                 payload.value.zeroize();

@@ -489,7 +489,10 @@ fn apply(state: State) -> crate::Result<super::Return> {
         // both the struct diff and the `usermod` argv.
         (
             want @ Presence::Present { system, .. },
-            have @ Presence::Present { system: observed_system, .. },
+            have @ Presence::Present {
+                system: observed_system,
+                ..
+            },
         ) => {
             // System-ness is fixed at creation (UID range); `usermod`
             // cannot migrate it. An explicit request that disagrees with
@@ -602,7 +605,10 @@ mod tests {
     fn reconcile_backfills_system_from_observed_when_dont_care() {
         // `None` must not fight the live account's system-ness — that
         // was the never-converging diff.
-        let res = reconcile(&want(None, None, None, None, None, None, None), &observed(true));
+        let res = reconcile(
+            &want(None, None, None, None, None, None, None),
+            &observed(true),
+        );
         assert!(args_of(&res).is_empty());
         assert_eq!(
             res.desired,

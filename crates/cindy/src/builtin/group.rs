@@ -182,10 +182,7 @@ fn apply(state: State) -> crate::Result<super::Return> {
         }
 
         // Want present, currently absent → create.
-        (
-            want @ Presence::Present { gid, system },
-            Presence::Absent,
-        ) => {
+        (want @ Presence::Present { gid, system }, Presence::Absent) => {
             show_diff(&state.name, Presence::Absent, want.clone());
             let mut cmd = Command::new("groupadd");
             if *system == Some(true) {

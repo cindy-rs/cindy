@@ -702,7 +702,8 @@ fn draw_confirm_quit(f: &mut ratatui::Frame, area: Rect, confirm_quit: bool) {
     if !confirm_quit {
         return;
     }
-    let hint = Paragraph::new("abort play? y/n (Esc cancels)").style(Style::default().fg(Color::Red));
+    let hint =
+        Paragraph::new("abort play? y/n (Esc cancels)").style(Style::default().fg(Color::Red));
     let bar = Rect {
         x: area.x + 1,
         y: area.y + area.height.saturating_sub(1),
@@ -756,11 +757,7 @@ fn draw_output(
             let mut spans = vec![
                 Span::raw(" "),
                 Span::styled(format!("{glyph} "), Style::default().fg(h.status.color())),
-                Span::raw(format!(
-                    "{} · {} lines",
-                    h.name,
-                    h.dropped + h.lines.len()
-                )),
+                Span::raw(format!("{} · {} lines", h.name, h.dropped + h.lines.len())),
             ];
             if scroll.vert > 0 {
                 spans.push(Span::styled(
@@ -896,7 +893,10 @@ mod tests {
         assert_eq!(h.dropped, 500);
         assert_eq!(h.lines[0].1, "line 500");
         let screen = render(&[h]);
-        assert!(screen.contains(&format!("chatty · {} lines", MAX_LINES + 500)), "{screen}");
+        assert!(
+            screen.contains(&format!("chatty · {} lines", MAX_LINES + 500)),
+            "{screen}"
+        );
     }
 
     #[test]

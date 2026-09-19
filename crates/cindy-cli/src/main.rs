@@ -822,8 +822,8 @@ fn collect_vault_keys(
     let mut map = HashMap::new();
     let mut missing = Vec::new();
     for vault in needed {
-        let path = cindy::secret::keychain::vault_key_path(vault)
-            .map_err(|e| eyre::eyre!("{e:#}"))?;
+        let path =
+            cindy::secret::keychain::vault_key_path(vault).map_err(|e| eyre::eyre!("{e:#}"))?;
         match std::fs::read(path) {
             Ok(bytes) => {
                 let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
@@ -969,17 +969,17 @@ async fn compile_remote_worker(
     let mut cmd = tokio::process::Command::new("cross");
     cmd.kill_on_drop(true)
         .args([
-        "build",
-        "--release",
-        "--message-format=json",
-        "--target",
-        platform.target_triple,
-        "--no-default-features",
-        "--features",
-        "remote",
-        "--target-dir",
-    ])
-    .arg(&target_dir);
+            "build",
+            "--release",
+            "--message-format=json",
+            "--target",
+            platform.target_triple,
+            "--no-default-features",
+            "--features",
+            "remote",
+            "--target-dir",
+        ])
+        .arg(&target_dir);
 
     if matches!(platform.tier, platforms::Tier::Three) {
         tracing::warn!("tier 3 target, building with `-Zbuild-std`");
