@@ -31,13 +31,12 @@ pub enum Presence {
         /// consulted when the group is being **created** — a group's
         /// system-ness is fixed by its GID at creation and cannot be
         /// changed afterwards without deleting and recreating it (which
-        /// would orphan every file owned by the old GID), so this module
-        /// never migrates an existing group between system and
-        /// non-system. It *observes* system-ness from the live GID (see
-        /// the host's `SYS_GID_MAX` in `/etc/login.defs`) so the diff is
-        /// honest, but a mismatch on an existing group is reported, not
-        /// "fixed". This matches Ansible's `group` module.
-        system: bool,
+        /// would orphan every file owned by the old GID). `None` (the
+        /// default) leaves an existing group's system-ness alone; a
+        /// `Some(..)` that disagrees with the live group errors instead
+        /// of silently never converging. This matches Ansible's `group`
+        /// module.
+        system: Option<bool>,
     },
 }
 
@@ -45,7 +44,7 @@ impl Default for Presence {
     fn default() -> Self {
         Self::Present {
             gid: None,
-            system: false,
+            system: None,
         }
     }
 }
@@ -55,7 +54,7 @@ impl Default for Presence {
 pub struct State {
     /// Group name.
     pub name: String,
-    /// Desired presence. Defaults to `Present { gid: None, system: false }`.
+    /// Desired presence. Defaults to `Present { gid: None, system: None }`.
     pub presence: Presence,
 }
 
@@ -80,10 +79,10 @@ fn observe(name: &str) -> crate::Result<Presence> {
             let gid = g.gid.as_raw();
             Ok(Presence::Present {
                 gid: Some(gid),
-                // Infer system-ness from the live GID against the host's
-                // own `SYS_GID_MAX`. This makes the diff honest; the
-                // reconcile logic still never migrates between ranges.
-                system: gid <= sys_gid_max(),
+                // Observed from the live GID against the host's own
+                // `SYS_GID_MAX`, so a requested mismatch can be detected
+                // (see `apply`).
+                system: Some(gid <= sys_gid_max()),
             })
         }
         None => Ok(Presence::Absent),
@@ -128,7 +127,7 @@ pub fn present(name: impl Into<String>) -> crate::Result<super::Return> {
         name,
         presence: Presence::Present {
             gid: None,
-            system: false,
+            system: None,
         },
     })
 }
@@ -141,7 +140,7 @@ pub fn present_with_gid(name: impl Into<String>, gid: u32) -> crate::Result<supe
         name,
         presence: Presence::Present {
             gid: Some(gid),
-            system: false,
+            system: None,
         },
     })
 }
@@ -154,7 +153,7 @@ pub fn system(name: impl Into<String>) -> crate::Result<super::Return> {
         name,
         presence: Presence::Present {
             gid: None,
-            system: true,
+            system: Some(true),
         },
     })
 }
@@ -184,10 +183,13 @@ fn apply(state: State) -> crate::Result<super::Return> {
         }
 
         // Want present, currently absent → create.
-        (want @ Presence::Present { gid, system }, Presence::Absent) => {
+        (
+            want @ Presence::Present { gid, system },
+            Presence::Absent,
+        ) => {
             show_diff(&state.name, Presence::Absent, want.clone());
             let mut cmd = Command::new("groupadd");
-            if *system {
+            if *system == Some(true) {
                 cmd.arg("--system");
             }
             if let Some(gid) = gid {
@@ -199,9 +201,11 @@ fn apply(state: State) -> crate::Result<super::Return> {
 
         // Want present, already present → reconcile the GID only. We
         // never migrate system-ness (see `Presence::Present::system`);
-        // the "new" diff view reports system inferred from the target
-        // GID purely so the rendered diff is honest about the side
-        // effect of moving the GID across the system boundary.
+        // an explicit request that disagrees with the live group errors
+        // instead of silently never converging. The "new" diff view
+        // reports system inferred from the target GID purely so the
+        // rendered diff is honest about the side effect of moving the
+        // GID across the system boundary.
         (
             Presence::Present {
                 gid: Some(want), ..
@@ -215,7 +219,7 @@ fn apply(state: State) -> crate::Result<super::Return> {
                 observed.clone(),
                 Presence::Present {
                     gid: Some(*want),
-                    system: *want <= sys_gid_max(),
+                    system: Some(*want <= sys_gid_max()),
                 },
             );
             super::run_check(Command::new("groupmod").args([
@@ -227,7 +231,27 @@ fn apply(state: State) -> crate::Result<super::Return> {
             true
         }
 
-        (Presence::Present { .. }, Presence::Present { .. }) => false,
+        (
+            want @ Presence::Present { system, .. },
+            Presence::Present {
+                system: observed_system,
+                ..
+            },
+        ) => {
+            if let Some(want_system) = *system
+                && let Some(live_system) = *observed_system
+                && want_system != live_system
+            {
+                crate::bail!(
+                    "group `{}` exists with system={live_system}, but the desired \
+                     state says system={want_system}: groupmod cannot move a group \
+                     between the system and regular GID ranges. Drop the `system` \
+                     field from the desired state, or delete and recreate the group.",
+                    state.name
+                );
+            }
+            false
+        }
     };
 
     Ok(super::Return::from_changed(changed))

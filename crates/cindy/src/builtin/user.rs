@@ -76,11 +76,11 @@ pub enum Presence {
         /// per-user group skeleton by default). Only consulted when the
         /// account is **created** — an account's system-ness is fixed by
         /// its UID at creation and isn't migratable without delete +
-        /// recreate (which would orphan its files), so this module never
-        /// changes it on an existing account. It *observes* system-ness
-        /// from the live UID (against the host's `SYS_UID_MAX`) for an
-        /// honest diff, but reports a mismatch rather than "fixing" it.
-        system: bool,
+        /// recreate (which would orphan its files). `None` (the default)
+        /// leaves an existing account's system-ness alone; a `Some(..)`
+        /// that disagrees with the live account errors instead of
+        /// silently never converging.
+        system: Option<bool>,
     },
 }
 
@@ -93,7 +93,7 @@ impl Default for Presence {
             shell: None,
             home: None,
             comment: None,
-            system: false,
+            system: None,
         }
     }
 }
@@ -114,10 +114,12 @@ impl crate::Diff for State {}
 /// excluding the user's primary group.
 fn supplementary_groups(name: &str, primary_gid: nix::unistd::Gid) -> crate::Result<Vec<String>> {
     // `getgrouplist(3)` resolves the full set of groups for `name`
-    // through NSS, so it's correct for LDAP/SSSD-backed hosts as well
-    // as local `/etc/group` (unlike a flat-file scan). It returns the
-    // primary group too, so we filter it out to leave only the
-    // supplementary set — the thing `usermod --groups` manages.
+    // through the C library. Caveat: workers are static-musl binaries,
+    // and musl has no NSS plugin support — the lookup reads
+    // `/etc/group` only, so memberships from LDAP/SSSD-backed hosts are
+    // invisible here. It returns the primary group too, so we filter it
+    // out to leave only the supplementary set — the thing
+    // `usermod --groups` manages.
     let cname = std::ffi::CString::new(name).context("User name contains an interior NUL byte")?;
     let gids = nix::unistd::getgrouplist(&cname, primary_gid)
         .context("getgrouplist failed for the user")?;
@@ -169,11 +171,9 @@ fn observe(name: &str) -> crate::Result<Presence> {
         // empty → `None` would make a desired `Some("")` compare unequal
         // forever, re-running `usermod --comment ""` on every play.
         comment: Some(comment),
-        // Inferred from the live UID against the host's `SYS_UID_MAX`,
-        // for an honest diff. Like `group`, we never migrate an existing
-        // account between system and non-system (the UID range is fixed
-        // at creation); a mismatch is reported, not "fixed".
-        system: user.uid.as_raw() <= sys_uid_max(),
+        // Observed from the live UID against the host's `SYS_UID_MAX` so
+        // a requested mismatch can be detected (see `apply`).
+        system: Some(user.uid.as_raw() <= sys_uid_max()),
     })
 }
 
@@ -230,7 +230,7 @@ fn reconcile(want: &Presence, have: &Presence) -> ReconcileResult {
             shell: o_shell,
             home: o_home,
             comment: o_comment,
-            ..
+            system: o_system,
         },
     ) = (want, have)
     else {
@@ -315,7 +315,7 @@ fn reconcile(want: &Presence, have: &Presence) -> ReconcileResult {
             shell,
             home,
             comment,
-            system: *system,
+            system: system.clone().or_else(|| o_system.clone()),
         },
     }
 }
@@ -337,7 +337,7 @@ fn useradd_args(want: &Presence) -> Vec<std::ffi::OsString> {
     };
 
     let mut args: Vec<std::ffi::OsString> = Vec::new();
-    if *system {
+    if *system == Some(true) {
         args.push("--system".into());
     }
     if let Some(uid) = uid {
@@ -433,7 +433,7 @@ pub fn system(name: impl Into<String>) -> crate::Result<super::Return> {
             shell: None,
             home: None,
             comment: None,
-            system: true,
+            system: Some(true),
         },
     })
 }
@@ -488,7 +488,26 @@ fn apply(state: State) -> crate::Result<super::Return> {
 
         // Reconcile an existing account: a single comparison pass builds
         // both the struct diff and the `usermod` argv.
-        (want @ Presence::Present { .. }, have @ Presence::Present { .. }) => {
+        (
+            want @ Presence::Present { system, .. },
+            have @ Presence::Present { system: observed_system, .. },
+        ) => {
+            // System-ness is fixed at creation (UID range); `usermod`
+            // cannot migrate it. An explicit request that disagrees with
+            // the live account would otherwise print a diff that never
+            // applies — error instead.
+            if let Some(want_system) = *system
+                && let Some(live_system) = *observed_system
+                && want_system != live_system
+            {
+                crate::bail!(
+                    "user `{}` exists with system={live_system}, but the desired \
+                     state says system={want_system}: usermod cannot move an account \
+                     between the system and regular UID ranges. Drop the `system` \
+                     field from the desired state, or delete and recreate the account.",
+                    state.name
+                );
+            }
             let ReconcileResult { args, desired } = reconcile(want, have);
             show_diff(&state.name, observed.clone(), desired);
 
@@ -504,4 +523,150 @@ fn apply(state: State) -> crate::Result<super::Return> {
     };
 
     Ok(super::Return::from_changed(changed))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn want(
+        uid: Option<u32>,
+        group: Option<&str>,
+        groups: Option<Groups>,
+        shell: Option<&str>,
+        home: Option<&str>,
+        comment: Option<&str>,
+        system: Option<bool>,
+    ) -> Presence {
+        Presence::Present {
+            uid,
+            group: group.map(str::to_owned),
+            groups,
+            shell: shell.map(PathBuf::from),
+            home: home.map(PathBuf::from),
+            comment: comment.map(str::to_owned),
+            system,
+        }
+    }
+
+    fn observed(system: bool) -> Presence {
+        want(
+            Some(1000),
+            Some("users"),
+            Some(Groups::Exact(vec!["docker".into()])),
+            Some("/bin/bash"),
+            Some("/home/alice"),
+            Some("Alice"),
+            Some(system),
+        )
+    }
+
+    fn args_of(res: &ReconcileResult) -> Vec<String> {
+        res.args
+            .iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    #[test]
+    fn reconcile_emits_flags_only_for_changed_fields() {
+        let res = reconcile(
+            &want(
+                Some(1500),
+                Some("staff"),
+                None,
+                Some("/bin/zsh"),
+                Some("/home/alice"), // unchanged → no --home/--move-home
+                None,
+                None,
+            ),
+            &observed(false),
+        );
+        let args = args_of(&res);
+        assert_eq!(
+            args,
+            vec!["--uid", "1500", "--gid", "staff", "--shell", "/bin/zsh"]
+        );
+    }
+
+    #[test]
+    fn reconcile_home_move_uses_two_flags() {
+        let res = reconcile(
+            &want(None, None, None, None, Some("/srv/alice"), None, None),
+            &observed(false),
+        );
+        assert_eq!(args_of(&res), vec!["--home", "/srv/alice", "--move-home"]);
+    }
+
+    #[test]
+    fn reconcile_backfills_system_from_observed_when_dont_care() {
+        // `None` must not fight the live account's system-ness — that
+        // was the never-converging diff.
+        let res = reconcile(&want(None, None, None, None, None, None, None), &observed(true));
+        assert!(args_of(&res).is_empty());
+        assert_eq!(
+            res.desired,
+            want(
+                Some(1000),
+                Some("users"),
+                Some(Groups::Exact(vec!["docker".into()])),
+                Some("/bin/bash"),
+                Some("/home/alice"),
+                Some("Alice"),
+                Some(true),
+            )
+        );
+    }
+
+    #[test]
+    fn reconcile_exact_groups_replaces_membership() {
+        let res = reconcile(
+            &want(
+                None,
+                None,
+                Some(Groups::Exact(vec!["wheel".into(), "video".into()])),
+                None,
+                None,
+                None,
+                None,
+            ),
+            &observed(false),
+        );
+        assert_eq!(args_of(&res), vec!["--groups", "wheel,video"]);
+    }
+
+    #[test]
+    fn reconcile_append_only_adds_missing() {
+        let res = reconcile(
+            &want(
+                None,
+                None,
+                Some(Groups::Append(vec!["docker".into(), "audit".into()])),
+                None,
+                None,
+                None,
+                None,
+            ),
+            &observed(false),
+        );
+        // `docker` is already there; only `audit` is appended.
+        assert_eq!(args_of(&res), vec!["--append", "--groups", "audit"]);
+        // Desired view is the union.
+        assert!(matches!(
+            res.desired,
+            Presence::Present {
+                groups: Some(Groups::Exact(ref g)),
+                ..
+            } if g == &["audit", "docker"]
+        ));
+    }
+
+    #[test]
+    fn useradd_args_passes_system_only_when_explicitly_true() {
+        let sys = useradd_args(&want(None, None, None, None, None, None, Some(true)));
+        assert!(sys.contains(&"--system".into()));
+        let dont_care = useradd_args(&want(None, None, None, None, None, None, None));
+        assert!(!dont_care.contains(&"--system".into()));
+    }
 }
