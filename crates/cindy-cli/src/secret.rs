@@ -98,8 +98,7 @@ pub async fn dispatch(cmd: SecretCommand, orchestrator_path: Option<&Path>) -> e
 // ---------------------------------------------------------------------
 
 fn vault_create(name: &str) -> eyre::Result<()> {
-    validate_vault_name(name)?;
-    let path = keychain::vault_key_path(name);
+    let path = keychain::vault_key_path(name).map_err(|e| eyre::eyre!("{e:#}"))?;
     if path.exists() {
         eyre::bail!(
             "{} already exists. Refusing to overwrite an existing vault key. \
@@ -113,16 +112,6 @@ fn vault_create(name: &str) -> eyre::Result<()> {
         "(remember to add `{}/` to .gitignore)",
         keychain::keys_dir().display()
     );
-    Ok(())
-}
-
-fn validate_vault_name(name: &str) -> eyre::Result<()> {
-    if name.is_empty() {
-        eyre::bail!("vault name must not be empty");
-    }
-    if name.contains(['/', '\\', '\0']) {
-        eyre::bail!("vault name {name:?} contains invalid characters");
-    }
     Ok(())
 }
 

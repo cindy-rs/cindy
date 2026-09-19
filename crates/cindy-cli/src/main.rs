@@ -497,7 +497,7 @@ async fn run_after_launch(
         let host_context_json =
             serde_json::to_string(&host.host).expect("Failed to serialise host context");
         let needed = host_needed_vaults(&in_code_vaults, &host_context_json);
-        let (keys, missing) = collect_vault_keys(&needed);
+        let (keys, missing) = collect_vault_keys(&needed)?;
         if !missing.is_empty() {
             preflight_failures.push(format!(
                 "  {}: missing key(s) for vault(s) {missing:?}",
@@ -780,16 +780,20 @@ async fn dump_in_code_vaults(orchestrator_exe_path: &Path) -> eyre::Result<Vec<S
 /// `{vault: base64-key}` map the worker/orchestrator expect in
 /// `CINDY_VAULT_KEYS`. Returns the names of any vault whose key file is
 /// missing or unreadable in `missing`, so the caller can fail the whole
-/// run up front with full visibility rather than mid-play.
+/// run up front with full visibility rather than mid-play. Vault names
+/// that are invalid outright (e.g. path separators smuggled in through
+/// sealed data) error here instead.
 fn collect_vault_keys(
     needed: &std::collections::BTreeSet<String>,
-) -> (HashMap<String, String>, Vec<String>) {
+) -> eyre::Result<(HashMap<String, String>, Vec<String>)> {
     use base64::Engine as _;
 
     let mut map = HashMap::new();
     let mut missing = Vec::new();
     for vault in needed {
-        match std::fs::read(cindy::secret::keychain::vault_key_path(vault)) {
+        let path = cindy::secret::keychain::vault_key_path(vault)
+            .map_err(|e| eyre::eyre!("{e:#}"))?;
+        match std::fs::read(path) {
             Ok(bytes) => {
                 let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
                 map.insert(vault.clone(), b64);
@@ -797,7 +801,7 @@ fn collect_vault_keys(
             Err(_) => missing.push(vault.clone()),
         }
     }
-    (map, missing)
+    Ok((map, missing))
 }
 
 /// Compute the vaults a single host needs: the in-code `secret!` vaults

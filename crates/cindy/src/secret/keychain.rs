@@ -92,8 +92,10 @@ pub fn decode_env_keys() -> crate::Result<Option<HashMap<String, Vec<u8>>>> {
 /// each key's length. Shared by the orchestrator (from env) and the
 /// worker (from the RPC handshake).
 pub fn install_raw_keys(map: HashMap<String, Vec<u8>>) -> crate::Result<()> {
+    use zeroize::Zeroize as _;
+
     let mut out = HashMap::new();
-    for (vault, bytes) in map {
+    for (vault, mut bytes) in map {
         if bytes.len() != VAULT_KEY_LEN {
             crate::bail!(
                 "Key for vault `{vault}` has the wrong byte length ({} \u{2260} {VAULT_KEY_LEN})",
@@ -102,6 +104,7 @@ pub fn install_raw_keys(map: HashMap<String, Vec<u8>>) -> crate::Result<()> {
         }
         let mut arr = [0u8; VAULT_KEY_LEN];
         arr.copy_from_slice(&bytes);
+        bytes.zeroize();
         out.insert(vault, zeroize::Zeroizing::new(arr));
     }
     install_keys(out);
@@ -116,8 +119,14 @@ pub fn keys_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from(DEFAULT_KEYS_DIR))
 }
 
-pub fn vault_key_path(vault: &str) -> PathBuf {
-    keys_dir().join(format!("{vault}.key"))
+pub fn vault_key_path(vault: &str) -> crate::Result<PathBuf> {
+    if vault.is_empty() {
+        crate::bail!("vault name must not be empty");
+    }
+    if vault.contains(['/', '\\', '\0']) {
+        crate::bail!("vault name {vault:?} contains invalid characters");
+    }
+    Ok(keys_dir().join(format!("{vault}.key")))
 }
 
 fn read_key_file(path: &Path) -> crate::Result<Option<VaultKey>> {
@@ -149,7 +158,7 @@ pub fn get_vault_key(vault: &str) -> crate::Result<VaultKey> {
     if let Some(key) = cache_get(vault) {
         return Ok(key);
     }
-    let path = vault_key_path(vault);
+    let path = vault_key_path(vault)?;
     let Some(key) = read_key_file(&path)? else {
         crate::bail!(
             "no key for vault `{vault}` \u{2014} expected {} to exist. \
@@ -160,4 +169,17 @@ pub fn get_vault_key(vault: &str) -> crate::Result<VaultKey> {
     };
     cache_put(vault.to_owned(), key.clone());
     Ok(key)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn vault_key_path_rejects_traversal_and_separators() {
+        assert!(vault_key_path("prod-db_1").is_ok());
+        for bad in ["", "../../etc/shadow", "a/b", "a\\b", "with\0nul"] {
+            assert!(vault_key_path(bad).is_err(), "{bad:?}");
+        }
+    }
 }
