@@ -300,6 +300,19 @@ fn Secrets() -> Element {
         }
         Snippet { src: dioxus_code::code!("src/snippets/reveal.rs") }
         P {
+            "For a secret that belongs in a file, don't reveal it yourself — put the "
+            code { class: "rounded bg-panel px-1.5 py-0.5 font-mono text-sm text-zinc-200", "Secret<T>" }
+            " straight into a template and hand that to "
+            code { class: "rounded bg-panel px-1.5 py-0.5 font-mono text-sm text-zinc-200", "path::template" }
+            ". cindy renders it twice — once for the bytes it writes, once with every secret "
+            "collapsed to "
+            code { class: "rounded bg-panel px-1.5 py-0.5 font-mono text-sm text-zinc-200", "***" }
+            " — and diffs only the second. So the rest of the file stays fully visible and "
+            "diffable while the secret does not, and the plaintext never reaches your terminal, "
+            "the run view, or a CI log. You don't mark anything up; the framework decides."
+        }
+        Snippet { src: dioxus_code::code!("src/snippets/template.rs") }
+        P {
             "The "
             code { class: "rounded bg-panel px-1.5 py-0.5 font-mono text-sm text-zinc-200", "keys/*.dek" }
             " files are the only thing you must keep out of version control; everything else, "
@@ -465,6 +478,10 @@ const BUILTINS: &[BuiltinModule] = &[
             BuiltinFn {
                 sig: "file(dest, content, user, group, mode)",
                 desc: "Manage a regular file with the given contents, owner, and mode.",
+            },
+            BuiltinFn {
+                sig: "template(dest, template, user, group, mode)",
+                desc: "Same, but the contents come from a template — which is what lets cindy redact secrets out of the diff. Use this whenever the file can contain one.",
             },
             BuiltinFn {
                 sig: "directory(dest, user, group, mode)",

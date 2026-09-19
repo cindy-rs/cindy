@@ -28,6 +28,7 @@ tokio = { workspace = true, features = [
 ] }
 
 anyhow_serde = "1.0"
+askama = { workspace = true, optional = true }
 base64 = "0.22"
 chacha20poly1305 = "0.10"
 inventory = "0.3"
@@ -54,3 +55,9 @@ sha2 = "0.11"
 [features]
 orchestrator = []
 remote = []
+# Renders `path::template` content through askama, and makes every
+# `askama::Template` a `cindy::secret::Render`. Off by default so
+# playbooks that template some other way (or not at all) don't pull the
+# dependency; on, a template holding `Secret<T>` fields gets a redacted
+# diff with no further effort.
+askama = ["dep:askama"]
