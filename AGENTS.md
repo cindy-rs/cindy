@@ -15,20 +15,37 @@ GLM, GPT, ...) collaborate here alongside the human owner.
   stay minimal.
 - **Never amend, rebase, or otherwise touch existing commits.** If you believe you
   need to, ask the human first.
-- Verify before committing: `cargo check --workspace`, `cargo clippy --workspace`,
-  plus tests for whatever you touched. Full commands below.
+- Verify before committing, with the same commands CI runs (below) — including
+  `cargo fmt --check` and clippy's `--all-targets -- -D warnings`. A plain
+  `cargo clippy --workspace` passes where CI fails.
+- Outstanding work lives in [PLAN.md](PLAN.md). Delete an item there in the same
+  commit that implements it; if you decide *against* one, move it to the settled
+  decisions below rather than dropping it.
 - Never run `cindy play` (or anything else that deploys to real hosts). The human
   runs plays; compiling/building steps are fine. The human's real playbook lives at
   `/home/martin/files/projects/home-infra` — don't modify it unasked.
 
 ## Commands
 
+These are what `.gitlab-ci.yml` runs; match them exactly or CI will disagree
+with your local pass.
+
 ```sh
-cargo check --workspace        # fast type check
-cargo clippy --workspace       # lints
-cargo test --workspace         # unit tests
-cargo test -p e2e-localhost    # e2e suite; slow (builds two binaries), hermetic
+cargo check --workspace                              # fast type check
+cargo fmt --check                                    # CI fails on any drift
+cargo clippy --workspace --all-targets -- -D warnings # lints
+cargo test --workspace                               # unit + e2e
+cargo test -p e2e-localhost    # e2e alone; slow (builds two binaries), hermetic
+cargo audit                    # vulnerabilities; must stay empty
+
+# The site is a nested workspace — the root commands don't reach it.
+cargo fmt --check --manifest-path web/Cargo.toml
+cargo audit --file web/Cargo.lock
+cargo check --manifest-path web/Cargo.toml --target wasm32-unknown-unknown
 ```
+
+`check.web` copies `web/tailwind.css` to `web/assets/tailwind.css` first —
+raw `cargo check` only needs the file to exist.
 
 ## Repo layout
 
@@ -68,6 +85,64 @@ cargo test -p e2e-localhost    # e2e suite; slow (builds two binaries), hermetic
   that didn't happen.
 - No shell string construction for process launches — argv vectors with `--`
   separators only.
+- Nothing cindy writes outlives a play on the target beyond the managed resources
+  themselves: no state directory, no cache, no sidecars. The worker unlinks its
+  own binary on startup. "Agent-less" is load-bearing, not marketing.
+- `cindy play --check` must never mutate a target. Every mutating operation needs
+  a `crate::dry_run()` guard, and check mode may over-report a change but must
+  never under-report one. See the practices below for the shape that holds.
+
+## Settled decisions — don't re-litigate
+
+Each was proposed, considered, and settled. The reasoning lives in the named
+commit (this repo keeps rationale in commit messages); don't re-open one without
+new information.
+
+- **Diffs show secrets.** A config file holding a revealed secret appears in the
+  operator's terminal and the run view, as in Ansible. Redaction was built and
+  reverted (`09ec86e`, `61857f3`): the old side of a diff can't be redacted
+  without withholding it always or keeping state on the target, a partial guard
+  reads as a guarantee and isn't, and the operator already holds every vault key
+  the play touches. This *qualifies* the redaction invariant above —
+  `Debug`/`Serialize` stay redacting; diffs deliberately don't.
+- **No value-based secret masking** (scanning output for known secret values):
+  misses anything transformed, and mangles diffs when a value is short or common.
+- **Diffs are not opt-in.** An operator should be able to introspect a deploy
+  without a flag. A `--no-diff` for CI logs is still open.
+- **No AAD on sealed ciphertexts.** The threat model it defends — rearranging
+  ciphertexts without code execution — doesn't exist when ciphertexts live in
+  playbook source. The version byte was the half worth keeping (`9c6234a`).
+- **`apt::install_all` was rejected** in favour of `impl Into<PackageList>`
+  (`fe3dc4e`).
+- **Buster (apt < 2.1.10) is not a target.** The fleet is VyOS 1.3+ (apt ≥ 2.2.4)
+  and OpenWrt (no apt), so `apt-get` relies on `-o DPkg::Lock::Timeout` and
+  doesn't need the retry wrapper `apt-mark` gets.
+- **No `--forks`/`--serial`** for this fleet (`441e5b2`). Worth knowing if it
+  comes back: rolling deploys are *not* expressible in playbook code — each host
+  gets its own orchestrator process with no cross-host coordination point — so
+  `--serial N` would have to be built as one orchestrator driving hosts in
+  batches, not a per-playbook workaround.
+
+## Practices learned the hard way
+
+Each of these cost a shipped bug. They're cheap to apply and expensive to
+rediscover.
+
+- **Conditional behaviour goes in a pure decision function.** Every `--check`
+  defect came from a condition replicated across call sites with nothing
+  enforcing it. The shape that survives review is `plan_holds`,
+  `system_conflict`, `disable_would_change`, `file_attrs_satisfied`: extract the
+  would-this-change decision, unit-test it, and have both the real path and the
+  dry-run path read the same answer.
+- **When the message is the feature, assert on the message.**
+  `assert!(x.is_err())` let two separate regressions ship green — an
+  unknown-version error that didn't name the version, then a wrong-key error
+  that claimed to be a version problem. Error-path tests assert the text in both
+  directions: it says X, and it does *not* say Y.
+- **Audit for mutations, not for guards.** Grepping existing `dry_run()` call
+  sites found nothing wrong with `daemon_reload` — it had no guard at all, so it
+  never appeared in the results. Enumerate the mutating operations and confirm
+  each one is covered.
 
 ## Conventions
 
@@ -75,4 +150,7 @@ cargo test -p e2e-localhost    # e2e suite; slow (builds two binaries), hermetic
   `-Zbuild-std`).
 - `cross` + podman (no docker) build remote workers; host `$CARGO_HOME` is mounted
   into the build container — keep that leak in mind for anything config-dependent.
-- Dependencies for `crates/cindy` should move toward `[workspace.dependencies]`.
+- A dependency used by more than one crate belongs in
+  `[workspace.dependencies]`, so versions can't drift apart. Single-consumer
+  deps (`zbus_systemd`, `ureq`, `nix`, …) are fine inline — hoisting those buys
+  nothing.
