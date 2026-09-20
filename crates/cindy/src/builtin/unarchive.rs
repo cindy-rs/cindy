@@ -114,12 +114,34 @@ fn render_summary(entries: &[Entry], dest: &Path) {
 }
 
 /// List a tar stream's entries (paths + sizes + dir flags) without
-/// extracting them.
-fn list_tar(tar_bytes: &[u8]) -> crate::Result<Vec<Entry>> {
-    let mut archive = tar::Archive::new(std::io::Cursor::new(tar_bytes));
+/// extracting them. Takes a reader, so it works identically over an
+/// in-memory buffer (dry-run listing of a plain tar), a decoding
+/// stream (gzip, ceiling enforced by [`tar_reader`]), or a spill file
+/// (xz/zstd).
+/// If an io error's chain carries the decompression ceiling, surface
+/// that message verbatim instead of letting a generic tar wrapper
+/// bury it — the knob's name is the feature, per the repo's
+/// assert-on-the-message practice.
+fn bail_if_limit(e: &std::io::Error) -> Option<anyhow_serde::Error> {
+    let mut src: Option<&dyn std::error::Error> = Some(e);
+    while let Some(s) = src {
+        let msg = s.to_string();
+        if msg.contains("decompression limit") {
+            return Some(anyhow_serde::Error::msg(msg));
+        }
+        src = s.source();
+    }
+    None
+}
+
+fn list_tar(reader: &mut dyn std::io::Read) -> crate::Result<Vec<Entry>> {
+    let mut archive = tar::Archive::new(reader);
     let mut out = Vec::new();
     for entry in archive.entries().context("Couldn't read tar entries")? {
-        let entry = entry.context("Couldn't read a tar entry")?;
+        let entry = entry.map_err(|e| {
+            bail_if_limit(&e)
+                .unwrap_or_else(|| anyhow_serde::Error::msg("Couldn't read a tar entry"))
+        })?;
         let path = entry.path().context("tar entry has no path")?.into_owned();
         let is_dir = entry.header().entry_type().is_dir();
         out.push(Entry {
@@ -129,6 +151,39 @@ fn list_tar(tar_bytes: &[u8]) -> crate::Result<Vec<Entry>> {
         });
     }
     Ok(out)
+}
+
+/// Build a fresh reader of the tar payload, once per pass (the summary
+/// pass and the extraction pass each need their own).
+///
+/// - `Store` reads the buffer as-is (no expansion, so no ceiling —
+///   the bytes on disk are what they are, as in `decompress`).
+/// - `Gzip` streams through `MultiGzDecoder`, wrapped in
+///   [`BoundedReader`] so the decoded stream stays under `max_bytes`.
+/// - `Xz`/`Zstd` were already expanded (bounded, once) into `spill` by
+///   the caller; each pass reopens that file.
+fn tar_reader<'a>(
+    codec: super::Codec,
+    raw: &'a [u8],
+    spill: Option<&std::path::Path>,
+    max_bytes: u64,
+) -> crate::Result<Box<dyn std::io::Read + 'a>> {
+    match codec {
+        super::Codec::Store => Ok(Box::new(std::io::Cursor::new(raw))),
+        super::Codec::Gzip => Ok(Box::new(super::decompress::BoundedReader::new(
+            flate2::read::MultiGzDecoder::new(raw),
+            "gzip",
+            max_bytes,
+        ))),
+        super::Codec::Xz | super::Codec::Zstd => {
+            let path = spill.context("xz/zstd tar extraction is missing its spill file")?;
+            let file = std::fs::File::open(path).context(format!(
+                "Couldn't reopen the tar spill file {}",
+                path.display()
+            ))?;
+            Ok(Box::new(file))
+        }
+    }
 }
 
 /// List a ZIP archive's entries without extracting them.
@@ -163,12 +218,16 @@ fn list_7z(src: &Path) -> crate::Result<Vec<Entry>> {
         .collect())
 }
 
-/// Unpack a raw tar byte stream into `dest`.
-fn extract_tar(tar_bytes: &[u8], dest: &Path) -> crate::Result<()> {
-    let mut archive = tar::Archive::new(std::io::Cursor::new(tar_bytes));
-    archive
-        .unpack(dest)
-        .context(format!("Couldn't unpack tar into {}", dest.display()))
+/// Unpack a tar stream into `dest`, entry by entry — the tar crate
+/// streams from any reader, so nothing but the current entry's block
+/// is resident.
+fn extract_tar(reader: &mut dyn std::io::Read, dest: &Path) -> crate::Result<()> {
+    let mut archive = tar::Archive::new(reader);
+    archive.unpack(dest).map_err(|e| {
+        bail_if_limit(&e).unwrap_or_else(|| {
+            anyhow_serde::Error::msg(format!("Couldn't unpack tar into {}", dest.display()))
+        })
+    })
 }
 
 /// Extract a ZIP archive into `dest`.
@@ -276,28 +335,67 @@ fn apply(state: State) -> crate::Result<super::Return> {
         format,
     );
 
-    // Read and decode the archive *before* touching the destination, so
-    // an unreadable or corrupt source errors without leaving a
-    // half-prepared destination directory behind.
+    // Streaming shape, per the tar path:
+    //
+    // 1. Read the *compressed* archive into memory, once, as before —
+    //    it's the artefact the operator (or `fetch`, with its own
+    //    `max_bytes`) placed on disk; the change is everything after.
+    // 2. gzip streams straight off that buffer through a bounded
+    //    reader; xz/zstd expand once into a bounded spill file (their
+    //    pure-Rust decoders have no Read-side streaming form usable
+    //    here — see `tar_reader`). Either way the *expanded* tar never
+    //    lives in RAM, which is what the old `bounded`-to-`Vec` path
+    //    did.
+    // 3. Two passes over the payload: one to list entries for the
+    //    summary (also the whole of a dry run), one to extract.
+    //
+    // The trade vs the old buffer-everything path: a corrupt payload
+    // now fails *during* extraction rather than before `dest` is
+    // touched, so a bad archive can leave a partially extracted tree —
+    // the same failure mode `tar(1)` and the zip/7z paths have always
+    // had. The summary pass still catches header-level corruption
+    // first.
     match format {
         Format::Tar(codec) => {
+            let codec = codec.unwrap_or(super::Codec::Store);
+            let max_bytes = state
+                .max_bytes
+                .unwrap_or(super::decompress::DEFAULT_MAX_BYTES);
             let raw = std::fs::read(&state.src)
                 .context(format!("Couldn't read {}", state.src.display()))?;
-            let tar_bytes = super::decompress::bounded(
-                raw,
-                codec.unwrap_or(super::Codec::Store),
-                state
-                    .max_bytes
-                    .unwrap_or(super::decompress::DEFAULT_MAX_BYTES),
-            )?;
-            let entries = list_tar(&tar_bytes)?;
+
+            let spill = match codec {
+                super::Codec::Xz | super::Codec::Zstd => {
+                    let fallback = std::env::temp_dir();
+                    let parent = state
+                        .dest
+                        .parent()
+                        .filter(|p| !p.as_os_str().is_empty() && p.exists())
+                        .unwrap_or(fallback.as_path());
+                    let mut spill = super::path::spill_in(parent)?;
+                    super::decompress::bounded_into(&raw, codec, max_bytes, spill.as_file_mut())?;
+                    Some(spill)
+                }
+                _ => None,
+            };
+            let spill_path = spill.as_ref().map(|s| s.path().to_path_buf());
+
+            let entries = list_tar(&mut tar_reader(
+                codec,
+                &raw,
+                spill_path.as_deref(),
+                max_bytes,
+            )?)?;
             if crate::dry_run() {
                 render_summary(&entries, &state.dest);
                 return Ok(super::Return::Changed);
             }
             establish_dest(&state.dest)?;
             render_summary(&entries, &state.dest);
-            extract_tar(&tar_bytes, &state.dest)?;
+            extract_tar(
+                &mut tar_reader(codec, &raw, spill_path.as_deref(), max_bytes)?,
+                &state.dest,
+            )?;
         }
         Format::Zip => {
             let entries = list_zip(&state.src)?;
@@ -552,6 +650,110 @@ mod tests {
 
         let mode = std::fs::metadata(&dest).unwrap().permissions().mode() & 0o7777;
         assert_eq!(mode, 0o750, "existing dest dir mode must be preserved");
+    }
+
+    /// The decompression ceiling must keep biting now that extraction
+    /// streams: a gzip tar whose *expanded* payload is over the limit
+    /// is a named error naming the knob, not an allocation or a
+    /// silently truncated tree. Asserted in both directions per the
+    /// repo's message practice.
+    #[test]
+    fn streaming_ceiling_is_a_named_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("payload");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("big.bin"), [0u8; 256 * 1024]).unwrap();
+
+        let archive_path = tmp.path().join("out.tar.gz");
+        archive::archive::inner(archive::State {
+            sources: vec![src],
+            dest: archive_path.clone(),
+            format: Some(Format::Tar(Some(crate::builtin::Codec::Gzip))),
+            mode: Some(crate::builtin::path::Mode(0o644)),
+        })
+        .unwrap();
+
+        let out = tmp.path().join("extracted");
+        let err = unarchive::inner(State {
+            src: archive_path,
+            dest: out.clone(),
+            format: Some(Format::Tar(Some(crate::builtin::Codec::Gzip))),
+            max_bytes: Some(64 * 1024),
+        })
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("gzip"), "{msg}");
+        assert!(msg.contains("max_bytes"), "{msg}");
+        assert!(!msg.contains("store"), "{msg}");
+
+        // The refusal must not have half-extracted a tree either: the
+        // summary pass trips the ceiling before extraction starts.
+        assert!(
+            !out.exists(),
+            "an over-limit extraction must not create the destination"
+        );
+    }
+
+    /// Same ceiling, through the xz spill path — `bounded_into` is the
+    /// enforcement point there, so a regression that skips it would
+    /// make this test silently pass at 4 GiB.
+    #[test]
+    fn streaming_ceiling_bites_through_the_spill_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("payload");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("big.bin"), [0u8; 256 * 1024]).unwrap();
+
+        let archive_path = tmp.path().join("out.tar.xz");
+        archive::archive::inner(archive::State {
+            sources: vec![src],
+            dest: archive_path.clone(),
+            format: Some(Format::Tar(Some(crate::builtin::Codec::Xz))),
+            mode: Some(crate::builtin::path::Mode(0o644)),
+        })
+        .unwrap();
+
+        let err = unarchive::inner(State {
+            src: archive_path,
+            dest: tmp.path().join("extracted"),
+            format: Some(Format::Tar(Some(crate::builtin::Codec::Xz))),
+            max_bytes: Some(64 * 1024),
+        })
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("xz"), "{msg}");
+        assert!(msg.contains("max_bytes"), "{msg}");
+    }
+
+    /// An existing *directory* at the archive destination is replaced
+    /// by the published archive, matching the old `path::file`
+    /// transition semantics — the streaming publish must not have
+    /// lost the one case rename(2) can't handle on its own.
+    #[test]
+    fn archive_replaces_a_directory_at_the_destination() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("payload");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("a.txt"), b"x").unwrap();
+
+        let dest = tmp.path().join("out.tar");
+        std::fs::create_dir(&dest).unwrap();
+        std::fs::write(dest.join("stale.txt"), b"stale").unwrap();
+
+        archive::archive::inner(archive::State {
+            sources: vec![src],
+            dest: dest.clone(),
+            format: Some(Format::Tar(None)),
+            mode: Some(crate::builtin::path::Mode(0o644)),
+        })
+        .unwrap();
+
+        let meta = std::fs::symlink_metadata(&dest).unwrap();
+        assert!(meta.is_file(), "dest must now be the archive file");
+        assert!(
+            !dest.join("stale.txt").exists(),
+            "the replaced directory's contents must be gone"
+        );
     }
 
     #[test]

@@ -573,6 +573,29 @@ pub(crate) fn stage_stream(
     gid: nix::unistd::Gid,
     mode: Mode,
 ) -> crate::Result<Staged> {
+    let mut tmp = new_staged_tempfile(destination)?;
+
+    std::io::copy(reader, &mut tmp).context("Couldn't write the temporary file")?;
+
+    finalise_staged(tmp, destination, uid, gid, mode)
+}
+
+/// A scratch temp file in `parent`, for bulk data that must not live
+/// in RAM but is never published — codec spill files. `0o600`, because
+/// unlike a staged publish it is reopened *by path*. Auto-unlinked on
+/// drop.
+pub(crate) fn spill_in(parent: &Path) -> crate::Result<tempfile::NamedTempFile> {
+    tempfile::Builder::new()
+        .prefix(".cindy.")
+        .tempfile_in(parent)
+        .context("Couldn't create a spill file")
+}
+
+/// A staging temp file the way every cindy publish wants it: hidden
+/// (`.cindy.` prefix), mode `0o000` until its real attributes arrive
+/// via its fd, living in the destination's own directory so the final
+/// `rename(2)` never crosses a filesystem.
+fn new_staged_tempfile(destination: &Path) -> crate::Result<tempfile::NamedTempFile> {
     let parent_raw = destination
         .parent()
         .context("Parent directory unavailable")?;
@@ -582,14 +605,24 @@ pub(crate) fn stage_stream(
         parent_raw
     };
 
-    let mut tmp = tempfile::Builder::new()
+    tempfile::Builder::new()
         .permissions(Mode(0o0000).into())
         .prefix(".cindy.")
         .tempfile_in(parent)
-        .context("Couldn't create temporary file")?;
+        .context("Couldn't create temporary file")
+}
 
-    let written = std::io::copy(reader, &mut tmp).context("Couldn't write the temporary file")?;
-
+/// Apply ownership and mode to a staged temp file through its fd, fsync
+/// it, and wrap it as a [`Staged`] ready to publish. Shared by
+/// [`stage_stream`] (reader side) and [`StagedWriter::finish`] (writer
+/// side).
+fn finalise_staged(
+    tmp: tempfile::NamedTempFile,
+    destination: &Path,
+    uid: nix::unistd::Uid,
+    gid: nix::unistd::Gid,
+    mode: Mode,
+) -> crate::Result<Staged> {
     nix::unistd::fchown(tmp.as_file(), Some(uid), Some(gid))
         .context("Couldn't change ownership of the temporary file")?;
     nix::sys::stat::fchmod(
@@ -606,11 +639,98 @@ pub(crate) fn stage_stream(
         .sync_all()
         .context("Couldn't fsync the temporary file before rename")?;
 
+    let written = tmp
+        .as_file()
+        .metadata()
+        .context("Couldn't stat the temporary file")?
+        .len();
+
     Ok(Staged {
         tmp,
         destination: destination.to_path_buf(),
         written,
     })
+}
+
+/// A staged temp file **open for writing**, for callers that *build*
+/// content rather than copy it — the write-side counterpart of
+/// [`stage_stream`]. Archive writers, compression encoders and friends
+/// stream into [`as_file_mut`](Self::as_file_mut); [`Self::finish`]
+/// then applies ownership/mode over the fd and hands back a [`Staged`]
+/// to publish. If the builder errors part-way, dropping the
+/// `StagedWriter` unlinks the temp file and the destination keeps
+/// whatever it had.
+pub(crate) struct StagedWriter {
+    tmp: tempfile::NamedTempFile,
+    destination: PathBuf,
+    uid: nix::unistd::Uid,
+    gid: nix::unistd::Gid,
+    mode: Mode,
+}
+
+impl StagedWriter {
+    /// Create a `0o000` temp file alongside `destination`, to be filled
+    /// by the caller and published over `destination`.
+    pub(crate) fn create(
+        destination: &Path,
+        uid: nix::unistd::Uid,
+        gid: nix::unistd::Gid,
+        mode: Mode,
+    ) -> crate::Result<Self> {
+        Ok(Self {
+            tmp: new_staged_tempfile(destination)?,
+            destination: destination.to_path_buf(),
+            uid,
+            gid,
+            mode,
+        })
+    }
+
+    /// The staged file, open for writing — hand this to the builder.
+    pub(crate) fn as_file_mut(&mut self) -> &mut std::fs::File {
+        self.tmp.as_file_mut()
+    }
+
+    /// Seal the staged file: attributes via its fd, fsync, and a
+    /// [`Staged`] whose `publish` renames it over the destination.
+    pub(crate) fn finish(self) -> crate::Result<Staged> {
+        finalise_staged(self.tmp, &self.destination, self.uid, self.gid, self.mode)
+    }
+}
+
+/// Publish a file at `destination` whose content the caller **builds**
+/// into a staged temp file, the way [`stage_stream`] publishes content
+/// it copies from a reader. Shares the destination-transition semantics
+/// of [`apply`]'s `Kind::File`: an existing file or symlink is replaced
+/// atomically by the rename, an existing directory is cleared first.
+///
+/// Unlike [`apply`], content is never read back or compared — the
+/// caller streams bytes that did not exist before it ran (an archive
+/// build), so there is nothing to diff against and the caller owns the
+/// `Changed` verdict. If `fill` errors, nothing is published.
+pub(crate) fn file_from_writer(
+    destination: &Path,
+    user: &str,
+    group: &str,
+    mode: Mode,
+    fill: impl FnOnce(&mut StagedWriter) -> crate::Result<()>,
+) -> crate::Result<()> {
+    // Resolve the owner before anything destructive, mirroring `apply`.
+    let (uid, gid) = resolve_owner(user, group)?;
+
+    // `Staged::publish`'s rename(2) replaces an existing file or
+    // symlink atomically. The one thing rename can't replace is a
+    // directory, so pre-clear that case.
+    if std::fs::symlink_metadata(destination)
+        .map(|md| md.is_dir())
+        .unwrap_or(false)
+    {
+        remove_existing(destination, &ObservedKind::Directory)?;
+    }
+
+    let mut staged = StagedWriter::create(destination, uid, gid, mode)?;
+    fill(&mut staged)?;
+    staged.finish()?.publish()
 }
 
 /// Reconcile only ownership and mode on the regular file at `path`,

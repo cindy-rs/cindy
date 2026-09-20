@@ -58,33 +58,76 @@ fn append_to_tar<W: std::io::Write>(
     }
 }
 
-/// Build the tar byte stream for all sources in memory.
-fn build_tar(sources: &[PathBuf]) -> crate::Result<Vec<u8>> {
-    let mut builder = tar::Builder::new(Vec::new());
+/// Build the tar byte stream for all sources straight into the staged
+/// destination, compressed as it goes.
+///
+/// `Store` and `Gzip` stream end-to-end: the tar writer's output goes
+/// directly through the codec encoder into the staged file. `Xz` and
+/// `Zstd` have no write-side streaming encoder in their pure-Rust
+/// implementations (see `compress_into`), so the raw tar spills to an
+/// intermediate temp file in the destination's directory and is
+/// compressed from there — memory stays flat either way, only the
+/// tar's own buffers resident.
+fn build_tar_into(
+    codec: super::Codec,
+    staged: &mut super::path::StagedWriter,
+    dest_parent: &Path,
+    sources: &[PathBuf],
+) -> crate::Result<()> {
     // Store symlinks *as* symlinks (like `tar(1)` without `-h`). The
     // crate's default is to follow them, which dereferences link farms,
     // fails outright on a dangling link, and recurses forever on a
-    // link cycle.
-    builder.follow_symlinks(false);
-    for source in sources {
-        append_to_tar(&mut builder, source)?;
+    // link cycle. Returns the builder's inner writer so the caller can
+    // finish an encoder wrapped around it.
+    fn fill<W: std::io::Write>(
+        mut builder: tar::Builder<W>,
+        sources: &[PathBuf],
+    ) -> crate::Result<W> {
+        builder.follow_symlinks(false);
+        for source in sources {
+            append_to_tar(&mut builder, source)?;
+        }
+        builder
+            .into_inner()
+            .context("Couldn't finalise the tar stream")
     }
-    builder
-        .into_inner()
-        .context("Couldn't finalise the tar stream")
+
+    match codec {
+        super::Codec::Store => {
+            fill(tar::Builder::new(staged.as_file_mut()), sources)?;
+        }
+        super::Codec::Gzip => {
+            let enc =
+                flate2::write::GzEncoder::new(staged.as_file_mut(), flate2::Compression::default());
+            fill(tar::Builder::new(enc), sources)?
+                .finish()
+                .context("gzip finalisation failed")?;
+        }
+        super::Codec::Xz | super::Codec::Zstd => {
+            let mut spill = super::path::spill_in(dest_parent)?;
+            fill(tar::Builder::new(spill.as_file_mut()), sources)?;
+            let mut spill_file =
+                std::fs::File::open(spill.path()).context("Couldn't reopen the tar spill file")?;
+            super::compress::compress_into(codec, &mut spill_file, staged.as_file_mut())?;
+        }
+    }
+    Ok(())
 }
 
-/// Build a ZIP archive in memory.
-fn build_zip(sources: &[PathBuf]) -> crate::Result<Vec<u8>> {
-    let mut zip = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+/// Build a ZIP archive straight into the staged destination.
+fn build_zip_into(
+    staged: &mut super::path::StagedWriter,
+    sources: &[PathBuf],
+) -> crate::Result<()> {
+    let mut zip = zip::ZipWriter::new(staged.as_file_mut());
     let options: zip::write::FileOptions<()> =
         zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Deflated);
 
     for source in sources {
         add_to_zip(&mut zip, source, entry_name(source)?, options)?;
     }
-    let cursor = zip.finish().context("Couldn't finalise the zip archive")?;
-    Ok(cursor.into_inner())
+    zip.finish().context("Couldn't finalise the zip archive")?;
+    Ok(())
 }
 
 /// Recursively add a path to a ZIP under `name`.
@@ -172,18 +215,17 @@ fn add_to_7z<W: std::io::Write + std::io::Seek>(
     Ok(())
 }
 
-/// Build a 7z archive in memory.
-fn build_7z(sources: &[PathBuf]) -> crate::Result<Vec<u8>> {
-    let mut buf = std::io::Cursor::new(Vec::new());
-    let mut writer =
-        sevenz_rust2::ArchiveWriter::new(&mut buf).context("Couldn't create the 7z writer")?;
+/// Build a 7z archive straight into the staged destination.
+fn build_7z_into(staged: &mut super::path::StagedWriter, sources: &[PathBuf]) -> crate::Result<()> {
+    let mut writer = sevenz_rust2::ArchiveWriter::new(staged.as_file_mut())
+        .context("Couldn't create the 7z writer")?;
     for source in sources {
         add_to_7z(&mut writer, source, entry_name(source)?)?;
     }
     writer
         .finish()
         .context("Couldn't finalise the 7z archive")?;
-    Ok(buf.into_inner())
+    Ok(())
 }
 
 /// Create an archive on the remote machine.
@@ -245,47 +287,62 @@ fn apply(state: State) -> crate::Result<super::Return> {
         None => Format::from_path(&state.dest)?,
     };
 
-    eprintln!(
-        "archive {} source(s) -> {} ({:?})",
-        state.sources.len(),
-        state.dest.display(),
-        format,
+    let _ = crate::diff::note(
+        &mut std::io::stderr().lock(),
+        &format!(
+            "~ {} ({format:?}, {} source(s))",
+            state.dest.display(),
+            state.sources.len(),
+        ),
     );
 
-    let bytes = match format {
-        // Tar-based: build the tar stream, then hand it to the
-        // `compress` module's codec (no codec logic lives here).
-        // `None` means an uncompressed tar (== `Codec::Store`).
-        Format::Tar(codec) => {
-            let tar_bytes = build_tar(&state.sources)?;
-            super::compress::compress::inner(tar_bytes, codec.unwrap_or(super::Codec::Store))?
-        }
-        // Container formats carry their own per-entry compression.
-        Format::Zip => build_zip(&state.sources)?,
-        Format::SevenZ => build_7z(&state.sources)?,
-    };
-
-    // Check mode: building the bytes is pure computation, but whether
-    // the destination would change is `path::file`'s comparison, which
-    // needs the bytes. Report the conservative `Changed`.
+    // Check mode: archives embed timestamps and ordering, so the
+    // destination never converges and `Changed` is always the honest
+    // verdict. Say so *without* building anything — a check run must
+    // not even stage a temp file.
     if crate::dry_run() {
         return Ok(super::Return::Changed);
     }
 
-    // Materialise the archive via the `path` module: it owns the
-    // on-disk state-transition logic (replacing an existing file, dir,
-    // or symlink at `dest`) and emits the diff.
+    // Materialise the archive by streaming it into a staged temp file
+    // next to the destination and publishing via the `path` module's
+    // rename — the same shape `fetch` got. The whole build is
+    // O(buffers) in memory regardless of tree size; the old
+    // build-to-`Vec` path held the entire archive (and, for tar, the
+    // uncompressed stream *and* the compressed output) in RAM.
     // `path` requires a total owner/mode; archive only carries an
     // optional mode, so default the owner to the worker's identity and
     // an unspecified mode to `0o644`.
     let (user, group) = super::current_owner_names();
-    super::path::file_raw::inner(
-        state.dest,
-        bytes,
-        user,
-        group,
-        state.mode.unwrap_or(super::path::Mode(0o644)),
-    )?;
+    let mode = state.mode.unwrap_or(super::path::Mode(0o644));
+    match format {
+        // Tar-based: build the tar stream through the `compress`
+        // module's codec (no codec logic lives here). `None` means an
+        // uncompressed tar (== `Codec::Store`).
+        Format::Tar(codec) => {
+            super::path::file_from_writer(&state.dest, &user, &group, mode, |staged| {
+                build_tar_into(
+                    codec.unwrap_or(super::Codec::Store),
+                    staged,
+                    state
+                        .dest
+                        .parent()
+                        .filter(|p| !p.as_os_str().is_empty())
+                        .unwrap_or_else(|| std::path::Path::new(".")),
+                    &state.sources,
+                )
+            })?
+        }
+        // Container formats carry their own per-entry compression.
+        Format::Zip => super::path::file_from_writer(&state.dest, &user, &group, mode, |staged| {
+            build_zip_into(staged, &state.sources)
+        })?,
+        Format::SevenZ => {
+            super::path::file_from_writer(&state.dest, &user, &group, mode, |staged| {
+                build_7z_into(staged, &state.sources)
+            })?
+        }
+    }
     Ok(super::Return::Changed)
 }
 

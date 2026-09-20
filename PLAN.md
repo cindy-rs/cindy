@@ -41,17 +41,7 @@ containers:
   localhost harness passes no keys, so a sealed secret has never
   crossed the wire in a test;
 - preflight failure on a missing key (the worker must refuse before
-  any playbook code runs);
+   any playbook code runs);
 - `--limit` end to end (CLI-side host filtering; only unit-tested).
   The localhost harness can carry the first two with a real vault;
   `--limit` needs the CLI's play path.
-
-### `archive`/`unarchive` still buffer whole trees
-
-`crates/cindy/src/builtin/unarchive.rs:284` reads the whole archive into
-memory before handing it to `decompress::bounded`, and
-`archive.rs:62`/`:79` build tar and zip output in a `Vec<u8>`. The
-decompression *ceiling* (`2d2574b`) closed the OOM-on-hostile-input
-half; this is the remaining O(archive size) resident cost on ordinary
-input. Same treatment `fetch` got in `a9f7208` — tar, zip and 7z all
-support streaming readers.
