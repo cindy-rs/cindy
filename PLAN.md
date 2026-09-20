@@ -46,13 +46,6 @@ containers:
   The localhost harness can carry the first two with a real vault;
   `--limit` needs the CLI's play path.
 
-### Vault key rotation
-
-There is no `cindy secret vault rotate`. Recovering from a leaked key
-today means `unseal --all`, delete the key file by hand, `vault create`,
-`seal --all` — with plaintext transiently on disk and no atomicity. A
-first-class rotate belongs in the secrets story.
-
 ### `fetch` has no headers, auth, or proxy
 
 `a9f7208` made it stream and bounded it, but there's still no way to pass

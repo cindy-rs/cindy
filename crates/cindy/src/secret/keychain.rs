@@ -143,7 +143,13 @@ pub fn vault_key_path(vault: &str) -> crate::Result<PathBuf> {
     Ok(keys_dir().join(format!("{vault}.key")))
 }
 
-fn read_key_file(path: &Path) -> crate::Result<Option<VaultKey>> {
+/// Read a vault key from `path`, enforcing the length and wiping the
+/// intermediate buffer. `Ok(None)` when the file doesn't exist.
+///
+/// Public for the CLI's `vault rotate`, which manages the same key
+/// files during a rotation (reading the live and parked keys without
+/// installing either into the runtime keychain).
+pub fn read_vault_key_file(path: &Path) -> crate::Result<Option<VaultKey>> {
     use zeroize::Zeroize as _;
 
     let mut bytes = match std::fs::read(path) {
@@ -181,7 +187,7 @@ pub fn get_vault_key(vault: &str) -> crate::Result<VaultKey> {
         return Ok(key);
     }
     let path = vault_key_path(vault)?;
-    let Some(key) = read_key_file(&path)? else {
+    let Some(key) = read_vault_key_file(&path)? else {
         crate::bail!(
             "no key for vault `{vault}` \u{2014} expected {} to exist. \
              Either run `cindy secret vault create {vault}` to bootstrap a new vault, \

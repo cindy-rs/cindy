@@ -9,6 +9,11 @@
 //!
 //!   * `cindy secret vault create <name>` — write a fresh random key to
 //!     `keys/<name>.key` (mode 0600).
+//!   * `cindy secret vault rotate <name>` — replace the vault's key and
+//!     re-seal every `Secret::sealed_b64(...)` site of that vault in
+//!     place, with plaintext never touching disk and every crash
+//!     window recoverable by re-running the same command (see
+//!     [`vault_rotate`]).
 //!   * `cindy secret seal`   — encrypt `cindy::secret!(...)` calls in
 //!     source, rewriting the file in-place. Interactive picker on a
 //!     TTY (skippable with `--all`); missing vaults are an error.
@@ -72,6 +77,21 @@ pub enum VaultCommand {
         /// `keys/<name>.key` and inside `secret!("<name>", ...)`.
         name: String,
     },
+
+    /// Replace the key of `<name>` with a fresh one and re-seal every
+    /// `Secret::sealed_b64(...)` site of that vault in source, so a
+    /// leaked old key becomes useless. Recovering from this used to
+    /// mean `unseal --all`, delete the key by hand, `vault create`,
+    /// `seal --all` — plaintext transiently on disk, no atomicity.
+    ///
+    /// Every unseal→seal happens in memory; sites are rewritten one
+    /// file at a time (write-to-temp + rename), so a crash leaves
+    /// whole files on the old or new key — never half a ciphertext —
+    /// and re-running the command resumes and converges.
+    Rotate {
+        /// Vault name whose key and sealed sites move to a fresh key.
+        name: String,
+    },
 }
 
 /// True iff the requested subcommand needs the orchestrator binary
@@ -84,6 +104,7 @@ pub fn requires_orchestrator(cmd: &SecretCommand) -> bool {
 pub async fn dispatch(cmd: SecretCommand, orchestrator_path: Option<&Path>) -> eyre::Result<()> {
     match cmd {
         SecretCommand::Vault(VaultCommand::Create { name }) => vault_create(&name),
+        SecretCommand::Vault(VaultCommand::Rotate { name }) => vault_rotate(&name),
         SecretCommand::Seal { all } => {
             let orch = orchestrator_path
                 .expect("`Seal` requires an orchestrator path (see `requires_orchestrator`)");
@@ -102,7 +123,8 @@ fn vault_create(name: &str) -> eyre::Result<()> {
     if path.exists() {
         eyre::bail!(
             "{} already exists. Refusing to overwrite an existing vault key. \
-             If you really mean to rotate, delete the file by hand first.",
+             To replace it (and re-seal the vault's secrets onto the new key), \
+             run `cindy secret vault rotate {name}`.",
             path.display(),
         );
     }
@@ -138,6 +160,279 @@ fn write_new_vault_key(path: &Path) -> eyre::Result<()> {
     f.write_all(key.as_slice())
         .with_context(|| format!("Writing vault key to {}", path.display()))?;
     Ok(())
+}
+
+// ---------------------------------------------------------------------
+// vault rotate
+// ---------------------------------------------------------------------
+
+/// `keys/<name>.key.previous` — the pre-rotation key, parked while a
+/// rotation is in flight. Derived from the same validated name and
+/// keys directory as the live key (so `CINDY_KEYS_DIR` applies), and
+/// its presence is the resume marker: it is deleted only once every
+/// site of the vault decrypts under the new key.
+fn previous_key_path(vault: &str) -> eyre::Result<PathBuf> {
+    let live = keychain::vault_key_path(vault).map_err(|e| eyre::eyre!("{e:#}"))?;
+    Ok(live.with_file_name(format!("{vault}.key.previous")))
+}
+
+/// Read a key file that rotation has already staked its state on —
+/// `Ok(None)` here means it vanished mid-rotation, which is a resume
+/// case, not a fresh start.
+fn read_required_key(path: &Path) -> eyre::Result<cindy::secret::crypto::VaultKey> {
+    keychain::read_vault_key_file(path)
+        .map_err(|e| eyre::eyre!("{e:#}"))?
+        .with_context(|| {
+            format!(
+                "{} went missing mid-rotation — another cindy process may be \
+                 rotating the same vault; re-run this command to resume",
+                path.display()
+            )
+        })
+}
+
+/// Install `key` at `path` via write-to-temp + rename, mode 0600.
+/// Overwrites: rotation owns this path once the old key is parked at
+/// `.key.previous`.
+fn write_vault_key_overwrite(
+    path: &Path,
+    key: &cindy::secret::crypto::VaultKey,
+) -> eyre::Result<()> {
+    use std::io::Write as _;
+
+    let dir = path.parent().unwrap_or(Path::new("."));
+    let tmp = tempfile::NamedTempFile::new_in(dir)
+        .with_context(|| format!("Creating a temp key file next to {}", path.display()))?;
+    tmp.as_file()
+        .write_all(key.as_slice())
+        .with_context(|| format!("Writing the new vault key for {}", path.display()))?;
+    // NamedTempFile is created 0600, matching what `vault create`
+    // writes — key material should never be wider than that.
+    tmp.persist(path)
+        .with_context(|| format!("Installing the new vault key at {}", path.display()))?;
+    Ok(())
+}
+
+/// `cindy secret vault rotate <name>`: replace the vault's key and
+/// re-seal every `Secret::sealed_b64` site of that vault in place.
+///
+/// The old key is what leaked, so it must not survive the rotation;
+/// but deleting it before every blob is off it would make a crash
+/// unrecoverable. The resolution is the parked `.key.previous` file
+/// plus an ordering that makes every crash window a state the same
+/// command can resume:
+///
+/// | state on disk | meaning | action |
+/// |---|---|---|
+/// | `.key` only | no rotation in flight | fresh: park old as `.previous`, install new |
+/// | `.key` + `.previous` | rotation interrupted mid-reseal | resume: converge sites from either key, verify, delete `.previous` |
+/// | `.previous` only | died between parking the old key and installing the new one | nothing was ever sealed with a new key, so generate a fresh one and proceed |
+///
+/// The swap (park, then install) precedes all rewrites, which is what
+/// makes the third row safe. Every unseal→seal happens in memory;
+/// per-file rewrites are write-to-temp + rename, so a crash leaves
+/// whole files on the old or new key — never half a ciphertext.
+fn vault_rotate(vault: &str) -> eyre::Result<()> {
+    let live = keychain::vault_key_path(vault).map_err(|e| eyre::eyre!("{e:#}"))?;
+    let previous = previous_key_path(vault)?;
+
+    // --- settle the key files ---------------------------------------
+    let current: cindy::secret::crypto::VaultKey;
+    let old: cindy::secret::crypto::VaultKey;
+    if previous.exists() && live.exists() {
+        current = read_required_key(&live)?;
+        old = read_required_key(&previous)?;
+        if current.as_slice() == old.as_slice() {
+            eyre::bail!(
+                "{} and {} hold the same key — that isn't a rotation state. \
+                 Inspect the keys directory by hand and remove whichever is wrong.",
+                live.display(),
+                previous.display()
+            );
+        }
+        tracing::info!("resuming an interrupted rotation of vault `{vault}`");
+    } else if previous.exists() {
+        // `.key` missing: the process died between parking the old key
+        // and installing the new one. The swap precedes all rewrites,
+        // so nothing was ever sealed with any new key — a fresh one is
+        // safe and the interrupted new key (never on disk) is moot.
+        old = read_required_key(&previous)?;
+        current = cindy::secret::crypto::generate_vault_key();
+        write_vault_key_overwrite(&live, &current)?;
+        tracing::info!("completing an interrupted key swap for vault `{vault}`");
+    } else if live.exists() {
+        old = read_required_key(&live)?;
+        current = cindy::secret::crypto::generate_vault_key();
+        std::fs::rename(&live, &previous)
+            .with_context(|| format!("Parking the old key at {}", previous.display()))?;
+        write_vault_key_overwrite(&live, &current)?;
+    } else {
+        eyre::bail!(
+            "no vault `{vault}` at {} — create it with \
+             `cindy secret vault create {vault}` first",
+            live.display()
+        );
+    }
+
+    // --- collect this vault's sealed sites --------------------------
+    let (workspace_root, cindy_names) = workspace_and_names()?;
+    let files = walk_rs_files(&workspace_root);
+    let mut per_file = Vec::new();
+    for file in &files {
+        let collected = collect_sealed_sites(file)?;
+        if collected.sites.iter().any(|s| s.vault == vault) {
+            per_file.push(collected);
+        }
+    }
+
+    // --- re-seal pass: converge every site onto the current key -----
+    let mut affected = Vec::new();
+    let mut converged = 0usize;
+    let mut resealed = 0usize;
+    for fs in &per_file {
+        let (c, r) = rotate_sites(fs, vault, &current, &old, cindy_names.for_file(&fs.path))?;
+        if r > 0 {
+            affected.push(fs.path.clone());
+        }
+        converged += c;
+        resealed += r;
+    }
+    if !affected.is_empty() {
+        cargo_fmt(&affected);
+    }
+
+    // --- verify: every site must decrypt under the current key ------
+    // Re-collect, not reuse: the rewrites changed byte offsets (and
+    // cargo fmt may have reflowed lines). A failure here keeps
+    // `.previous` in place for the resume path.
+    let mut verified = 0usize;
+    for file in &files {
+        let fs = collect_sealed_sites(file)?;
+        for site in &fs.sites {
+            if site.vault != vault {
+                continue;
+            }
+            let ciphertext = base64::engine::general_purpose::STANDARD
+                .decode(site.ciphertext_b64.as_bytes())
+                .with_context(|| {
+                    format!(
+                        "{}:{}:{}: ciphertext is not valid base64 after rotation",
+                        fs.path.display(),
+                        site.line,
+                        site.column
+                    )
+                })?;
+            crypto::unseal(&current, &ciphertext).map_err(|e| {
+                eyre::eyre!(
+                    "{}:{}:{}: vault `{vault}` site doesn't decrypt under the new key \
+                     ({e}); the previous key is kept at {}. Fix or remove the site, \
+                     then re-run `cindy secret vault rotate {vault}` to resume.",
+                    fs.path.display(),
+                    site.line,
+                    site.column,
+                    previous.display()
+                )
+            })?;
+            verified += 1;
+        }
+    }
+    if verified != converged + resealed {
+        eyre::bail!(
+            "site count changed during rotation ({verified} verified, \
+             {} seen) — a concurrent edit raced the rewrites. The previous key \
+             is kept at {}; re-run to resume",
+            converged + resealed,
+            previous.display()
+        );
+    }
+
+    // --- success: destroy the old key -------------------------------
+    std::fs::remove_file(&previous)
+        .with_context(|| format!("Deleting the parked old key {}", previous.display()))?;
+    println!(
+        "rotated vault `{vault}`: {resealed} secret(s) re-sealed onto the new key at {}",
+        live.display()
+    );
+    if converged > 0 {
+        println!("({converged} site(s) had already converged from an interrupted run)");
+    }
+    println!(
+        "the previous key was destroyed; any copy of it that leaked is now \
+         useless for this vault's ciphertexts"
+    );
+    Ok(())
+}
+
+/// Re-seal every site of `vault` in one file onto `current`, reading
+/// blobs still sealed with `old`. Returns `(already converged,
+/// re-sealed)`. A blob decrypting under neither key is a hard error:
+/// this file stays untouched (the rewrites are all-or-nothing per
+/// file) and the caller keeps the old key for recovery.
+fn rotate_sites(
+    fs: &FileSites,
+    vault: &str,
+    current: &cindy::secret::crypto::VaultKey,
+    old: &cindy::secret::crypto::VaultKey,
+    cindy_name: &str,
+) -> eyre::Result<(usize, usize)> {
+    let FileSites {
+        path,
+        original,
+        sites,
+    } = fs;
+
+    let mut planned: Vec<(usize, usize, String)> = Vec::new();
+    let mut converged = 0usize;
+    let mut resealed = 0usize;
+    for site in sites {
+        if site.vault != vault {
+            continue;
+        }
+        let ciphertext = base64::engine::general_purpose::STANDARD
+            .decode(site.ciphertext_b64.as_bytes())
+            .with_context(|| {
+                format!(
+                    "{}:{}:{}: ciphertext for vault `{vault}` is not valid base64",
+                    path.display(),
+                    site.line,
+                    site.column
+                )
+            })?;
+        if crypto::unseal(current, &ciphertext).is_ok() {
+            // Already on the new key — an interrupted run got this far.
+            converged += 1;
+            continue;
+        }
+        let plaintext = crypto::unseal(old, &ciphertext).map_err(|e| {
+            eyre::eyre!(
+                "{}:{}:{}: decrypting vault `{vault}` for rotation: {e}. Neither \
+                 the new nor the previous key opens this blob; this file is \
+                 untouched and the previous key is kept — fix or remove the \
+                 site, then re-run `cindy secret vault rotate {vault}` to resume",
+                path.display(),
+                site.line,
+                site.column
+            )
+        })?;
+        let new_ciphertext = crypto::seal(current, &plaintext).map_err(|e| {
+            eyre::eyre!(
+                "{}:{}:{}: re-sealing vault `{vault}` onto the new key: {e}",
+                path.display(),
+                site.line,
+                site.column
+            )
+        })?;
+        let new_b64 = base64::engine::general_purpose::STANDARD.encode(&new_ciphertext);
+        planned.push((
+            site.byte_start,
+            site.byte_end,
+            format!("::{cindy_name}::Secret::sealed_b64({vault:?}, {new_b64:?})"),
+        ));
+        resealed += 1;
+    }
+
+    apply_planned_replacements(path, original, &mut planned)?;
+    Ok((converged, resealed))
 }
 
 // ---------------------------------------------------------------------
@@ -773,6 +1068,165 @@ mod seal_unseal_roundtrip_tests {
             std::fs::read_to_string(&file).unwrap(),
             format!("::infra::secret!(\"rt-vault-x8\", {source_tokens});\n"),
         );
+    }
+}
+
+#[cfg(test)]
+mod rotation_tests {
+    use super::*;
+
+    fn seal_with(key: &cindy::secret::crypto::VaultKey, source_tokens: &str) -> String {
+        let payload = cindy::secret::SealedPayload {
+            value: postcard::to_allocvec(&("u", "p")).unwrap(),
+            source: source_tokens.to_owned(),
+        };
+        let ciphertext =
+            cindy::secret::crypto::seal(key, &postcard::to_allocvec(&payload).unwrap()).unwrap();
+        base64::engine::general_purpose::STANDARD.encode(&ciphertext)
+    }
+
+    /// The core promise: after rotation the site's ciphertext opens
+    /// under the new key, refuses the old one (by name — the leaked
+    /// key is the whole point), and the unseal round-trip still
+    /// restores the original source tokens.
+    #[test]
+    fn rotation_reseals_onto_the_new_key_and_old_key_cannot_read_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("playbook.rs");
+
+        let source_tokens = "Creds { user: \"u\".into(), pw: \"p\".into() }";
+        let old_key = cindy::secret::crypto::generate_vault_key();
+        let old_b64 = seal_with(&old_key, source_tokens);
+        std::fs::write(
+            &file,
+            format!("::cindy::Secret::sealed_b64(\"rt-rot-x9\", {old_b64:?});\n"),
+        )
+        .unwrap();
+
+        let fs_sites = collect_sealed_sites(&file).unwrap();
+        assert_eq!(fs_sites.sites.len(), 1);
+
+        let new_key = cindy::secret::crypto::generate_vault_key();
+        let (converged, resealed) =
+            rotate_sites(&fs_sites, "rt-rot-x9", &new_key, &old_key, "cindy").unwrap();
+        assert_eq!((converged, resealed), (0, 1));
+
+        // The rewritten file is still a findable sealed call, and the
+        // ciphertext is NEW (not a re-emission of the old b64).
+        let after = collect_sealed_sites(&file).unwrap();
+        assert_eq!(after.sites.len(), 1);
+        assert_ne!(after.sites[0].ciphertext_b64, old_b64);
+
+        let new_ct = base64::engine::general_purpose::STANDARD
+            .decode(after.sites[0].ciphertext_b64.as_bytes())
+            .unwrap();
+        assert!(cindy::secret::crypto::unseal(&new_key, &new_ct).is_ok());
+        let err = cindy::secret::crypto::unseal(&old_key, &new_ct).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("AEAD decryption failed"), "got: {msg}");
+        assert!(!msg.contains("version"), "got: {msg}");
+
+        // End to end: with the new key installed, unseal restores the
+        // original source expression.
+        let mut chain = std::collections::HashMap::new();
+        chain.insert("rt-rot-x9".to_owned(), new_key);
+        cindy::secret::keychain::install_keys(chain);
+        let count = unseal_sites(&after, "cindy").unwrap();
+        assert_eq!(count, 1);
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            format!("::cindy::secret!(\"rt-rot-x9\", {source_tokens});\n"),
+        );
+    }
+
+    /// The resume path: a run interrupted mid-reseal leaves some sites
+    /// on the new key and some on the old. A second pass must converge
+    /// both without touching the already-done one.
+    #[test]
+    fn resumed_rotation_converges_mixed_sites() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("playbook.rs");
+
+        let old_key = cindy::secret::crypto::generate_vault_key();
+        let new_key = cindy::secret::crypto::generate_vault_key();
+        let old_b64 = seal_with(&old_key, "1");
+        let new_b64 = seal_with(&new_key, "2");
+        std::fs::write(
+            &file,
+            format!(
+                "a: ::cindy::Secret::sealed_b64(\"rt-rot-x10\", {old_b64:?});\n\
+                 b: ::cindy::Secret::sealed_b64(\"rt-rot-x10\", {new_b64:?});\n"
+            ),
+        )
+        .unwrap();
+
+        let fs_sites = collect_sealed_sites(&file).unwrap();
+        assert_eq!(fs_sites.sites.len(), 2);
+
+        let (converged, resealed) =
+            rotate_sites(&fs_sites, "rt-rot-x10", &new_key, &old_key, "cindy").unwrap();
+        assert_eq!((converged, resealed), (1, 1));
+
+        // Both sites now open under the new key, and the file still
+        // holds two findable sealed calls.
+        let after = collect_sealed_sites(&file).unwrap();
+        assert_eq!(after.sites.len(), 2);
+        for site in &after.sites {
+            let ct = base64::engine::general_purpose::STANDARD
+                .decode(site.ciphertext_b64.as_bytes())
+                .unwrap();
+            assert!(cindy::secret::crypto::unseal(&new_key, &ct).is_ok());
+        }
+    }
+
+    /// Rotation is vault-scoped: a site of another vault in the same
+    /// file must come through byte-for-byte identical.
+    #[test]
+    fn other_vaults_are_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("playbook.rs");
+
+        let old_key = cindy::secret::crypto::generate_vault_key();
+        let new_key = cindy::secret::crypto::generate_vault_key();
+        let bystander_key = cindy::secret::crypto::generate_vault_key();
+        let rotated_b64 = seal_with(&old_key, "1");
+        let bystander_b64 = seal_with(&bystander_key, "2");
+        std::fs::write(
+            &file,
+            format!(
+                "a: ::cindy::Secret::sealed_b64(\"rt-rot-x11\", {rotated_b64:?});\n\
+                 b: ::cindy::Secret::sealed_b64(\"rt-rot-bystander\", {bystander_b64:?});\n"
+            ),
+        )
+        .unwrap();
+
+        let fs_sites = collect_sealed_sites(&file).unwrap();
+        let (_, resealed) =
+            rotate_sites(&fs_sites, "rt-rot-x11", &new_key, &old_key, "cindy").unwrap();
+        assert_eq!(resealed, 1);
+
+        let after = collect_sealed_sites(&file).unwrap();
+        let bystander = after
+            .sites
+            .iter()
+            .find(|s| s.vault == "rt-rot-bystander")
+            .unwrap();
+        assert_eq!(bystander.ciphertext_b64, bystander_b64);
+    }
+
+    /// Key installation for rotation keeps the mode `vault create`
+    /// writes — 0600, never wider.
+    #[cfg(unix)]
+    #[test]
+    fn overwrite_keeps_key_file_mode_0600() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rotated.key");
+        let key = cindy::secret::crypto::generate_vault_key();
+        write_vault_key_overwrite(&path, &key).unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
     }
 }
 
