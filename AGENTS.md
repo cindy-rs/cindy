@@ -18,9 +18,11 @@ GLM, GPT, ...) collaborate here alongside the human owner.
 - Verify before committing, with the same commands CI runs (below) — including
   `cargo fmt --check` and clippy's `--all-targets -- -D warnings`. A plain
   `cargo clippy --workspace` passes where CI fails.
-- Outstanding work lives in [PLAN.md](PLAN.md). Delete an item there in the same
-  commit that implements it; if you decide *against* one, move it to the settled
-  decisions below rather than dropping it.
+- Outstanding work is not parked in a plan file: PLAN.md was consumed once
+  every item had either shipped (each deleted in the commit that implemented
+  it) or been moved to the settled decisions below. Keep that shape —
+  rationale lives in commit messages and settled decisions, and new work goes
+  through the owner before it lands anywhere.
 - Never run `cindy play` (or anything else that deploys to real hosts). The human
   runs plays; compiling/building steps are fine. The human's real playbook lives at
   `/home/martin/files/projects/home-infra` — don't modify it unasked.
@@ -141,6 +143,15 @@ new information.
   gets its own orchestrator process with no cross-host coordination point — so
   `--serial N` would have to be built as one orchestrator driving hosts in
   batches, not a per-playbook workaround.
+- **The `nix 0.31.3` future-incompat warning stays.** Every build prints it;
+  it is blocked upstream — the lint is a trailing semicolon in a macro used in
+  expression position, in nix's own `build.rs` (`cfg_aliases!`), no fixed
+  release exists to bump to, and future-incompat lints are exempt from
+  `--cap-lints=allow`, so it can't even be silenced for a transitive
+  dependency. An informed wait with a tripwire, not a workaround: bump `nix`
+  when a release ships the fix and the warning dies. Pinning the toolchain
+  was rejected — this repo floats nightly by design (tier-3 builds need
+  `-Zbuild-std`), so a pin trades the warning for a bigger problem.
 
 ## Practices learned the hard way
 
