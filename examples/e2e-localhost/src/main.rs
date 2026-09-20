@@ -309,7 +309,10 @@ async fn main(host: cindy::Host<Vars>) -> cindy::Result<()> {
             url: host.vars.fetch_url_authed.clone(),
             dest: authed_ok.clone(),
             checksum: Some(fetch::Checksum::Sha256(host.vars.fetch_sha256.clone())),
-            headers: vec![("Authorization".into(), "Bearer cindy-e2e-token".into())],
+            headers: vec![(
+                "Authorization".into(),
+                fetch::HeaderValue::new("Bearer cindy-e2e-token")?,
+            )],
             ..Default::default()
         })
         .await?
@@ -342,7 +345,10 @@ async fn main(host: cindy::Host<Vars>) -> cindy::Result<()> {
             url: host.vars.fetch_url_authed.clone(),
             dest: authed_ok.clone(),
             checksum: Some(fetch::Checksum::Sha256(host.vars.fetch_sha256.clone())),
-            headers: vec![("Authorization".into(), "Bearer wrong-token".into())],
+            headers: vec![(
+                "Authorization".into(),
+                fetch::HeaderValue::new("Bearer wrong-token")?,
+            )],
             ..Default::default()
         })
         .await?

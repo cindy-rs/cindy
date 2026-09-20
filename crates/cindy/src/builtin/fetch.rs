@@ -173,12 +173,75 @@ pub struct State {
     /// fixed timeout.
     pub timeout: Option<std::time::Duration>,
     /// Extra request headers, applied verbatim — e.g.
-    /// `Authorization: Bearer …` for a private GitHub release. Header
-    /// values often carry secrets: they are never logged (the run-view
-    /// line is `dest <- url`), and revealing them from a
-    /// [`Secret`](crate::secret::Secret) inside the remote fn before
-    /// building the `State` is the intended shape.
-    pub headers: Vec<(String, String)>,
+    /// `Authorization: Bearer …` for a private GitHub release.
+    ///
+    /// Values are [`HeaderValue`]s, which redact themselves: `Debug`
+    /// renders every one of them as `Sensitive`, because header values
+    /// routinely carry credentials and this `State` is otherwise an
+    /// ordinary `#[crate::wire]` struct with a derived `Debug`. Without
+    /// that, one `dbg!(&state)` or `bail!("{state:?}")` in a playbook
+    /// would put a bearer token in the run view. Reveal from a
+    /// [`Secret`](crate::secret::Secret) inside the remote fn when
+    /// building the `State`; cindy's own paths never log a value (the
+    /// run-view line is `dest <- url`).
+    pub headers: Vec<(String, HeaderValue)>,
+}
+
+/// A request header value that never prints itself.
+///
+/// Wraps `http::HeaderValue` (via ureq's re-export, so no new
+/// dependency) purely to carry it over the postcard RPC wire: the
+/// upstream type has no serde impls, but its `Debug` already writes
+/// `Sensitive` for a value marked sensitive — which is exactly the
+/// redaction wanted, from the crate that owns the concept, rather than
+/// a hand-rolled one.
+///
+/// Every value is marked sensitive on construction and after transport.
+/// A non-secret header therefore also reads as `Sensitive` in a debug
+/// dump; that is the right default for a field whose whole purpose is
+/// carrying credentials.
+#[derive(Clone, PartialEq, Eq)]
+pub struct HeaderValue(ureq::http::HeaderValue);
+
+impl HeaderValue {
+    /// Build a header value, rejecting bytes a header can't carry
+    /// (control characters, newlines — the header-injection shapes).
+    pub fn new(value: impl AsRef<[u8]>) -> crate::Result<Self> {
+        let mut inner = ureq::http::HeaderValue::from_bytes(value.as_ref())
+            .map_err(|e| anyhow_serde::Error::msg(format!("invalid header value: {e}")))?;
+        inner.set_sensitive(true);
+        Ok(Self(inner))
+    }
+
+    fn as_str(&self) -> crate::Result<&str> {
+        self.0
+            .to_str()
+            .map_err(|e| anyhow_serde::Error::msg(format!("header value is not valid UTF-8: {e}")))
+    }
+}
+
+/// Deliberately not the derived impl: this is the whole point of the
+/// newtype. Delegates to `http`'s, which writes `Sensitive`.
+impl std::fmt::Debug for HeaderValue {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl serde::Serialize for HeaderValue {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_bytes(self.0.as_bytes())
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for HeaderValue {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        use serde::de::Error as _;
+        let bytes = <Vec<u8> as serde::Deserialize>::deserialize(deserializer)?;
+        // Re-marked sensitive on arrival: the flag is local state on
+        // the upstream type, not something the bytes carry.
+        Self::new(&bytes).map_err(D::Error::custom)
+    }
 }
 
 /// `url` with any `user:password@` userinfo replaced.
@@ -381,7 +444,7 @@ fn apply(state: State) -> crate::Result<super::Return> {
     for (name, value) in &state.headers {
         // ureq defers header validation to `call()`, so a bad name or
         // value surfaces as the request's own error, wrapped below.
-        request = request.header(name.as_str(), value.as_str());
+        request = request.header(name.as_str(), value.as_str()?);
     }
     let mut response = request.call().context(format!("GET {url} failed"))?;
 
@@ -531,6 +594,56 @@ mod tests {
         );
         // A sha256-length string in a Sha512 slot is a mixed-up algorithm.
         assert!(Checksum::Sha512(BODY_SHA256.to_owned()).validate().is_err());
+    }
+
+    /// The point of the newtype: a header value must never appear in a
+    /// debug rendering of the `State` that carries it. `#[crate::wire]`
+    /// derives `Debug` on `State`, so this is the only thing standing
+    /// between a bearer token and the run view.
+    #[test]
+    fn header_values_never_debug_print_themselves() {
+        let state = State {
+            url: "https://example.com/a".into(),
+            headers: vec![(
+                "Authorization".to_owned(),
+                HeaderValue::new("Bearer s3kr1t-token").unwrap(),
+            )],
+            ..State::default()
+        };
+        let rendered = format!("{state:?}");
+        assert!(!rendered.contains("s3kr1t-token"), "{rendered}");
+        assert!(!rendered.contains("Bearer"), "{rendered}");
+        // The header's *name* stays visible — knowing an Authorization
+        // header was sent is diagnostic, its value is not.
+        assert!(rendered.contains("Authorization"), "{rendered}");
+        assert!(rendered.contains("Sensitive"), "{rendered}");
+        // Control: the URL is still rendered, so this isn't passing
+        // because the whole struct went opaque.
+        assert!(rendered.contains("example.com"), "{rendered}");
+    }
+
+    /// The sensitive flag is local state on `http::HeaderValue`, not
+    /// something the serialised bytes carry — so it has to be re-applied
+    /// on the far side of the wire, or the worker's own debug output
+    /// would leak what the orchestrator's did not.
+    #[test]
+    fn redaction_survives_the_rpc_wire() {
+        let before = HeaderValue::new("Bearer s3kr1t-token").unwrap();
+        let bytes = postcard::to_allocvec(&before).unwrap();
+        let after: HeaderValue = postcard::from_bytes(&bytes).unwrap();
+        assert_eq!(after, before, "value must round-trip intact");
+        assert_eq!(format!("{after:?}"), "Sensitive");
+        assert_eq!(after.as_str().unwrap(), "Bearer s3kr1t-token");
+    }
+
+    #[test]
+    fn header_values_reject_injection_shapes() {
+        // A newline in a header value is header injection; `http`
+        // refuses it and so must we.
+        assert!(HeaderValue::new("ok").is_ok());
+        assert!(HeaderValue::new("bad\r\nX-Evil: 1").is_err());
+        assert!(HeaderValue::new("bad\nvalue").is_err());
+        assert!(HeaderValue::new("bad\0value").is_err());
     }
 
     #[test]

@@ -159,6 +159,18 @@ fn write_new_vault_key(path: &Path) -> eyre::Result<()> {
         .with_context(|| format!("Creating {} (refusing to overwrite)", path.display()))?;
     f.write_all(key.as_slice())
         .with_context(|| format!("Writing vault key to {}", path.display()))?;
+    // A key that reached the directory listing but not the platter is
+    // worse than no key at all: everything sealed under it is
+    // unrecoverable, and the operator has no reason to suspect it.
+    // `create_new` means there's no rename to make durable, only the
+    // bytes and the new directory entry.
+    f.sync_all()
+        .with_context(|| format!("Flushing the vault key at {}", path.display()))?;
+    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        std::fs::File::open(parent)
+            .and_then(|d| d.sync_all())
+            .with_context(|| format!("Flushing the directory entry for {}", path.display()))?;
+    }
     Ok(())
 }
 
@@ -208,8 +220,34 @@ fn write_vault_key_overwrite(
         .with_context(|| format!("Writing the new vault key for {}", path.display()))?;
     // NamedTempFile is created 0600, matching what `vault create`
     // writes — key material should never be wider than that.
-    tmp.persist(path)
+    persist_durably(tmp, path)
         .with_context(|| format!("Installing the new vault key at {}", path.display()))?;
+    Ok(())
+}
+
+/// `persist`, with the file's bytes and the rename both made durable.
+///
+/// A plain `persist` can publish a rename whose data hasn't reached the
+/// platter: after a power cut the key file exists and is empty or
+/// partial. For an ordinary file that means "redeploy it"; for a vault
+/// key it can mean every blob sealed under it is gone — and a completed
+/// `rotate` has already destroyed `.previous`, so there is nothing to
+/// recover from. `path::stage_stream` takes the same care for far less
+/// valuable bytes.
+fn persist_durably(tmp: tempfile::NamedTempFile, path: &Path) -> eyre::Result<()> {
+    tmp.as_file().sync_all().with_context(|| {
+        format!(
+            "Flushing the key bytes before installing them at {}",
+            path.display()
+        )
+    })?;
+    tmp.persist(path)?;
+    // The rename itself, so the directory entry survives too.
+    let dir = path.parent().filter(|p| !p.as_os_str().is_empty());
+    let dir = dir.unwrap_or_else(|| Path::new("."));
+    std::fs::File::open(dir)
+        .and_then(|d| d.sync_all())
+        .with_context(|| format!("Flushing the directory entry for {}", path.display()))?;
     Ok(())
 }
 
