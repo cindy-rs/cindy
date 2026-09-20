@@ -129,8 +129,17 @@ new information.
   `Debug`/`Serialize` stay redacting; diffs deliberately don't.
 - **No value-based secret masking** (scanning output for known secret values):
   misses anything transformed, and mangles diffs when a value is short or common.
-- **Diffs are not opt-in.** An operator should be able to introspect a deploy
-  without a flag. A `--no-diff` for CI logs is still open.
+- **Diffs are not opt-in.** An operator should be able to introspect a
+  deploy without a flag. The parked CI idea is a `--headless` mode, *not*
+  `--no-diff`: suppressing diffs is backwards (CI is where the change record
+  matters most, and gets archived) and wouldn't contain secrets anyway — any
+  forwarded stderr line can carry them, so the controllable unit is where the
+  output goes, not which segments it has. The shape: force plain output (the
+  off-tty stream already skips the TUI) and turn the run into a JSON-lines
+  event stream for an external auditing tool — the progress channel already
+  carries every event needed (host adds, tagged lines, statuses, diff notes),
+  so headless is a new subscriber, not new instrumentation. `--check
+  --headless` is the CI merge-gate: exit code decides, events get archived.
 - **No AAD on sealed ciphertexts.** The threat model it defends — rearranging
   ciphertexts without code execution — doesn't exist when ciphertexts live in
   playbook source. The version byte was the half worth keeping (`9c6234a`).
