@@ -27,8 +27,9 @@ GLM, GPT, ...) collaborate here alongside the human owner.
 
 ## Commands
 
-These are what `.gitlab-ci.yml` runs; match them exactly or CI will disagree
-with your local pass.
+These are what `.github/workflows/ci.yml` runs; match them exactly or CI will
+disagree with your local pass. (`.gitlab-ci.yml` is kept for the GitLab mirror
+and lists the same checks, minus the container suite.)
 
 ```sh
 cargo check --workspace                              # fast type check
@@ -36,7 +37,7 @@ cargo fmt --check                                    # CI fails on any drift
 cargo clippy --workspace --all-targets -- -D warnings # lints
 cargo test --workspace                               # unit + e2e
 cargo test -p e2e-localhost    # e2e alone; slow (builds two binaries), hermetic
-cargo test -p e2e-containers   # mutating-builtins e2e; needs podman, skips without it
+cargo test -p e2e-containers   # mutating-builtins e2e; needs a container engine
 cargo audit                    # vulnerabilities; must stay empty
 
 # The site is a nested workspace — the root commands don't reach it.

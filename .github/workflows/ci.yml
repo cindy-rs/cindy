@@ -1,0 +1,115 @@
+# Mirror of the checks in .gitlab-ci.yml, for the repository's actual
+# home (github.com/cindy-rs/cindy).
+#
+# No docker-in-docker anywhere, and none needed: a GitHub-hosted
+# `ubuntu-*` runner is a **virtual machine** with a real Docker daemon
+# already running, not a container. `/var/run/docker.sock` is there, so
+# testcontainers — and therefore examples/e2e-containers — works with
+# no service, no privileged mode and no DOCKER_HOST. (dind exists on
+# GitLab because its runners execute jobs *inside* containers, so
+# nesting needs help. There is nothing to nest here.)
+#
+# Two consequences worth knowing:
+#   * `container:` on a job would put us back inside a container, and
+#     the socket would then need mounting. Don't, unless you must.
+#   * macOS and Windows runners have no usable Linux Docker daemon, so
+#     the container suite is ubuntu-only.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# A new push to the same ref makes the older run pointless.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # Fail on warnings in CI without needing `-D warnings` on every call.
+  RUSTFLAGS: -D warnings
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Nightly: cindy's MSRV is 1.98 but tier-3 worker builds need
+      # -Zbuild-std, and rustfmt/clippy come from the same toolchain.
+      - name: Install Rust nightly
+        run: |
+          rustup toolchain install nightly --profile minimal \
+            --component rustfmt,clippy
+          rustup default nightly
+          rustup component add rust-src
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Format
+        run: cargo fmt --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      # `cargo test --workspace` includes examples/e2e-containers, which
+      # needs the runner's Docker daemon. CINDY_E2E_CONTAINER_CLI is set
+      # explicitly rather than left to detection: the runner image ships
+      # *both* podman and docker, and the live engine is Docker's — a
+      # podman CLI against a Docker daemon can't see its containers.
+      - name: Test
+        env:
+          CINDY_E2E_CONTAINER_CLI: docker
+        run: cargo test --workspace
+
+      # Proves the container suite actually ran rather than skipping.
+      # It fails by default when no engine is present, so a green Test
+      # step already implies it ran — this makes that explicit and
+      # would catch a future default flipping back to skip.
+      - name: Container e2e ran (not skipped)
+        env:
+          CINDY_E2E_CONTAINER_CLI: docker
+        run: |
+          cargo test -p e2e-containers -- --nocapture 2>&1 | tee out.txt
+          if grep -q "skipping container e2e" out.txt; then
+            echo "::error::container e2e skipped; it must run in CI"
+            exit 1
+          fi
+
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: rustsec/audit-check@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+  web:
+    # The marketing site is a nested workspace; the root commands don't
+    # reach it, so it gets its own job (as in .gitlab-ci.yml).
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust nightly with wasm
+        run: |
+          rustup toolchain install nightly --profile minimal --component rustfmt
+          rustup default nightly
+          rustup target add wasm32-unknown-unknown
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: web
+
+      - name: Format
+        run: cargo fmt --check --manifest-path web/Cargo.toml
+
+      # `dx` compiles tailwind.css into assets/; raw cargo only needs
+      # the file to exist — its content doesn't affect compilation.
+      - name: Check (wasm)
+        run: |
+          cp web/tailwind.css web/assets/tailwind.css
+          cargo check --manifest-path web/Cargo.toml \
+            --target wasm32-unknown-unknown

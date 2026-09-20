@@ -22,36 +22,6 @@ Every build prints a future-incompatibility warning for `nix`. Blocked
 upstream: bump when a fixed release exists. Until then it's noise that
 trains people to ignore warnings.
 
-## P1 — blocked on a decision
-
-### Run the container e2e in CI
-
-`examples/e2e-containers` now fails rather than skips without a
-container engine, and the pipeline has none — so `check.test` would go
-red today if it ran `cargo test --workspace` unchanged. **The human
-wants these running in CI**, which needs an engine in the job, and that
-is a runner-capability question rather than a code one.
-
-What the harness already supports, so no code change is needed for
-either shape: `DOCKER_HOST` for the socket, `CINDY_E2E_CONTAINER_CLI`
-to pick `docker` over `podman`, and `CINDY_E2E_SYSTEMD_IMAGE` to use a
-prebuilt image instead of building in the test job.
-
-The obvious shape is a `docker:dind` service — and `.gitlab-ci.yml`
-already carries an unused `image_docker_dind` anchor from the pipeline
-it was modelled on. But dind needs a **privileged** runner, and the
-evidence points the other way: `image.build` uses
-`moby/buildkit:…-rootless` with `--oci-worker-no-process-sandbox`,
-which is precisely the pattern for runners that *can't* go privileged.
-
-So, to answer before writing the job: is the runner privileged (or can
-a privileged one be tagged for this job)? If yes — dind service,
-`DOCKER_HOST=tcp://docker:2375`, `CINDY_E2E_CONTAINER_CLI=docker`, and
-build the systemd image in the existing buildkit job and push it to
-`$CI_REGISTRY_IMAGE/systemd:$CI_COMMIT_SHA` so the test job pulls
-rather than builds. If no, the options get narrower and worse, and
-worth discussing before anyone starts.
-
 ## P3 — architecture
 
 ### Integration coverage for the secrets and CLI paths

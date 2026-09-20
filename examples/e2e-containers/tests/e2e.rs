@@ -21,10 +21,12 @@
 //! stderr"). So the worker is spawned with a CLI `exec -i`, which is
 //! also the closest analogue to the SSH child `cindy play` really uses.
 //!
-//! That one CLI call is engine-agnostic: `podman` is preferred,
-//! `docker` used when it's what's present, `CINDY_E2E_CONTAINER_CLI`
-//! forces one. Everything else talks to whatever `DOCKER_HOST` points
-//! at. `CINDY_E2E_SYSTEMD_IMAGE` names a prebuilt image instead of
+//! That one CLI call is engine-agnostic, and the CLI is *derived from
+//! the engine socket* rather than probed separately — see
+//! [`negotiate`], which exists because picking them independently
+//! pairs a podman CLI with a Docker daemon on any machine that has
+//! both. `CINDY_E2E_CONTAINER_CLI` forces the choice;
+//! `CINDY_E2E_SYSTEMD_IMAGE` names a prebuilt image instead of
 //! building, which is how CI skips a build in the test job.
 
 use std::path::{Path, PathBuf};
@@ -48,33 +50,102 @@ const MASTER_WORKER: &str = "/worker/e2e-worker.orig";
 /// Per-play copy, consumed by the worker unlinking itself.
 const STAGED_WORKER: &str = "/worker/e2e-worker";
 
-/// The container CLI to drive. Preference order is podman then docker;
-/// `CINDY_E2E_CONTAINER_CLI` overrides. Resolved once — the answer
-/// can't change mid-suite, and probing per call would be noise.
+/// The negotiated CLI, or `None` if no engine was found. See
+/// [`negotiate`] — this is just its happy path.
 fn container_cli() -> Option<&'static str> {
-    static CLI: OnceLock<Option<&'static str>> = OnceLock::new();
-    *CLI.get_or_init(|| {
-        let usable = |cli: &str| {
-            Command::new(cli)
-                .arg("--version")
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status()
-                .map(|s| s.success())
-                .unwrap_or(false)
+    negotiate().as_ref().ok().copied()
+}
+
+/// Can this CLI be executed at all?
+fn cli_runs(cli: &str) -> bool {
+    Command::new(cli)
+        .arg("--version")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+/// Settle on an engine *and* the CLI that speaks to it, as one
+/// decision, returning the CLI.
+///
+/// One decision on purpose. Choosing them separately lets them
+/// disagree, and the failure is baffling: a GitHub Actions runner has
+/// both CLIs installed and Docker's socket live, so "prefer podman"
+/// picks a CLI that cannot see a container the Docker engine created,
+/// and `exec` fails with "no such container" while the container is
+/// plainly running. Deriving the CLI from the socket makes that
+/// unrepresentable.
+///
+/// Order:
+///
+/// 1. `CINDY_E2E_CONTAINER_CLI` wins, and `DOCKER_HOST` (or bollard's
+///    default) is trusted to match it — if you name the CLI, you own
+///    the pairing.
+/// 2. An explicit `DOCKER_HOST` decides: a path mentioning podman is
+///    podman's, anything else (including `tcp://`) is treated as
+///    Docker-compatible.
+/// 3. A rootless podman socket at `$XDG_RUNTIME_DIR/podman/podman.sock`
+///    ⇒ podman, with `DOCKER_HOST` pointed at it (bollard defaults to
+///    Docker's path and would otherwise miss it).
+/// 4. `/var/run/docker.sock` ⇒ docker, `DOCKER_HOST` left unset because
+///    that is already where bollard looks. This is the GitHub Actions
+///    case: the runner is a VM with a real Docker daemon, no dind
+///    needed.
+fn negotiate() -> &'static Result<&'static str, String> {
+    static NEGOTIATED: OnceLock<Result<&'static str, String>> = OnceLock::new();
+    NEGOTIATED.get_or_init(|| {
+        // Safety: `DOCKER_HOST` is only set here, inside this
+        // `OnceLock`, before any container exists — every test calls
+        // this through `harness_ready` first, and the lock serialises
+        // them — so no thread is mid-read of the environment.
+        let adopt = |socket: &Path| unsafe {
+            std::env::set_var("DOCKER_HOST", format!("unix://{}", socket.display()));
         };
-        match std::env::var("CINDY_E2E_CONTAINER_CLI") {
-            // An explicit choice is honoured even if unusable, so the
-            // failure names the CLI that was asked for rather than
-            // silently falling back to the other one.
-            Ok(forced) => match forced.as_str() {
-                "podman" => Some("podman"),
-                "docker" => Some("docker"),
-                _ => None,
-            },
-            Err(_) => ["podman", "docker"].into_iter().find(|cli| usable(cli)),
+
+        let cli = match std::env::var("CINDY_E2E_CONTAINER_CLI").as_deref() {
+            Ok("podman") => "podman",
+            Ok("docker") => "docker",
+            Ok(other) => {
+                return Err(format!(
+                    "CINDY_E2E_CONTAINER_CLI={other:?} is not a CLI I know; \
+                     use `podman` or `docker`"
+                ));
+            }
+            Err(_) => {
+                let podman_socket = std::env::var_os("XDG_RUNTIME_DIR")
+                    .map(|rt| PathBuf::from(rt).join("podman/podman.sock"))
+                    .filter(|s| s.exists());
+                let docker_socket = Path::new("/var/run/docker.sock");
+                match std::env::var("DOCKER_HOST") {
+                    Ok(host) if host.contains("podman") => "podman",
+                    Ok(_) => "docker",
+                    Err(_) => match podman_socket {
+                        Some(socket) => {
+                            adopt(&socket);
+                            "podman"
+                        }
+                        None if docker_socket.exists() => "docker",
+                        None => {
+                            return Err("no container engine: DOCKER_HOST unset, no podman \
+                                 socket at $XDG_RUNTIME_DIR/podman/podman.sock, and no \
+                                 /var/run/docker.sock"
+                                .to_owned());
+                        }
+                    },
+                }
+            }
+        };
+
+        if !cli_runs(cli) {
+            return Err(format!(
+                "the `{cli}` CLI is needed for the worker's `exec -i` (the one thing \
+                 testcontainers can't do) but didn't run"
+            ));
         }
+        Ok(cli)
     })
 }
 
@@ -133,54 +204,11 @@ fn cli() -> &'static str {
     container_cli().expect("harness_ready() established a usable CLI")
 }
 
-/// One-time environment negotiation for the whole suite. `Ok(())` =
-/// ready to run; `Err(reason)` = the suite fails with that reason
-/// (or skips, if `CINDY_E2E_CONTAINERS=skip`).
-///
-/// Two things to settle:
-///
-/// - `DOCKER_HOST`, which bollard needs and defaults to Docker's path.
-///   Pointed at the rootless podman socket when that's the only
-///   container socket in town.
-/// - A container CLI, for the worker's `exec -i` alone. The image build
-///   and the container itself go through the crate, over that socket.
+/// Is the suite able to run? `Err(reason)` fails every test with that
+/// reason (or skips, under `CINDY_E2E_CONTAINERS=skip`). All the work
+/// is in [`negotiate`]; this is the name the tests read it by.
 fn harness_ready() -> Result<(), String> {
-    static ONCE: OnceLock<Result<(), String>> = OnceLock::new();
-    ONCE.get_or_init(|| {
-        let podman_socket = std::env::var_os("XDG_RUNTIME_DIR")
-            .map(|rt| PathBuf::from(rt).join("podman/podman.sock"));
-        match (std::env::var_os("DOCKER_HOST"), podman_socket) {
-            // Explicit DOCKER_HOST (or a real Docker socket): trust it.
-            (Some(_), _) => {}
-            (None, Some(socket)) if socket.exists() => {
-                // Safety: no container has started yet — every test
-                // calls `harness_ready()` before starting one, and this
-                // `OnceLock` serialises them — so no thread is mid-read
-                // of the environment here.
-                unsafe {
-                    std::env::set_var("DOCKER_HOST", format!("unix://{}", socket.display()));
-                }
-            }
-            _ => {
-                return Err("no DOCKER_HOST and no podman socket at \
-                     $XDG_RUNTIME_DIR/podman/podman.sock"
-                    .to_owned());
-            }
-        }
-
-        // The CLI is needed for one thing only — `exec -i` to run the
-        // worker (see the module docs) — but it's needed for every
-        // test, so probe it here rather than failing mid-play.
-        if container_cli().is_none() {
-            return Err("no usable container CLI: neither `podman` nor `docker` \
-                 responded to --version (CINDY_E2E_CONTAINER_CLI overrides). \
-                 Only the worker's `exec -i` needs it; everything else goes \
-                 through DOCKER_HOST."
-                .to_owned());
-        }
-        Ok(())
-    })
-    .clone()
+    negotiate().clone().map(|_| ())
 }
 
 /// Build the example with one feature set and return the binary path.
