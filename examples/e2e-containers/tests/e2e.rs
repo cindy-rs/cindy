@@ -1,13 +1,31 @@
 //! Container e2e harness: drives the same orchestrator/worker pipe
 //! pair as `examples/e2e-localhost`, except the worker runs **inside**
-//! a Debian-systemd container via `podman exec -i` — which is what
-//! puts the mutating builtins (systemd, apt, user, group) in front of
-//! a real system.
+//! a Debian-systemd container — which is what puts the mutating
+//! builtins (systemd, apt, user, group) in front of a real system.
 //!
-//! Degradation is explicit, not a failure: on a machine without
-//! podman (CI) or without the image and the network to build it, every
-//! test reports why it skipped and passes, so `cargo test --workspace`
-//! stays green everywhere the hermetic suite already runs.
+//! These tests are **required, not optional**: an unusable harness
+//! fails the suite, naming what's missing. A silently-skipped container
+//! test is indistinguishable from a passing one in default `cargo test`
+//! output (libtest captures the reason), so a broken harness — image
+//! gone, socket moved, engine absent — would take the whole of this
+//! coverage with it and still read as green. Set
+//! `CINDY_E2E_CONTAINERS=skip` to opt out deliberately, on a machine
+//! where that's the right trade.
+//!
+//! Everything goes through the testcontainers crate — building the
+//! image, starting the container, copying the worker in, staging it per
+//! play — with exactly **one** exception: running the worker itself.
+//! The RPC channel needs a bidirectional pipe, and testcontainers
+//! 0.28's `exec` surfaces stdout/stderr only (`ExecResult` has no stdin
+//! writer; see `core/client.rs`: "We only interested in stdout and
+//! stderr"). So the worker is spawned with a CLI `exec -i`, which is
+//! also the closest analogue to the SSH child `cindy play` really uses.
+//!
+//! That one CLI call is engine-agnostic: `podman` is preferred,
+//! `docker` used when it's what's present, `CINDY_E2E_CONTAINER_CLI`
+//! forces one. Everything else talks to whatever `DOCKER_HOST` points
+//! at. `CINDY_E2E_SYSTEMD_IMAGE` names a prebuilt image instead of
+//! building, which is how CI skips a build in the test job.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -15,29 +33,117 @@ use std::sync::OnceLock;
 use std::time::Duration;
 
 use testcontainers::{
-    ContainerAsync, GenericImage,
-    core::{WaitFor, wait::HealthWaitStrategy},
-    runners::AsyncRunner as _,
+    ContainerAsync, GenericBuildableImage, GenericImage, ImageExt as _,
+    core::{ExecCommand, WaitFor, wait::HealthWaitStrategy},
+    runners::{AsyncBuilder as _, AsyncRunner as _},
 };
 
-/// Locally-built image (see `Containerfile.systemd` in this crate).
-/// `localhost/` is podman's local-only namespace: no registry is ever
-/// contacted for it, so testcontainers' create-then-pull fallback can't
-/// reach for the network.
-const IMAGE: &str = "localhost/cindy-e2e-systemd";
+/// Locally-built image name (see `Containerfile.systemd` in this
+/// crate), without a registry prefix.
+const IMAGE_NAME: &str = "cindy-e2e-systemd";
 const TAG: &str = "latest";
 
-/// One-time environment negotiation for the whole suite. `Ok(())` =
-/// ready to run; `Err(reason)` = every test skips with that reason.
+/// Pristine worker binary, copied in once per container.
+const MASTER_WORKER: &str = "/worker/e2e-worker.orig";
+/// Per-play copy, consumed by the worker unlinking itself.
+const STAGED_WORKER: &str = "/worker/e2e-worker";
+
+/// The container CLI to drive. Preference order is podman then docker;
+/// `CINDY_E2E_CONTAINER_CLI` overrides. Resolved once — the answer
+/// can't change mid-suite, and probing per call would be noise.
+fn container_cli() -> Option<&'static str> {
+    static CLI: OnceLock<Option<&'static str>> = OnceLock::new();
+    *CLI.get_or_init(|| {
+        let usable = |cli: &str| {
+            Command::new(cli)
+                .arg("--version")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false)
+        };
+        match std::env::var("CINDY_E2E_CONTAINER_CLI") {
+            // An explicit choice is honoured even if unusable, so the
+            // failure names the CLI that was asked for rather than
+            // silently falling back to the other one.
+            Ok(forced) => match forced.as_str() {
+                "podman" => Some("podman"),
+                "docker" => Some("docker"),
+                _ => None,
+            },
+            Err(_) => ["podman", "docker"].into_iter().find(|cli| usable(cli)),
+        }
+    })
+}
+
+/// The image to run, built once for the suite if it isn't supplied.
 ///
-/// - `DOCKER_HOST` is pointed at the rootless podman socket when it's
-///   the only container socket in town (bollard defaults to Docker's).
-/// - The systemd image is used from the local store or built once
-///   (`--network=host`: rootless podman's slirp DNS may be absent even
-///   where the host itself has egress — the sandbox this was written
-///   in is exactly that).
-/// - The `podman` CLI is required for `exec` even though
-///   testcontainers talks to the socket directly.
+/// `CINDY_E2E_SYSTEMD_IMAGE` takes precedence and is assumed present or
+/// pullable — that's how CI supplies a prebuilt image without a build
+/// in the test job. Otherwise `Containerfile.systemd` is built through
+/// the crate, which sidesteps the engine-specific flags a `podman
+/// build` / `docker build` shell-out would have needed to reconcile.
+async fn image() -> GenericImage {
+    static IMAGE: tokio::sync::OnceCell<(String, String)> = tokio::sync::OnceCell::const_new();
+    let (name, tag) = IMAGE
+        .get_or_init(|| async {
+            // CI supplies a prebuilt reference; use it as-is and let
+            // the container start report the truth if it's wrong.
+            if let Ok(explicit) = std::env::var("CINDY_E2E_SYSTEMD_IMAGE") {
+                let (name, tag) = explicit
+                    .rsplit_once(':')
+                    .map(|(n, t)| (n.to_owned(), t.to_owned()))
+                    .unwrap_or((explicit.clone(), "latest".to_owned()));
+                return (name, tag);
+            }
+            // Built through the crate, so no `podman build` shell-out
+            // and no engine-specific flags. Built once for the suite:
+            // `build_image` is idempotent but not free.
+            // The built `GenericImage` is dropped rather than returned:
+            // each container start needs its own (it's consumed by
+            // `start`), and it carries no state beyond the
+            // `IMAGE_NAME:TAG` descriptor this memoises. What's cached
+            // here is "the build has happened".
+            drop(
+                GenericBuildableImage::new(IMAGE_NAME, TAG)
+                    .with_dockerfile(
+                        Path::new(env!("CARGO_MANIFEST_DIR")).join("Containerfile.systemd"),
+                    )
+                    .build_image()
+                    .await
+                    .expect(
+                        "building the systemd image failed (needs network on first run); \
+                         see Containerfile.systemd, or point CINDY_E2E_SYSTEMD_IMAGE at a \
+                         prebuilt one",
+                    ),
+            );
+            (IMAGE_NAME.to_owned(), TAG.to_owned())
+        })
+        .await
+        .clone();
+    GenericImage::new(name, tag)
+}
+
+/// The resolved CLI, for the worker's `exec -i` — the one thing the
+/// crate can't do. Panics if called before [`harness_ready`] vouched
+/// for it; every caller is downstream of `setup`.
+fn cli() -> &'static str {
+    container_cli().expect("harness_ready() established a usable CLI")
+}
+
+/// One-time environment negotiation for the whole suite. `Ok(())` =
+/// ready to run; `Err(reason)` = the suite fails with that reason
+/// (or skips, if `CINDY_E2E_CONTAINERS=skip`).
+///
+/// Two things to settle:
+///
+/// - `DOCKER_HOST`, which bollard needs and defaults to Docker's path.
+///   Pointed at the rootless podman socket when that's the only
+///   container socket in town.
+/// - A container CLI, for the worker's `exec -i` alone. The image build
+///   and the container itself go through the crate, over that socket.
 fn harness_ready() -> Result<(), String> {
     static ONCE: OnceLock<Result<(), String>> = OnceLock::new();
     ONCE.get_or_init(|| {
@@ -62,47 +168,15 @@ fn harness_ready() -> Result<(), String> {
             }
         }
 
-        if !Command::new("podman")
-            .arg("--version")
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false)
-        {
-            return Err("podman CLI not available".to_owned());
-        }
-
-        let image = format!("{IMAGE}:{TAG}");
-        let have = Command::new("podman")
-            .args(["image", "exists", &image])
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false);
-        if !have {
-            let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
-            let built = Command::new("podman")
-                .args([
-                    "build",
-                    "--format",
-                    "docker",
-                    "--network=host",
-                    "--tag",
-                    &image,
-                    "--file",
-                    "Containerfile.systemd",
-                ])
-                .current_dir(manifest)
-                .status()
-                .map(|s| s.success())
-                .unwrap_or(false);
-            if !built {
-                return Err(format!(
-                    "image {image} not present and couldn't be built \
-                     (needs network); see Containerfile.systemd"
-                ));
-            }
+        // The CLI is needed for one thing only — `exec -i` to run the
+        // worker (see the module docs) — but it's needed for every
+        // test, so probe it here rather than failing mid-play.
+        if container_cli().is_none() {
+            return Err("no usable container CLI: neither `podman` nor `docker` \
+                 responded to --version (CINDY_E2E_CONTAINER_CLI overrides). \
+                 Only the worker's `exec -i` needs it; everything else goes \
+                 through DOCKER_HOST."
+                .to_owned());
         }
         Ok(())
     })
@@ -163,10 +237,20 @@ struct SystemdHost {
 }
 
 impl SystemdHost {
-    async fn start() -> Self {
-        let request = GenericImage::new(IMAGE, TAG).with_wait_for(WaitFor::Healthcheck(
-            HealthWaitStrategy::new().with_poll_interval(Duration::from_millis(200)),
-        ));
+    /// Start a container from the systemd image, with the worker binary
+    /// already copied in as a pristine master at
+    /// `/worker/e2e-worker.orig`.
+    ///
+    /// The copy happens through testcontainers' `with_copy_to` at
+    /// create time rather than a `cp` afterwards — one fewer thing
+    /// outside the crate, and it can't race the container's startup.
+    async fn start(worker_bin: &Path) -> Self {
+        let request = image()
+            .await
+            .with_wait_for(WaitFor::Healthcheck(
+                HealthWaitStrategy::new().with_poll_interval(Duration::from_millis(200)),
+            ))
+            .with_copy_to(MASTER_WORKER, worker_bin.to_path_buf());
         let container = request
             .start()
             .await
@@ -178,35 +262,34 @@ impl SystemdHost {
         }
     }
 
-    /// Stage the worker binary for one play. Per play, not per
-    /// container: the worker unlinks its own executable on startup —
-    /// agent-less is load-bearing — so each play's worker consumes
-    /// the staged copy and the next one needs a fresh one. This is
-    /// the same dance `cindy play` performs per host, minus SSH.
-    fn stage_worker(&self, worker_bin: &Path) {
-        let ok = Command::new("podman")
-            .args(["exec", &self.id, "mkdir", "-p", "/worker"])
-            .stdin(Stdio::null())
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false);
-        assert!(ok, "mkdir /worker in the container failed");
-        let ok = Command::new("podman")
-            .arg("cp")
-            .arg(worker_bin)
-            .arg(format!("{}:/worker/e2e-worker", self.id))
-            .stdin(Stdio::null())
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false);
-        assert!(ok, "podman cp of the worker binary failed");
-        let ok = Command::new("podman")
-            .args(["exec", &self.id, "chmod", "755", "/worker/e2e-worker"])
-            .stdin(Stdio::null())
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false);
-        assert!(ok, "chmod of the staged worker binary failed");
+    /// Stage the worker binary for one play, from the master copy.
+    ///
+    /// Per play, not per container: the worker unlinks its own
+    /// executable on startup — agent-less is load-bearing — so each
+    /// play consumes the staged copy and the next needs a fresh one.
+    /// This is the dance `cindy play` performs per host, minus SSH.
+    ///
+    /// `install -m 755` does the copy and the mode in one step, run
+    /// through testcontainers' `exec` (no stdin needed here, so the
+    /// crate is enough).
+    async fn stage_worker(&self) {
+        let result = self
+            ._container
+            .exec(ExecCommand::new([
+                "install",
+                "-m",
+                "755",
+                MASTER_WORKER,
+                STAGED_WORKER,
+            ]))
+            .await
+            .expect("exec `install` to stage the worker");
+        let code = result
+            .exit_code()
+            .await
+            .expect("staging exec exit code")
+            .unwrap_or(0);
+        assert_eq!(code, 0, "staging the worker binary failed in-container");
     }
 
     /// The worker runs *inside* the container: `podman exec -i` with
@@ -215,10 +298,8 @@ impl SystemdHost {
     /// — inside the container's writable layer, exactly as on a real
     /// host (agent-less is load-bearing).
     fn exec_worker(&self) -> Command {
-        let mut cmd = Command::new("podman");
-        cmd.args(["exec", "-i"])
-            .arg(&self.id)
-            .arg("/worker/e2e-worker");
+        let mut cmd = Command::new(cli());
+        cmd.args(["exec", "-i"]).arg(&self.id).arg(STAGED_WORKER);
         cmd
     }
 }
@@ -235,14 +316,13 @@ struct Play {
     _context_file: tempfile::NamedTempFile,
 }
 
-fn start_play(
+async fn start_play(
     host: &SystemdHost,
-    worker_bin: &Path,
     host_context: &serde_json::Value,
     orchestrator_env: &[(&str, &str)],
 ) -> Play {
     let orchestrator_bin = build_variant("orchestrator");
-    host.stage_worker(worker_bin);
+    host.stage_worker().await;
 
     let mut worker_cmd = host.exec_worker();
     worker_cmd
@@ -318,15 +398,26 @@ fn host_context() -> serde_json::Value {
 /// and start a fresh container. One container per test — isolation is
 /// worth the seconds, and scenarios within a test share their
 /// container on purpose.
-async fn setup() -> Option<(tempfile::TempDir, SystemdHost, PathBuf)> {
+async fn setup() -> Option<(tempfile::TempDir, SystemdHost)> {
     if let Err(reason) = harness_ready() {
-        eprintln!("skipping container e2e: {reason}");
+        // Fail by default. Skipping silently would make this coverage
+        // evaporate without a signal: libtest captures the reason, so
+        // in normal output a skipped test and a real one both read
+        // `ok`, and the only tell is a 0.00s duration nobody reads.
+        assert_eq!(
+            std::env::var("CINDY_E2E_CONTAINERS").as_deref(),
+            Ok("skip"),
+            "container e2e harness unusable: {reason}\n\
+             These tests are required. Provide a container engine, or set \
+             CINDY_E2E_CONTAINERS=skip to opt out deliberately."
+        );
+        eprintln!("skipping container e2e (CINDY_E2E_CONTAINERS=skip): {reason}");
         return None;
     }
     let tmp = tempfile::tempdir().expect("tempdir");
     let worker = build_variant("remote");
-    let host = SystemdHost::start().await;
-    Some((tmp, host, worker))
+    let host = SystemdHost::start(&worker).await;
+    Some((tmp, host))
 }
 
 /// `systemd`, `apt`, `user` and `group` finally meet a real system:
@@ -334,16 +425,12 @@ async fn setup() -> Option<(tempfile::TempDir, SystemdHost, PathBuf)> {
 /// lifecycle a VyOS play actually drives.
 #[tokio::test]
 async fn systemd_manages_a_unit_lifecycle() {
-    let Some((tmp, host, worker)) = setup().await else {
+    let Some((tmp, host)) = setup().await else {
         return;
     };
-    let status = start_play(
-        &host,
-        &worker,
-        &host_context(),
-        &[("CINDY_E2E_SYSTEMD", "1")],
-    )
-    .wait();
+    let status = start_play(&host, &host_context(), &[("CINDY_E2E_SYSTEMD", "1")])
+        .await
+        .wait();
     assert!(
         status.success(),
         "systemd lifecycle play failed: {status:?} — see the output above"
@@ -358,20 +445,16 @@ async fn systemd_manages_a_unit_lifecycle() {
 /// real systemd can — this is the exact arm where the bug shipped.
 #[tokio::test]
 async fn systemd_check_mode_never_unmasks() {
-    let Some((tmp, host, worker)) = setup().await else {
+    let Some((tmp, host)) = setup().await else {
         return;
     };
 
     // Setup: mask a /usr/lib-backed unit (its file survives the mask —
     // an admin-authored one is deleted to complete the mask, by
     // design, leaving nothing to unmask).
-    let status = start_play(
-        &host,
-        &worker,
-        &host_context(),
-        &[("CINDY_E2E_SYSTEMD_MASK", "1")],
-    )
-    .wait();
+    let status = start_play(&host, &host_context(), &[("CINDY_E2E_SYSTEMD_MASK", "1")])
+        .await
+        .wait();
     assert!(status.success(), "mask run failed: {status:?}");
 
     // Check mode: report, don't touch. The playbook itself asserts the
@@ -379,10 +462,10 @@ async fn systemd_check_mode_never_unmasks() {
     // mutation leaked through check mode.
     let status = start_play(
         &host,
-        &worker,
         &host_context(),
         &[("CINDY_E2E_SYSTEMD_CHECK", "1"), ("CINDY_DRY_RUN", "1")],
     )
+    .await
     .wait();
     assert!(
         status.success(),
@@ -391,13 +474,9 @@ async fn systemd_check_mode_never_unmasks() {
     );
 
     // For real: the same request now unmasks.
-    let status = start_play(
-        &host,
-        &worker,
-        &host_context(),
-        &[("CINDY_E2E_SYSTEMD_UNMASK", "1")],
-    )
-    .wait();
+    let status = start_play(&host, &host_context(), &[("CINDY_E2E_SYSTEMD_UNMASK", "1")])
+        .await
+        .wait();
     assert!(status.success(), "unmask run failed: {status:?}");
     drop(tmp);
 }
@@ -408,10 +487,12 @@ async fn systemd_check_mode_never_unmasks() {
 /// exactly one account), and absence.
 #[tokio::test]
 async fn users_and_groups_reconcile_on_a_real_system() {
-    let Some((tmp, host, worker)) = setup().await else {
+    let Some((tmp, host)) = setup().await else {
         return;
     };
-    let status = start_play(&host, &worker, &host_context(), &[("CINDY_E2E_USERS", "1")]).wait();
+    let status = start_play(&host, &host_context(), &[("CINDY_E2E_USERS", "1")])
+        .await
+        .wait();
     assert!(
         status.success(),
         "user/group play failed: {status:?} — see the output above"
@@ -424,10 +505,12 @@ async fn users_and_groups_reconcile_on_a_real_system() {
 /// No test-time network — the repo is a build-time artifact.
 #[tokio::test]
 async fn apt_installs_converges_and_removes() {
-    let Some((tmp, host, worker)) = setup().await else {
+    let Some((tmp, host)) = setup().await else {
         return;
     };
-    let status = start_play(&host, &worker, &host_context(), &[("CINDY_E2E_APT", "1")]).wait();
+    let status = start_play(&host, &host_context(), &[("CINDY_E2E_APT", "1")])
+        .await
+        .wait();
     assert!(
         status.success(),
         "apt play failed: {status:?} — see the output above"
