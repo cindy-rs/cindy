@@ -84,6 +84,14 @@ jobs:
       - uses: rustsec/audit-check@v2
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
+      # The site is a nested workspace with its own lockfile; the
+      # action above only audits the root one (as .gitlab-ci.yml's
+      # check.audit does both explicitly).
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+      - name: Audit web lockfile
+        run: cargo audit --file web/Cargo.lock
 
   web:
     # The marketing site is a nested workspace; the root commands don't

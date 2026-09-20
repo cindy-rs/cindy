@@ -119,4 +119,12 @@ check.test:
     # Includes examples/e2e-localhost: the hermetic end-to-end harness
     # (spawns a local orchestrator+worker pair over pipes; no SSH, no
     # containers, no network beyond a loopback HTTP server for fetch).
-    - cargo test --workspace
+    #
+    # The container e2e suite (examples/e2e-containers) opts out here,
+    # deliberately: these jobs run *inside* containers with no engine
+    # socket, and the suite is required-not-optional by default. The
+    # real CI for it is .github/workflows/ci.yml, whose runners are
+    # VMs with a live Docker daemon. If this mirror ever gains an
+    # engine (dind needs a privileged runner — see the buildkit-rootless
+    # evidence above), drop the opt-out instead of maintaining both.
+    - CINDY_E2E_CONTAINERS=skip cargo test --workspace

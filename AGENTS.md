@@ -67,10 +67,12 @@ raw `cargo check` only needs the file to exist.
   no SSH, no containers).
 - `examples/e2e-containers` — container end-to-end harness: the
   mutating builtins (`systemd`, `apt`, `user`, `group`) against a real
-  Debian-systemd container under podman (testcontainers over the
-  rootless podman socket; `Containerfile.systemd` in that crate builds
-  the image). Self-skips where podman or the image is unavailable, so
-  `cargo test --workspace` stays green in CI, which has neither.
+  Debian-systemd container (`Containerfile.systemd` in that crate
+  builds the image). Speaks the Docker API directly (testcontainers +
+  bollard), so podman and docker both work and no CLI is involved.
+  **Required, not optional** — no engine fails the suite, naming what's
+  missing; `CINDY_E2E_CONTAINERS=skip` is the deliberate opt-out (the
+  GitLab mirror uses it, since its jobs run inside containers).
 - `examples/snippet-check` — compile guard: `#[path]`-includes
   `web/src/snippets/*.rs` so the site's code examples can't drift from the real
   `cindy` API. Nothing executes; edit the snippets in `web/`, not here.
