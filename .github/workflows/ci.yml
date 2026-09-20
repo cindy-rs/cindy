@@ -14,6 +14,10 @@
 #     the socket would then need mounting. Don't, unless you must.
 #   * macOS and Windows runners have no usable Linux Docker daemon, so
 #     the container suite is ubuntu-only.
+#
+# The harness needs no container CLI at all — it speaks the Docker API
+# directly (bollard) — so there is nothing to install and no
+# podman-vs-docker choice to configure.
 name: CI
 
 on:
@@ -55,13 +59,10 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
 
       # `cargo test --workspace` includes examples/e2e-containers, which
-      # needs the runner's Docker daemon. CINDY_E2E_CONTAINER_CLI is set
-      # explicitly rather than left to detection: the runner image ships
-      # *both* podman and docker, and the live engine is Docker's — a
-      # podman CLI against a Docker daemon can't see its containers.
+      # uses the runner's Docker daemon over /var/run/docker.sock. No
+      # setup and no engine choice to make: the harness talks the Docker
+      # API through bollard, so podman-vs-docker never comes up.
       - name: Test
-        env:
-          CINDY_E2E_CONTAINER_CLI: docker
         run: cargo test --workspace
 
       # Proves the container suite actually ran rather than skipping.
@@ -69,8 +70,6 @@ jobs:
       # step already implies it ran — this makes that explicit and
       # would catch a future default flipping back to skip.
       - name: Container e2e ran (not skipped)
-        env:
-          CINDY_E2E_CONTAINER_CLI: docker
         run: |
           cargo test -p e2e-containers -- --nocapture 2>&1 | tee out.txt
           if grep -q "skipping container e2e" out.txt; then

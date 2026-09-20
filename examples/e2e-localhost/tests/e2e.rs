@@ -2,6 +2,7 @@ use std::io::{Read as _, Write as _};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::OnceLock;
 
 use sha2::Digest as _;
 
@@ -14,9 +15,29 @@ fn hex(bytes: &[u8]) -> String {
 
 /// Build the example with one feature set and return the binary path.
 ///
+/// Memoised behind a mutex, and that is load-bearing rather than an
+/// optimisation. libtest runs these tests concurrently, so without it
+/// several threads invoke `cargo build` for the same feature into the
+/// same `--target-dir` at once; one test then copies or execs the
+/// output binary while another cargo is still linking it, and the spawn
+/// fails with `ETXTBSY` ("Text file busy") or the play dies on a
+/// half-written worker. Holding the lock across the build serialises
+/// them, and the cache means only the first test pays for it — the
+/// binary is identical for every test in the process.
+///
 /// A dedicated `--target-dir` keeps this nested `cargo build` from
 /// contending on the outer test invocation's build lock.
 fn build_variant(feature: &str) -> PathBuf {
+    static BUILT: OnceLock<std::sync::Mutex<std::collections::HashMap<String, PathBuf>>> =
+        OnceLock::new();
+    let mut cache = BUILT
+        .get_or_init(Default::default)
+        .lock()
+        .expect("build cache mutex poisoned");
+    if let Some(path) = cache.get(feature) {
+        return path.clone();
+    }
+
     let manifest = Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
     let target_dir = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("target-e2e")
@@ -48,12 +69,14 @@ fn build_variant(feature: &str) -> PathBuf {
     // The last cargo "compiler-artifact" message with an executable is
     // our binary.
     let stdout = String::from_utf8(output.stdout).expect("cargo output not utf-8");
-    stdout
+    let path = stdout
         .lines()
         .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
         .filter_map(|j| j["executable"].as_str().map(PathBuf::from))
         .next_back()
-        .unwrap_or_else(|| panic!("no executable in cargo output for feature {feature}"))
+        .unwrap_or_else(|| panic!("no executable in cargo output for feature {feature}"));
+    cache.insert(feature.to_owned(), path.clone());
+    path
 }
 
 /// Spin up a one-shot localhost HTTP/1.0 server that answers every
@@ -136,6 +159,23 @@ fn start_play(
     let orchestrator_bin = build_variant("orchestrator");
     let remote_bin_src = build_variant("remote");
 
+    // Staging an executable and spawning one must not interleave across
+    // threads, so everything from the copy to the last spawn happens
+    // under this lock.
+    //
+    // libtest runs these tests concurrently in one process, and `fork`
+    // duplicates the whole fd table: a thread mid-`fs::copy` has the
+    // destination open for writing, and a *different* thread's spawn
+    // inherits that write fd. `execve` then rejects the file with
+    // `ETXTBSY` ("Text file busy") — it checks for writers before
+    // `O_CLOEXEC` gets a chance to close the inherited fd, so Rust
+    // opening files close-on-exec doesn't save us. Rare, load-dependent,
+    // and it took a second e2e crate's parallelism to surface.
+    static STAGE_AND_SPAWN: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _staging = STAGE_AND_SPAWN
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+
     // The remote worker deletes its own executable on startup (it's
     // designed to be an uploaded throwaway). Copy it to a temp path so
     // the cached build artifact survives for re-runs.
@@ -172,6 +212,9 @@ fn start_play(
         orch_cmd.env(k, v);
     }
     let mut orchestrator = orch_cmd.spawn().expect("spawn orchestrator");
+
+    // Both children exist; no further fork can inherit a staging fd.
+    drop(_staging);
 
     let mut o_out = orchestrator.stdout.take().unwrap();
     let mut r_in = worker.stdin.take().unwrap();
