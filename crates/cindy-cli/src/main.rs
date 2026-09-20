@@ -3,19 +3,19 @@ mod limit;
 mod picker;
 mod progress;
 mod secret;
+mod transport;
+
+use transport::{HostChild, Transport};
 
 use clap::Parser;
 use eyre::{ContextCompat as _, WrapErr as _};
 use futures_util::future::try_join_all;
-use openssh::Stdio;
 use std::collections::{HashMap, HashSet};
 use std::io::IsTerminal as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tracing::Instrument as _;
-
-use crate::conditional_sudo_command::ConditionalSudoCommand as _;
 
 /// Stable replacement for the nightly `ExitStatus::exit_ok`: turn a non-zero
 /// process exit into an error rather than silently succeeding.
@@ -53,6 +53,13 @@ enum Subcommand {
         limit: Option<String>,
         #[clap(long)]
         unprivileged: bool,
+        /// Run every selected host as a local process on this machine —
+        /// no SSH, no `cross`/podman (the worker builds and runs
+        /// natively). For smoke-testing a playbook against this box,
+        /// and what the e2e harness drives. Sudo is never applied: the
+        /// play runs as the invoking user.
+        #[clap(long)]
+        local: bool,
         /// Check mode: build everything, connect everywhere, render
         /// every diff — but apply nothing. Builtins report what they
         /// *would* change; `command`/`shell` don't execute; custom
@@ -85,7 +92,7 @@ struct Args {
 #[derive(Debug)]
 struct DiscoveredHost {
     host: cindy::Host<serde_json::Value>,
-    session: openssh::Session,
+    transport: Transport,
     platform: &'static platforms::Platform,
     use_sudo: bool,
 }
@@ -468,12 +475,13 @@ async fn run_after_launch(
         }
     }
 
-    let (limit, unprivileged, check_mode) = match subcommand {
+    let (limit, unprivileged, check_mode, local) = match subcommand {
         Subcommand::Play {
             limit,
             unprivileged,
             check,
-        } => (limit, unprivileged, check),
+            local,
+        } => (limit, unprivileged, check, local),
         Subcommand::Inventory { host, json, reveal } => {
             if json {
                 // Pick the JSON source: the secrets-decrypted whole
@@ -562,36 +570,48 @@ async fn run_after_launch(
         // OpenSSH's default ServerAliveCountMax of 3, a silent peer tears
         // the session down after ~30s, which EOFs the RPC pump and fails
         // the play's in-flight calls promptly.
-        log_tofu_fingerprints(&host.name).await;
-        let session = openssh::SessionBuilder::default()
-            .known_hosts_check(openssh::KnownHosts::Add)
-            .connect_timeout(std::time::Duration::from_secs(30))
-            .server_alive_interval(std::time::Duration::from_secs(10))
-            .connect(&host.name)
-            .await?;
-
-        let uname_out = session
-            .command("uname")
-            .args(["-m"])
-            .output()
-            .await?
-            .ok_or_die()?;
-        let machine_arch = String::from_utf8(uname_out.stdout)?.trim().to_string();
-        let triplet = format!("{machine_arch}-unknown-linux-musl");
+        // Local hosts skip the SSH machinery entirely: no TOFU
+        // fingerprints, no session, and the platform is *this* machine
+        // (the host triple, glibc — the musl/static choice exists for
+        // remote busybox targets, not for a worker that runs here).
+        // Sudo never applies locally: the play runs as the invoking
+        // user, so `use_sudo` is pinned false.
+        let (transport, triplet) = if local {
+            (
+                Transport::Local,
+                format!("{}-unknown-linux-gnu", std::env::consts::ARCH),
+            )
+        } else {
+            log_tofu_fingerprints(&host.name).await;
+            let session = openssh::SessionBuilder::default()
+                .known_hosts_check(openssh::KnownHosts::Add)
+                .connect_timeout(std::time::Duration::from_secs(30))
+                .server_alive_interval(std::time::Duration::from_secs(10))
+                .connect(&host.name)
+                .await?;
+            let uname_out = session
+                .command("uname")
+                .args(["-m"])
+                .output()
+                .await?
+                .ok_or_die()?;
+            let machine_arch = String::from_utf8(uname_out.stdout)?.trim().to_string();
+            (
+                Transport::Ssh(session),
+                format!("{machine_arch}-unknown-linux-musl"),
+            )
+        };
         let platform = platforms::Platform::find(&triplet)
             .context(format!("Couldn't find platform by triplet: '{triplet}'"))?;
 
-        let id_out = session
-            .command("id")
-            .args(["-u"])
-            .output()
-            .await?
-            .ok_or_die()?;
-        let use_sudo = !unprivileged && String::from_utf8(id_out.stdout)?.trim() != "0";
+        let use_sudo = !local && !unprivileged && {
+            let id_out = transport.check_output("id", &["-u"]).await?.ok_or_die()?;
+            String::from_utf8(id_out.stdout)?.trim() != "0"
+        };
 
         Ok::<DiscoveredHost, eyre::Error>(DiscoveredHost {
             host,
-            session,
+            transport,
             platform,
             use_sudo,
         })
@@ -644,7 +664,7 @@ async fn run_after_launch(
                 .expect("build gate semaphore is never closed");
             Ok::<_, eyre::Error>((
                 platform,
-                compile_remote_worker(platform, &meta, &root).await?,
+                compile_remote_worker(platform, &meta, &root, local).await?,
             ))
         }
     });
@@ -768,10 +788,8 @@ async fn run_after_launch(
                 // cheap roundtrip, world-readable, no sudo) and take
                 // the first candidate whose mount allows exec.
                 let mounts = host
-                    .session
-                    .command("cat")
-                    .arg("/proc/mounts")
-                    .output()
+                    .transport
+                    .check_output("cat", &["/proc/mounts"])
                     .await
                     .ok()
                     .filter(|out| out.status.success());
@@ -803,17 +821,19 @@ async fn run_after_launch(
                 // this host's output pane, not on the real terminal where it
                 // would corrupt the alternate-screen TUI. We forward the
                 // upload's stderr the same way we do the run's.
-                let mut upload = host
-                    .session
-                    .conditional_sudo_command(host.use_sudo, "sh")
-                    .args(["-c", &format!("umask 0266 && gzip -dc >'{remote_tmp_path}' && chmod u+x '{remote_tmp_path}'")])
-                    .stdin(Stdio::piped())
-                    .stdout(Stdio::piped())
-                    .stderr(Stdio::piped())
-                    .spawn()
+                let upload_script = format!(
+                    "umask 0266 && gzip -dc >'{remote_tmp_path}' && chmod u+x '{remote_tmp_path}'"
+                );
+                let mut upload: HostChild = host
+                    .transport
+                    .spawn_piped(host.use_sudo, "sh", &["-c", &upload_script])
                     .await?;
 
-                let upload_stderr = BufReader::new(upload.stderr().take().unwrap());
+                let upload_stderr = BufReader::new(
+                    upload
+                        .take_stderr()
+                        .expect("upload stderr was piped"),
+                );
                 tokio::spawn(forward_stderr(
                     upload_stderr,
                     progress_tx.clone(),
@@ -821,7 +841,7 @@ async fn run_after_launch(
                     progress::Source::Worker,
                 ));
 
-                if let Some(mut stdin) = upload.stdin().take() {
+                if let Some(mut stdin) = upload.take_stdin() {
                     // `worker_bin` is the gzipped payload (see the read
                     // step above).
                     // If the remote command died before we finished writing
@@ -853,13 +873,9 @@ async fn run_after_launch(
                 // orchestrator below), so they never appear in the
                 // target's process table. It also doesn't need the host
                 // context — that's an orchestrator-only concern.
-                let mut remote_run = host
-                    .session
-                    .conditional_sudo_command(host.use_sudo, &remote_tmp_path)
-                    .stdin(Stdio::piped())
-                    .stdout(Stdio::piped())
-                    .stderr(Stdio::piped())
-                    .spawn()
+                let mut remote_run: HostChild = host
+                    .transport
+                    .spawn_piped(host.use_sudo, &remote_tmp_path, &[])
                     .await?;
 
                 // The orchestrator runs locally (operator's machine), so
@@ -887,9 +903,17 @@ async fn run_after_launch(
                     .stderr(std::process::Stdio::piped())
                     .spawn()?;
 
-                let mut r_stdout = remote_run.stdout().take().unwrap();
-                let mut r_stdin = remote_run.stdin().take().unwrap();
-                let r_stderr = BufReader::new(remote_run.stderr().take().unwrap());
+                let mut r_stdout = remote_run
+                    .take_stdout()
+                    .expect("worker stdout was piped");
+                let mut r_stdin = remote_run
+                    .take_stdin()
+                    .expect("worker stdin was piped");
+                let r_stderr = BufReader::new(
+                    remote_run
+                        .take_stderr()
+                        .expect("worker stderr was piped"),
+                );
 
                 let mut o_stdout = orchestrator_run.stdout.take().unwrap();
                 let mut o_stdin = orchestrator_run.stdin.take().unwrap();
@@ -1267,13 +1291,19 @@ async fn compile_remote_worker(
     platform: &'static platforms::Platform,
     metadata: &cargo_metadata::Metadata,
     workspace_root: &Path,
+    local: bool,
 ) -> eyre::Result<PathBuf> {
     tracing::info!(platform.target_triple, "compiling remote binary");
     // Absolute so the output lands under the workspace regardless of cwd, and
     // so we can reconstruct the binary path from it below without relying on
     // cargo's container-relative `executable` field.
     let target_dir = workspace_root.join(format!("target/cindy/remote/{}", platform.target_triple));
-    let mut cmd = tokio::process::Command::new("cross");
+    // A local play builds the worker with plain cargo for the host
+    // triple — no cross, no container: the worker runs on this very
+    // machine, so the container round-trip (and its podman
+    // requirement) buys nothing.
+    let builder = if local { "cargo" } else { "cross" };
+    let mut cmd = tokio::process::Command::new(builder);
     cmd.kill_on_drop(true)
         .args([
             "build",
@@ -1291,6 +1321,13 @@ async fn compile_remote_worker(
     if matches!(platform.tier, platforms::Tier::Three) {
         tracing::warn!("tier 3 target, building with `-Zbuild-std`");
         cmd.arg("-Zbuild-std");
+    }
+
+    // Everything below is cross-specific: the container volume mount
+    // for the framework workspace, the rustc-wrapper clobber, the
+    // container opts. A plain-cargo local build wants none of it.
+    if local {
+        return finish_worker_build(cmd, target_dir, platform, metadata).await;
     }
 
     // Append to user-exported opts instead of clobbering them.
@@ -1315,20 +1352,29 @@ async fn compile_remote_worker(
         cmd.env("CROSS_CONTAINER_OPTS", container_opts.trim());
     }
 
+    finish_worker_build(cmd, target_dir, platform, metadata).await
+}
+
+/// The shared tail of the worker build: run the builder, surface its
+/// output, and pin the produced binary's path. `cross` reports a
+/// container path in `executable`, so only the file *name* is trusted
+/// and rebased onto our own absolute target-dir; plain cargo reports a
+/// host path already — the rebase is the identity for it.
+async fn finish_worker_build(
+    mut cmd: tokio::process::Command,
+    target_dir: PathBuf,
+    platform: &'static platforms::Platform,
+    metadata: &cargo_metadata::Metadata,
+) -> eyre::Result<PathBuf> {
     let output = cmd.output().await?;
     if !output.status.success() {
         eyre::bail!("{}", String::from_utf8_lossy(&output.stderr));
     }
     for line in String::from_utf8_lossy(&output.stderr).lines() {
         if !line.trim().is_empty() {
-            tracing::info!("cross: {line}");
+            tracing::info!("build: {line}");
         }
     }
-    // `cross` runs cargo inside a container, so the `executable` it reports is
-    // a container path that may not exist on the host. We only trust it for
-    // the binary's *file name*, then rebase that onto our own absolute
-    // target-dir (mounted into the container at the same path), giving a host
-    // path we can actually read.
     let stdout_str = String::from_utf8(output.stdout)?;
     let exe_name = extract_executable(&stdout_str, metadata)?
         .context("Failed to extract remote executable path")?

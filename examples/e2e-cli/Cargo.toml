@@ -1,0 +1,19 @@
+[package]
+name = "e2e-cli"
+description = "Drives the real `cindy` binary through its whole play path (--limit, preflight, deployment, summary) against local hosts."
+publish = false
+version.workspace = true
+rust-version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+# The fixture playbook this suite deploys lives in `fixture/` — its own
+# nested workspace (excluded from the root one in the root Cargo.toml),
+# because `cindy play` resolves the playbook via `cargo metadata` on its
+# working directory and must find the fixture, not the monorepo.
+
+[dev-dependencies]
+tempfile = "3.27"

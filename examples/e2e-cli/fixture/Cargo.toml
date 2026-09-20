@@ -1,0 +1,26 @@
+[package]
+name = "e2e-cli-fixture"
+description = "Fixture playbook for the e2e-cli suite: three hosts, one marker-writing remote fn."
+publish = false
+version = "0.1.0"
+edition = "2024"
+
+# Detach from the monorepo's workspace: `cindy play` runs `cargo
+# metadata` in its working directory and must resolve *this* playbook,
+# not the framework workspace the crate sits inside.
+[workspace]
+
+[[bin]]
+name = "e2e-cli-fixture"
+path = "src/main.rs"
+
+[features]
+# The `cindy` CLI always builds with --no-default-features and exactly
+# one of the two; defaulting to *both* keeps plain `cargo check` (and
+# rust-analyzer) analysing the whole program.
+default = ["orchestrator", "remote"]
+orchestrator = ["cindy/orchestrator"]
+remote = ["cindy/remote"]
+
+[dependencies]
+cindy = { path = "../../../crates/cindy" }

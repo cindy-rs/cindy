@@ -37,6 +37,7 @@ cargo clippy --workspace --all-targets -- -D warnings # lints
 cargo test --workspace                               # unit + e2e
 cargo test -p e2e-localhost    # e2e alone; slow (builds two binaries), hermetic
 cargo test -p e2e-containers   # mutating-builtins e2e; needs a container engine
+cargo test -p e2e-cli          # real-binary play-path e2e; slow (builds CLI + fixture), hermetic
 cargo audit                    # vulnerabilities; must stay empty
 
 # The site is a nested workspace — the root commands don't reach it.
@@ -60,8 +61,10 @@ raw `cargo check` only needs the file to exist.
 - `crates/cindy-macros` — proc macros: `#[cindy::main]`, `#[cindy::inventory]`,
   `#[remote]`, `#[action]`, `secret!`.
 - `crates/cindy-cli` — the `cindy` binary: compiles the user's orchestrator,
-  cross-builds remote workers via `cross` + podman, deploys over SSH, streams
-  progress (ratatui), manages vaults (`cindy secret seal/unseal`).
+  cross-builds remote workers via `cross` + podman, deploys over SSH (or, with
+  `play --local`, runs every host as a local process — no SSH, no cross: the
+  smoke-test and e2e path), streams progress (ratatui), manages vaults
+  (`cindy secret seal/unseal`).
 - `examples/e2e-localhost` — hermetic end-to-end harness (local pipes,
   no SSH, no containers).
 - `examples/e2e-containers` — container end-to-end harness: the
@@ -72,6 +75,13 @@ raw `cargo check` only needs the file to exist.
   **Required, not optional** — no engine fails the suite, naming what's
   missing; `CINDY_E2E_CONTAINERS=skip` is the deliberate opt-out for
   machines with no engine.
+- `examples/e2e-cli` — drives the *real* `cindy` binary through its whole
+  play path (`play --local`) against the checked-in fixture playbook in
+  `fixture/` — a nested workspace excluded from the root one, because
+  `cindy play` must resolve the fixture playbook, not the framework
+  monorepo the suite lives in. Covers `--limit` selection end to end
+  (tag, expression, unknown-term refusal), the run summary, and
+  `--check` applying nothing.
 - `examples/snippet-check` — compile guard: `#[path]`-includes
   `web/src/snippets/*.rs` so the site's code examples can't drift from the real
   `cindy` API. Nothing executes; edit the snippets in `web/`, not here.

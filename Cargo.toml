@@ -4,8 +4,11 @@ members = ["crates/*", "examples/*"]
 # The marketing site is its own nested workspace: it shares no crates
 # with the framework (the coupling is editorial — docs and snippets),
 # and keeping its dioxus tree out of this lockfile keeps framework
-# builds, `cargo install --path` and audits lean.
-exclude = ["web"]
+# builds, `cargo install --path` and audits lean. The e2e-cli fixture
+# playbook is nested for the opposite reason: `cindy play` must resolve
+# *it* — a standalone user playbook — not the framework workspace the
+# suite lives in.
+exclude = ["web", "examples/e2e-cli/fixture"]
 
 [workspace.package]
 description = "Managing infrastructure at breakneck speed."

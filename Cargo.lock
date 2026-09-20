@@ -1070,6 +1070,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d0881ea181b1df73ff77ffaaf9c7544ecc11e82fba9b5f27b262a3c73a332555"
 
 [[package]]
+name = "e2e-cli"
+version = "0.3.0"
+dependencies = [
+ "tempfile",
+]
+
+[[package]]
 name = "e2e-containers"
 version = "0.3.0"
 dependencies = [

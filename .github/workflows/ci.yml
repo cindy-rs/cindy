@@ -54,6 +54,11 @@ jobs:
       - name: Format
         run: cargo fmt --check
 
+      # The e2e-cli fixture playbook is a nested workspace (excluded
+      # from the root one), so the fmt pass above doesn't reach it.
+      - name: Format fixture playbook
+        run: cargo fmt --check --manifest-path examples/e2e-cli/fixture/Cargo.toml
+
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
