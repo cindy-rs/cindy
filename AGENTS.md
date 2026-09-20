@@ -63,9 +63,10 @@ raw `cargo check` only needs the file to exist.
 - `crates/cindy-macros` — proc macros: `#[cindy::main]`, `#[cindy::inventory]`,
   `#[remote]`, `#[action]`, `secret!`.
 - `crates/cindy-cli` — the `cindy` binary: compiles the user's orchestrator,
-  cross-builds remote workers via `cross` + podman, deploys over SSH (or, with
-  `play --local`, runs every host as a local process — no SSH, no cross: the
-  smoke-test and e2e path), streams progress (ratatui), manages vaults
+  cross-builds remote workers via `cross` + podman, deploys over SSH (a hidden
+  `play --local` flag swaps every host to local processes — no SSH, no cross;
+  it exists for the e2e-cli harness and maintainer debugging, not as a
+  supported deploy mode), streams progress (ratatui), manages vaults
   (`cindy secret seal/unseal`).
 - `examples/e2e-localhost` — hermetic end-to-end harness (local pipes,
   no SSH, no containers).

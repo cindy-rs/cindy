@@ -89,6 +89,24 @@ fn marker(markers: &TempDir, host: &str) -> PathBuf {
 }
 
 #[test]
+fn local_flag_stays_hidden() {
+    // `--local` exists for this suite and maintainer debugging, not as
+    // a supported deploy mode — a real playbook run this way converges
+    // the operator's own machine. If it ever grows a genuine user
+    // case, un-hiding it must be a deliberate decision, not help-text
+    // drift; this test forces that conversation.
+    let help = Command::new(cindy_bin())
+        .args(["play", "--help"])
+        .output()
+        .expect("failed to spawn cindy play --help");
+    assert!(help.status.success());
+    let text = String::from_utf8_lossy(&help.stdout);
+    assert!(!text.contains("--local"), "{text}");
+    // Control: this is really the play subcommand's help.
+    assert!(text.contains("--check"), "{text}");
+}
+
+#[test]
 fn full_run_plays_every_host() {
     let (ok, stderr, markers) = play(&[]);
     assert!(ok, "cindy play --local failed:\n{stderr}");

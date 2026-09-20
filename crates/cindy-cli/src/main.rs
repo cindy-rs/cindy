@@ -55,10 +55,12 @@ enum Subcommand {
         unprivileged: bool,
         /// Run every selected host as a local process on this machine —
         /// no SSH, no `cross`/podman (the worker builds and runs
-        /// natively). For smoke-testing a playbook against this box,
-        /// and what the e2e harness drives. Sudo is never applied: the
-        /// play runs as the invoking user.
-        #[clap(long)]
+        /// natively). Hidden on purpose: this is the e2e harness's
+        /// transport seam and a maintainer debugging aid, not a
+        /// supported deploy mode — a real playbook run this way
+        /// converges this box as the invoking user. Sudo is never
+        /// applied.
+        #[clap(long, hide = true)]
         local: bool,
         /// Check mode: build everything, connect everywhere, render
         /// every diff — but apply nothing. Builtins report what they

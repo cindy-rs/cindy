@@ -5,11 +5,12 @@
 //! a staging directory, upload the worker, run it — goes through
 //! [`Transport`], which is either an SSH session to a real host or
 //! [`Transport::Local`], spawning the same commands as local child
-//! processes. `--local` is the operator-facing half of this (run a
-//! playbook against this machine, no SSH, for smoke-testing); the
-//! e2e-cli harness is the testing half — it drives the *real* CLI
-//! binary through the whole play path (inventory, `--limit`, preflight,
-//! deployment, summary) with local hosts.
+//! processes. The hidden `play --local` flag selects the local half:
+//! the e2e-cli harness drives the *real* CLI binary through the whole
+//! play path (inventory, `--limit`, preflight, deployment, summary)
+//! with local hosts, and maintainers can do the same by hand. It is
+//! not a supported deploy mode — a real playbook run this way
+//! converges the operator's own machine.
 //!
 //! The abstraction is deliberately two methods: "run this to
 //! completion" and "spawn this with piped stdio". Everything else
