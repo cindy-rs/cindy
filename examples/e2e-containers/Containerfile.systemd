@@ -1,0 +1,42 @@
+# The container e2e target: Debian with a real systemd as PID 1, so
+# the `systemd`, `apt`, `user` and `group` builtins can be exercised
+# against the same stack the fleet runs (VyOS is Debian-based).
+#
+# - `policy-rc.d` is disabled so package installs can start services
+#   (Debian images block that by default).
+# - The machine-id is left absent; systemd generates a fresh one on
+#   boot, so concurrent test containers don't share an identity.
+# - STOPSIGNAL is systemd's clean shutdown signal.
+# - HEALTHCHECK is the readiness probe the test harness waits on:
+#   `degraded` counts as up (some units always fail in containers,
+#   e.g. anything needing a real console), the builtins don't care.
+#   The image must be built `--format docker` — OCI images drop
+#   HEALTHCHECK.
+# - A `file://` apt repo with one installable package (`sl`) is baked
+#   in and the Debian network sources are removed, so the apt builtin
+#   resolves, installs and reports honestly with **no test-time
+#   network**. Build-time network is enough (this RUN block).
+FROM docker.io/library/debian:trixie-slim
+
+# `systemd-sysv` owns the /sbin/init symlink; `dpkg-dev` provides
+# dpkg-scanpackages for the local repo; `dbus` because the builtins
+# reach systemd through the *D-Bus system bus* (zbus won't use
+# /run/systemd/private), and systemd-socket-activation brings it up on
+# boot — without it every systemd builtin dies with a bare I/O error.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends systemd systemd-sysv dbus dpkg-dev \
+    && mkdir -p /opt/local-debs \
+    && cd /opt/local-debs \
+    && apt-get download sl libncurses6 libtinfo6 \
+    && dpkg-scanpackages -m . > Packages \
+    && echo 'deb [trusted=yes] file:///opt/local-debs ./' > /etc/apt/sources.list.d/local-debs.list \
+    && rm -f /etc/apt/sources.list.d/debian.sources \
+    && apt-get update \
+    && rm -f /etc/machine-id \
+    && printf '#!/bin/sh\nexit 0\n' > /usr/sbin/policy-rc.d
+
+STOPSIGNAL SIGRTMIN+3
+HEALTHCHECK --interval=1s --timeout=2s --start-period=10s --retries=30 \
+    CMD systemctl is-system-running | grep -qE '^(running|degraded)$' || exit 1
+
+CMD ["/sbin/init"]

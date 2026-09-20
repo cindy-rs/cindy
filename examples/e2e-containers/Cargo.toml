@@ -1,0 +1,34 @@
+[package]
+name = "e2e-containers"
+description = "End-to-end container example/test exercising the mutating builtins (systemd, apt, user, group) against a real Debian system under podman."
+publish = false
+version.workspace = true
+rust-version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "e2e-containers"
+path = "src/main.rs"
+
+[features]
+# Same dual-feature shape as examples/e2e-localhost: the harness builds
+# this crate once with each feature and cross-pipes the two resulting
+# processes — the worker half running inside the container via
+# `podman exec`, where the mutating builtins finally meet a real
+# systemd, shadow-utils and apt instead of unit tests over pure
+# helpers.
+default = ["orchestrator", "remote"]
+orchestrator = ["cindy/orchestrator"]
+remote = ["cindy/remote"]
+
+[dependencies]
+cindy = { workspace = true }
+futures-util = "0.3"
+serde_json = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
+tempfile = "3.27"
+testcontainers = "0.28"
+tokio = { workspace = true, features = ["macros", "rt"] }

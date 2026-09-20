@@ -24,21 +24,27 @@ trains people to ignore warnings.
 
 ## P3 — architecture
 
-### Integration coverage for the mutating builtins
+### Integration coverage for the secrets and CLI paths
 
-The highest-leverage item left. `examples/e2e-localhost` covers the
-happy path, worker death, both backpressure budgets, check mode and
-streaming fetch — but **nothing exercises `systemd`, `apt`, `user` or
-`group`**, because they need a real system rather than a pipe. That is
-exactly where the `--check` mutation bug shipped; unit tests over pure
-decision functions mitigate that without closing it.
+The mutating-builtins half of the old coverage item is closed:
+`examples/e2e-containers` runs `systemd`, `apt`, `user` and `group`
+against a real Debian-systemd container under podman — including the
+`--check` mask regression pinned end to end, and the shadow-utils
+create race (eight concurrent identical creates must converge to one
+account). It self-skips where podman or its image is unavailable, so
+the hermetic CI jobs stay green.
 
-A container-based harness would cover them (podman is already a
-dependency, for `cross`). Also untested at the integration level: the
-vault-key handshake reaching a worker-side `reveal()`, preflight failure
-on a missing key, `--limit` end to end, and concurrent invocation of one
-builtin — which is the shadow-utils create race, so it pairs with
-whichever of these lands first.
+Still untested at the integration level, none of it needing
+containers:
+
+- the vault-key handshake reaching a worker-side `reveal()` — the
+  localhost harness passes no keys, so a sealed secret has never
+  crossed the wire in a test;
+- preflight failure on a missing key (the worker must refuse before
+  any playbook code runs);
+- `--limit` end to end (CLI-side host filtering; only unit-tested).
+  The localhost harness can carry the first two with a real vault;
+  `--limit` needs the CLI's play path.
 
 ### Vault key rotation
 

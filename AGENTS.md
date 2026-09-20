@@ -36,6 +36,7 @@ cargo fmt --check                                    # CI fails on any drift
 cargo clippy --workspace --all-targets -- -D warnings # lints
 cargo test --workspace                               # unit + e2e
 cargo test -p e2e-localhost    # e2e alone; slow (builds two binaries), hermetic
+cargo test -p e2e-containers   # mutating-builtins e2e; needs podman, skips without it
 cargo audit                    # vulnerabilities; must stay empty
 
 # The site is a nested workspace — the root commands don't reach it.
@@ -61,8 +62,14 @@ raw `cargo check` only needs the file to exist.
 - `crates/cindy-cli` — the `cindy` binary: compiles the user's orchestrator,
   cross-builds remote workers via `cross` + podman, deploys over SSH, streams
   progress (ratatui), manages vaults (`cindy secret seal/unseal`).
-- `examples/e2e-localhost` — hermetic end-to-end harness; the only integration
-  coverage.
+- `examples/e2e-localhost` — hermetic end-to-end harness (local pipes,
+  no SSH, no containers).
+- `examples/e2e-containers` — container end-to-end harness: the
+  mutating builtins (`systemd`, `apt`, `user`, `group`) against a real
+  Debian-systemd container under podman (testcontainers over the
+  rootless podman socket; `Containerfile.systemd` in that crate builds
+  the image). Self-skips where podman or the image is unavailable, so
+  `cargo test --workspace` stays green in CI, which has neither.
 - `examples/snippet-check` — compile guard: `#[path]`-includes
   `web/src/snippets/*.rs` so the site's code examples can't drift from the real
   `cindy` API. Nothing executes; edit the snippets in `web/`, not here.
