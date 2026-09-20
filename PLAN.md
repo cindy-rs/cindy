@@ -46,12 +46,6 @@ containers:
   The localhost harness can carry the first two with a real vault;
   `--limit` needs the CLI's play path.
 
-### `fetch` has no headers, auth, or proxy
-
-`a9f7208` made it stream and bounded it, but there's still no way to pass
-an `Authorization` header — so a private GitHub release can't be
-fetched. `State` is the natural home.
-
 ### `archive`/`unarchive` still buffer whole trees
 
 `crates/cindy/src/builtin/unarchive.rs:284` reads the whole archive into

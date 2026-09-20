@@ -11,6 +11,10 @@ pub struct Vars {
     /// don't exercise fetch can leave it out of their host context.
     #[serde(default)]
     fetch_url_unsized: String,
+    /// Same body again, behind a server that demands an
+    /// `Authorization` header — for the `fetch::State::headers` path.
+    #[serde(default)]
+    fetch_url_authed: String,
     /// Bulk payload holder: the e2e test stuffs >128 KiB into it to
     /// prove the host-context hand-off survives contexts too large
     /// for a single env var (kernel `MAX_ARG_STRLEN`).
@@ -32,6 +36,7 @@ fn inventory() -> cindy::Inventory<Vars> {
                 fetch_url: "http://127.0.0.1/".into(),
                 fetch_sha256: String::new(),
                 fetch_url_unsized: "http://127.0.0.1/".into(),
+                fetch_url_authed: "http://127.0.0.1/".into(),
                 padding: String::new(),
             },
         }],
@@ -216,6 +221,55 @@ async fn main(host: cindy::Host<Vars>) -> cindy::Result<()> {
         .changed()
         {
             cindy::bail!("first fetch of {} reported Unchanged", good.display());
+        }
+
+        // Request headers reach the server: the authed URL serves the
+        // same body, but only to a request carrying the token.
+        let authed_ok = work.join("authed.bin");
+        if !fetch::fetch(fetch::State {
+            url: host.vars.fetch_url_authed.clone(),
+            dest: authed_ok.clone(),
+            checksum: Some(fetch::Checksum::Sha256(host.vars.fetch_sha256.clone())),
+            headers: vec![("Authorization".into(), "Bearer cindy-e2e-token".into())],
+            ..Default::default()
+        })
+        .await?
+        .changed()
+        {
+            cindy::bail!("authed fetch reported Unchanged for a missing file");
+        }
+
+        // Without the header the server refuses, and the fetch fails.
+        let authed_denied = work.join("authed-denied.bin");
+        if fetch::fetch(fetch::State {
+            url: host.vars.fetch_url_authed.clone(),
+            dest: authed_denied.clone(),
+            ..Default::default()
+        })
+        .await
+        .is_ok()
+        {
+            cindy::bail!("fetch succeeded against a server that demanded authorization");
+        }
+        if authed_denied.exists() {
+            cindy::bail!("refused fetch left {} behind", authed_denied.display());
+        }
+
+        // A satisfied destination skips the request entirely — even
+        // one whose headers would now be rejected. Pointing the
+        // re-run at a *bad* token is the proof: if it re-requested,
+        // the 403 would fail the call instead of reporting Unchanged.
+        if fetch::fetch(fetch::State {
+            url: host.vars.fetch_url_authed.clone(),
+            dest: authed_ok.clone(),
+            checksum: Some(fetch::Checksum::Sha256(host.vars.fetch_sha256.clone())),
+            headers: vec![("Authorization".into(), "Bearer wrong-token".into())],
+            ..Default::default()
+        })
+        .await?
+        .changed()
+        {
+            cindy::bail!("satisfied authed fetch re-requested instead of skipping");
         }
 
         // …and a re-run whose content is already satisfied must repair

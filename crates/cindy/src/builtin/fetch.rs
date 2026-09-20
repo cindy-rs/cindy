@@ -172,6 +172,13 @@ pub struct State {
     /// [`max_bytes`](Self::max_bytes) and header retrieval by its own
     /// fixed timeout.
     pub timeout: Option<std::time::Duration>,
+    /// Extra request headers, applied verbatim — e.g.
+    /// `Authorization: Bearer …` for a private GitHub release. Header
+    /// values often carry secrets: they are never logged (the run-view
+    /// line is `dest <- url`), and revealing them from a
+    /// [`Secret`](crate::secret::Secret) inside the remote fn before
+    /// building the `State` is the intended shape.
+    pub headers: Vec<(String, String)>,
 }
 
 /// `url` with any `user:password@` userinfo replaced.
@@ -370,10 +377,13 @@ fn apply(state: State) -> crate::Result<super::Return> {
         &format!("~ {} <- {url}", state.dest.display()),
     );
 
-    let mut response = agent(state.timeout)
-        .get(&state.url)
-        .call()
-        .context(format!("GET {url} failed"))?;
+    let mut request = agent(state.timeout).get(&state.url);
+    for (name, value) in &state.headers {
+        // ureq defers header validation to `call()`, so a bad name or
+        // value surfaces as the request's own error, wrapped below.
+        request = request.header(name.as_str(), value.as_str());
+    }
+    let mut response = request.call().context(format!("GET {url} failed"))?;
 
     // Reject an over-sized artefact from the declared length before a
     // single body byte is transferred, when the server declares one.

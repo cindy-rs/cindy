@@ -105,6 +105,47 @@ fn start_http_server() -> String {
     format!("http://{addr}/")
 }
 
+/// Like [`start_http_server`], but demands an `Authorization` header
+/// (`Bearer cindy-e2e-token`) and answers `403` without it — the
+/// counterpart for exercising `fetch::State::headers`.
+fn start_http_server_authed() -> String {
+    // Header *names* arrive lower-cased (HTTP names are
+    // case-insensitive and ureq normalises); the value is exact.
+    const REQUIRED_VALUE: &str = "Bearer cindy-e2e-token";
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind localhost");
+    let addr = listener.local_addr().expect("local addr");
+
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            let mut buf = [0u8; 2048];
+            let n = stream.read(&mut buf).unwrap_or(0);
+            let request = String::from_utf8_lossy(&buf[..n]).into_owned();
+            let ok = request.lines().any(|l| {
+                l.split_once(':').is_some_and(|(name, value)| {
+                    name.trim().eq_ignore_ascii_case("authorization")
+                        && value.trim() == REQUIRED_VALUE
+                })
+            });
+            let header = if ok {
+                format!(
+                    "HTTP/1.0 200 OK\r\nContent-Length: {}\r\nContent-Type: application/octet-stream\r\n\r\n",
+                    FETCH_BODY.len()
+                )
+            } else {
+                "HTTP/1.0 403 Forbidden\r\nContent-Length: 0\r\n\r\n".to_owned()
+            };
+            let _ = stream.write_all(header.as_bytes());
+            if ok {
+                let _ = stream.write_all(FETCH_BODY);
+            }
+            let _ = stream.flush();
+        }
+    });
+
+    format!("http://{addr}/")
+}
+
 /// Like [`start_http_server`] but sends **no** `Content-Length`, so the
 /// body is delimited only by the connection close.
 ///
@@ -500,6 +541,7 @@ fn fetch_streams_within_its_limits() {
             "fetch_url": start_http_server(),
             "fetch_sha256": hex(&sha2::Sha256::digest(FETCH_BODY)),
             "fetch_url_unsized": start_http_server_unsized(),
+            "fetch_url_authed": start_http_server_authed(),
         }
     });
 
