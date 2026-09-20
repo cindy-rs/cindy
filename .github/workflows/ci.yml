@@ -1,13 +1,12 @@
-# Mirror of the checks in .gitlab-ci.yml, for the repository's actual
-# home (github.com/cindy-rs/cindy).
+# CI for github.com/cindy-rs/cindy.
 #
 # No docker-in-docker anywhere, and none needed: a GitHub-hosted
 # `ubuntu-*` runner is a **virtual machine** with a real Docker daemon
 # already running, not a container. `/var/run/docker.sock` is there, so
 # testcontainers — and therefore examples/e2e-containers — works with
-# no service, no privileged mode and no DOCKER_HOST. (dind exists on
-# GitLab because its runners execute jobs *inside* containers, so
-# nesting needs help. There is nothing to nest here.)
+# no service, no privileged mode and no DOCKER_HOST. (dind is the
+# pattern for runners that execute jobs *inside* containers; there is
+# nothing to nest here.)
 #
 # Two consequences worth knowing:
 #   * `container:` on a job would put us back inside a container, and
@@ -85,8 +84,7 @@ jobs:
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
       # The site is a nested workspace with its own lockfile; the
-      # action above only audits the root one (as .gitlab-ci.yml's
-      # check.audit does both explicitly).
+      # action above only audits the root one.
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-audit
@@ -95,7 +93,7 @@ jobs:
 
   web:
     # The marketing site is a nested workspace; the root commands don't
-    # reach it, so it gets its own job (as in .gitlab-ci.yml).
+    # reach it, so it gets its own job.
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

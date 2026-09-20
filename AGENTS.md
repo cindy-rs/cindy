@@ -28,8 +28,7 @@ GLM, GPT, ...) collaborate here alongside the human owner.
 ## Commands
 
 These are what `.github/workflows/ci.yml` runs; match them exactly or CI will
-disagree with your local pass. (`.gitlab-ci.yml` is kept for the GitLab mirror
-and lists the same checks, minus the container suite.)
+disagree with your local pass.
 
 ```sh
 cargo check --workspace                              # fast type check
@@ -71,8 +70,8 @@ raw `cargo check` only needs the file to exist.
   builds the image). Speaks the Docker API directly (testcontainers +
   bollard), so podman and docker both work and no CLI is involved.
   **Required, not optional** — no engine fails the suite, naming what's
-  missing; `CINDY_E2E_CONTAINERS=skip` is the deliberate opt-out (the
-  GitLab mirror uses it, since its jobs run inside containers).
+  missing; `CINDY_E2E_CONTAINERS=skip` is the deliberate opt-out for
+  machines with no engine.
 - `examples/snippet-check` — compile guard: `#[path]`-includes
   `web/src/snippets/*.rs` so the site's code examples can't drift from the real
   `cindy` API. Nothing executes; edit the snippets in `web/`, not here.

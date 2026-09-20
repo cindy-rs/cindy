@@ -26,9 +26,6 @@
 //! interested in stdout and stderr"), whereas bollard's
 //! `StartExecResults::Attached { input, output }` is exactly that pipe.
 //! Same socket, same container, one level down.
-//!
-//! `CINDY_E2E_SYSTEMD_IMAGE` names a prebuilt image instead of
-//! building, which is how CI skips a build in the test job.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -99,34 +96,17 @@ fn negotiate() -> &'static Result<(), String> {
     })
 }
 
-/// The image to run, built once for the suite if it isn't supplied.
-///
-/// `CINDY_E2E_SYSTEMD_IMAGE` takes precedence and is assumed present or
-/// pullable — that's how CI supplies a prebuilt image without a build
-/// in the test job. Otherwise `Containerfile.systemd` is built through
-/// the crate, which sidesteps the engine-specific flags a `podman
-/// build` / `docker build` shell-out would have needed to reconcile.
+/// The image to run: `Containerfile.systemd` in this crate, built once
+/// for the suite through testcontainers — no `podman build` /
+/// `docker build` shell-out, so no engine-specific flags to
+/// reconcile, and the engine's layer cache makes repeats cheap. What's
+/// memoised here is "the build has happened": every container start
+/// needs its own `GenericImage`, which carries no state beyond the
+/// `IMAGE_NAME:TAG` descriptor.
 async fn image() -> GenericImage {
-    static IMAGE: tokio::sync::OnceCell<(String, String)> = tokio::sync::OnceCell::const_new();
-    let (name, tag) = IMAGE
+    static BUILT: tokio::sync::OnceCell<()> = tokio::sync::OnceCell::const_new();
+    BUILT
         .get_or_init(|| async {
-            // CI supplies a prebuilt reference; use it as-is and let
-            // the container start report the truth if it's wrong.
-            if let Ok(explicit) = std::env::var("CINDY_E2E_SYSTEMD_IMAGE") {
-                let (name, tag) = explicit
-                    .rsplit_once(':')
-                    .map(|(n, t)| (n.to_owned(), t.to_owned()))
-                    .unwrap_or((explicit.clone(), "latest".to_owned()));
-                return (name, tag);
-            }
-            // Built through the crate, so no `podman build` shell-out
-            // and no engine-specific flags. Built once for the suite:
-            // `build_image` is idempotent but not free.
-            // The built `GenericImage` is dropped rather than returned:
-            // each container start needs its own (it's consumed by
-            // `start`), and it carries no state beyond the
-            // `IMAGE_NAME:TAG` descriptor this memoises. What's cached
-            // here is "the build has happened".
             drop(
                 GenericBuildableImage::new(IMAGE_NAME, TAG)
                     .with_dockerfile(
@@ -135,16 +115,13 @@ async fn image() -> GenericImage {
                     .build_image()
                     .await
                     .expect(
-                        "building the systemd image failed (needs network on first run); \
-                         see Containerfile.systemd, or point CINDY_E2E_SYSTEMD_IMAGE at a \
-                         prebuilt one",
+                        "building the systemd image failed (needs network on first \
+                         run); see Containerfile.systemd",
                     ),
             );
-            (IMAGE_NAME.to_owned(), TAG.to_owned())
         })
-        .await
-        .clone();
-    GenericImage::new(name, tag)
+        .await;
+    GenericImage::new(IMAGE_NAME, TAG)
 }
 
 /// Is the suite able to run? `Err(reason)` fails every test with that
