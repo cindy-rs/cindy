@@ -300,6 +300,7 @@ async fn main() -> eyre::Result<()> {
     let cargo_meta = Arc::new(cargo_metadata::MetadataCommand::new().exec()?);
     let workspace_root = cargo_meta.workspace_root.clone().into_std_path_buf();
     let is_play = matches!(args.subcommand, Subcommand::Play { .. });
+    let is_check_play = matches!(args.subcommand, Subcommand::Play { check: true, .. });
     // The run view (progress::run) takes over stderr with an alternate
     // screen when stderr is a tty. A tracing layer writing to that same
     // stderr would punch through and corrupt the TUI, so logs are routed
@@ -314,8 +315,14 @@ async fn main() -> eyre::Result<()> {
             .with_writer(progress::LogWriter)
             .init();
     } else {
+        // Human-facing format for every non-play invocation (`secret`,
+        // `inventory`, …): elapsed-since-start instead of wall-clock
+        // timestamps, no module target, no thread ids — the default
+        // `tracing` format reads like a log-shipping agent, not a CLI.
         tracing_subscriber::fmt()
             .with_writer(std::io::stderr)
+            .with_target(false)
+            .with_timer(tracing_subscriber::fmt::time::uptime())
             .init();
     }
 
@@ -360,7 +367,7 @@ async fn main() -> eyre::Result<()> {
     // every child process is spawned `kill_on_drop`, so the local
     // orchestrators die, the SSH sessions drop, and the workers EOF out of
     // their RPC loops and exit.
-    let result: eyre::Result<()> = tokio::select! {
+    let result: eyre::Result<Option<RunSummary>> = tokio::select! {
         biased;
         r = run_after_launch(args.subcommand, workspace_root, Arc::clone(&cargo_meta), progress_tx.clone()) => r,
         _ = abort_rx.changed() => Err(eyre::eyre!(
@@ -376,7 +383,7 @@ async fn main() -> eyre::Result<()> {
     // prints on the actual terminal. Per-host failures (`RunFailed`) keep
     // the view up — their diagnostics live in the host panes.
     if let Err(e) = &result
-        && e.downcast_ref::<RunFailed>().is_none()
+        && e.downcast_ref::<RunSummary>().is_none()
     {
         let _ = progress_tx.send(progress::Msg::Shutdown);
     }
@@ -390,24 +397,31 @@ async fn main() -> eyre::Result<()> {
         let _ = view.await;
     }
 
-    // A completed-but-failed run is reported as a single summary line and a
-    // non-zero exit, without eyre's backtrace decoration. Any other error
+    // The play's terminal report — count, duration, failed host names —
+    // printed as plain lines (the view is torn down by now, and on a tty
+    // the tracing subscriber writes into its no-longer-rendered log pane,
+    // so a tracing call here would be invisible). Failed runs exit
+    // non-zero without eyre's backtrace decoration; any other error
     // propagates normally (eyre prints it).
+    let tty = std::io::stderr().is_terminal();
     match result {
-        Ok(()) => {
-            // Plain eprintln: the play view is torn down by now, and on a
-            // tty the tracing subscriber writes into its (no longer
-            // rendered) log pane — a tracing call here would be invisible.
-            if is_play {
-                eprintln!("All hosts completed successfully.");
+        Ok(Some(summary)) => {
+            if tty {
+                eprintln!("\x1b[32m✓\x1b[0m {summary}");
+            } else {
+                eprintln!("OK: {summary}");
+            }
+            if is_check_play {
+                eprintln!("check mode: nothing was applied");
             }
             Ok(())
         }
-        Err(e) if e.downcast_ref::<RunFailed>().is_some() => {
-            if std::io::stderr().is_terminal() {
-                eprintln!("\x1b[31m{e}\x1b[0m");
+        Ok(None) => Ok(()),
+        Err(e) if e.downcast_ref::<RunSummary>().is_some() => {
+            if tty {
+                eprintln!("\x1b[31m✗\x1b[0m {e}");
             } else {
-                eprintln!("{e}");
+                eprintln!("FAILED: {e}");
             }
             std::process::exit(1);
         }
@@ -423,7 +437,8 @@ async fn run_after_launch(
     workspace_root: PathBuf,
     cargo_meta: Arc<cargo_metadata::Metadata>,
     progress_tx: tokio::sync::mpsc::UnboundedSender<progress::Msg>,
-) -> eyre::Result<()> {
+) -> eyre::Result<Option<RunSummary>> {
+    let started = std::time::Instant::now();
     let orchestrator_exe_path = compile_orchestrator(&workspace_root, &cargo_meta).await?;
 
     // `--reveal` must reach the orchestrator dump, which does the
@@ -495,7 +510,7 @@ async fn run_after_launch(
                     None => whole,
                 };
                 println!("{}", serde_json::to_string_pretty(&value)?);
-                return Ok(());
+                return Ok(None);
             }
             // Print the `Debug` rendering the orchestrator produced from
             // the user's real `V`, not the JSON-`Value` `Debug` the CLI
@@ -511,7 +526,7 @@ async fn run_after_launch(
                 }
             })?;
             println!("{rendered}");
-            return Ok(());
+            return Ok(None);
         }
         Subcommand::Secret(_) => unreachable!("handled above"),
     };
@@ -538,7 +553,7 @@ async fn run_after_launch(
     }
     tracing::info!(count = selected.len(), "selected hosts after --limit");
 
-    tracing::info!("Initiating pre-flight checks across targets...");
+    tracing::info!("pre-flighting targets");
     let discovery_futures = selected.into_iter().map(|host| async move {
         // `server_alive_interval`: a target that dies without closing the
         // TCP connection (reboot, `sysupgrade`, power loss) would otherwise
@@ -710,17 +725,22 @@ async fn run_after_launch(
     }
     tracing::info!("Vault key preflight passed for all targets.");
 
-    tracing::info!("Launching parallel deployment loops...");
+    tracing::info!(count = discovered_hosts.len(), "deploying");
     let orchestrator_path = Arc::new(orchestrator_exe_path);
     let host_contexts = Arc::new(host_contexts);
     let host_vault_keys = Arc::new(host_vault_keys);
 
     if check_mode {
         tracing::warn!(
-            "check mode: builtins will report without applying; command/shell will not              execute; custom #[remote] functions still run"
+            "check mode: builtins report without applying; command/shell won't \
+             execute; custom #[remote] functions still run"
         );
     }
 
+    let host_names: Vec<String> = discovered_hosts
+        .iter()
+        .map(|h| h.host.name.clone())
+        .collect();
     let deployment_futures = discovered_hosts.into_iter().enumerate().map(|(idx, host)| {
         let orch_path = Arc::clone(&orchestrator_path);
         let worker_binaries = Arc::clone(&worker_binaries);
@@ -954,7 +974,7 @@ async fn run_after_launch(
                 }
                 drop(remote_run);
 
-                tracing::info!("Execution successfully completed.");
+                tracing::info!("playbook completed");
                 Ok::<(), eyre::Error>(())
             }
             .instrument(context_span)
@@ -997,30 +1017,76 @@ async fn run_after_launch(
 
     let results = futures_util::future::join_all(deployment_futures).await;
 
-    let failed = results.iter().filter(|r| r.is_err()).count();
-    if failed > 0 {
+    let total = host_names.len();
+    let failed: Vec<String> = results
+        .iter()
+        .zip(&host_names)
+        .filter(|(r, _)| r.is_err())
+        .map(|(_, name)| name.clone())
+        .collect();
+    let summary = RunSummary {
+        total,
+        failed,
+        elapsed: started.elapsed(),
+    };
+    if summary.failed.is_empty() {
+        Ok(Some(summary))
+    } else {
         // The per-host failures (including any panic output) were already
-        // shown in the run view; report a one-line summary as the error so
-        // `main` can tear the view down first, then exit non-zero without an
+        // shown in the run view; raise the summary as the error so `main`
+        // can tear the view down first, then exit non-zero without an
         // eyre backtrace.
-        eyre::bail!(RunFailed(failed));
+        eyre::bail!(summary);
     }
-    Ok(())
 }
 
 /// Sentinel error for "N hosts failed". Carries no backtrace-worthy context —
 /// the real per-host failures were already shown in the run view — so `main`
 /// can render a single red summary line and exit non-zero.
 #[derive(Debug)]
-struct RunFailed(usize);
+/// The terminal run report carried out of the deployment loops so
+/// `main` can print it after the view is torn down (plain `eprintln`
+/// — a `tracing` call there would land in the no-longer-rendered log
+/// pane on a tty).
+struct RunSummary {
+    total: usize,
+    failed: Vec<String>,
+    elapsed: std::time::Duration,
+}
 
-impl std::fmt::Display for RunFailed {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{} host(s) failed", self.0)
+impl RunSummary {
+    fn plural(&self) -> &'static str {
+        if self.total == 1 { "host" } else { "hosts" }
     }
 }
 
-impl std::error::Error for RunFailed {}
+impl std::fmt::Display for RunSummary {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mins = self.elapsed.as_secs() / 60;
+        let secs = self.elapsed.as_secs() % 60;
+        let dur = format!("{mins}m{secs:02}s");
+        if self.failed.is_empty() {
+            write!(
+                f,
+                "all {} {} completed successfully in {dur}",
+                self.total,
+                self.plural()
+            )
+        } else {
+            let list = self.failed.join(", ");
+            write!(
+                f,
+                "{} of {} {} failed in {dur}: {list} \
+                 (their output is above, or in the run view via f)",
+                self.failed.len(),
+                self.total,
+                self.plural()
+            )
+        }
+    }
+}
+
+impl std::error::Error for RunSummary {}
 
 /// Ask the orchestrator binary which vaults its `secret!` invocations
 /// reference (the "secrets in code" half of the preflight), by running
@@ -1280,7 +1346,36 @@ async fn compile_remote_worker(
 
 #[cfg(test)]
 mod tests {
-    use super::ssh_fingerprint;
+    use super::{RunSummary, ssh_fingerprint};
+
+    /// The end-of-play summary is operator-facing text: successes state
+    /// the count and duration, failures name every failed host and
+    /// where to find their output — asserted in both directions, per
+    /// the repo's message practice.
+    #[test]
+    fn run_summary_names_failed_hosts_and_counts() {
+        let summary = RunSummary {
+            total: 3,
+            failed: vec!["web-01".into(), "db-2".into()],
+            elapsed: std::time::Duration::from_secs(75),
+        };
+        let msg = summary.to_string();
+        assert!(msg.contains("2 of 3 hosts failed"), "{msg}");
+        assert!(msg.contains("web-01, db-2"), "{msg}");
+        assert!(msg.contains("1m15s"), "{msg}");
+        assert!(msg.contains("run view"), "{msg}");
+        assert!(!msg.contains("successfully"), "{msg}");
+
+        let ok = RunSummary {
+            total: 8,
+            failed: vec![],
+            elapsed: std::time::Duration::from_secs(723),
+        };
+        let msg = ok.to_string();
+        assert!(msg.contains("all 8 hosts completed successfully"), "{msg}");
+        assert!(msg.contains("12m03s"), "{msg}");
+        assert!(!msg.contains("failed"), "{msg}");
+    }
 
     /// The digest must byte-for-byte match `ssh-keygen -lf`, so a logged
     /// TOFU line can be diffed against known_hosts by eye. Vector from a

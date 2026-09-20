@@ -285,13 +285,17 @@ async fn stream(mut rx: tokio::sync::mpsc::UnboundedReceiver<Msg>) {
                 eprintln!("[{}] {}", hosts[idx].name, strip_ansi(&line));
             }
             Msg::Status(idx, status) => {
-                hosts[idx].status = status;
-                let label = match status {
-                    Status::Finished => "finished",
-                    Status::Failed => "failed",
+                hosts[idx].set_status(status);
+                let (glyph, label) = match status {
+                    Status::Finished => ("✓", "finished"),
+                    Status::Failed => ("✗", "failed"),
                     Status::Running => continue,
                 };
-                eprintln!("[{}] {label}", hosts[idx].name);
+                eprintln!(
+                    "[{}] {glyph} {label} in {}",
+                    hosts[idx].name,
+                    fmt_duration(hosts[idx].runtime()),
+                );
             }
             // Non-interactive output has nothing to tear down; the loop
             // ends when the senders drop right after this message.

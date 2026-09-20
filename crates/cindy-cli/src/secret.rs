@@ -590,7 +590,8 @@ async fn seal_all(orchestrator_path: &Path, all: bool) -> eyre::Result<()> {
         }
         records = keep_indices(records, &selected);
     }
-    tracing::info!(count = records.len(), "Sealing pending secrets...");
+    let count = records.len();
+    tracing::info!(count, "Sealing pending secrets...");
 
     let mut by_file: std::collections::BTreeMap<String, Vec<SealRecord>> =
         std::collections::BTreeMap::new();
@@ -604,7 +605,9 @@ async fn seal_all(orchestrator_path: &Path, all: bool) -> eyre::Result<()> {
         affected.push(path);
     }
 
+    let files = affected.len();
     cargo_fmt(&affected);
+    println!("sealed {count} secret(s) across {files} file(s)");
     Ok(())
 }
 
@@ -737,10 +740,11 @@ fn unseal_all(all: bool) -> eyre::Result<()> {
         total += count;
     }
 
+    let files = affected.len();
     cargo_fmt(&affected);
-    tracing::info!(
-        count = total,
-        "unsealed total secrets (re-run `cindy secret seal` to put them back)"
+    println!(
+        "unsealed {total} secret(s) across {files} file(s) — re-run \
+         `cindy secret seal` to seal them back"
     );
     Ok(())
 }
