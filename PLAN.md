@@ -1,10 +1,11 @@
 # PLAN.md
 
-Outstanding work, written up by `opus` after a full review of the
-codebase at `15bc5c4` plus the five commits that followed. Intended to be
-picked up by another agent — read [AGENTS.md](AGENTS.md) first, then this.
+Outstanding work. Started by `opus` from a full review of the codebase at
+`15bc5c4`; most of it has since been implemented by `glm`, and what's
+left is below. Intended to be picked up by another agent — read
+[AGENTS.md](AGENTS.md) first, then this.
 
-Line references are accurate as of `61857f3`; re-grep before trusting
+Line references are accurate as of `60b3982`; re-grep before trusting
 them, the code moves.
 
 ## How to use this file
@@ -13,20 +14,19 @@ them, the code moves.
 - Each item states the **problem**, a **suggested approach**, and how to
   know it's **done**. The approach is a suggestion, not a specification —
   if you see a better one, take it and say why in the commit message.
-- Some items are blocked on a decision only the human can make. They're
-  in [Needs a decision](#needs-a-decision). Don't guess; ask.
 - Tick items off by deleting them from this file in the same commit that
-  implements them. A stale plan is worse than no plan.
+  implements them. A stale plan is worse than no plan. A decision *not*
+  to do something moves to the section below instead of being deleted.
 - Verify with `cargo check --workspace`, `cargo clippy --workspace
   --all-targets -- -D warnings`, `cargo fmt --check`, `cargo test
-  --workspace`. Current baseline: **96 tests** (68 lib, 24 CLI, 4 e2e),
+  --workspace`. Current baseline: **120 tests** (82 lib, 32 CLI, 6 e2e),
   clippy and fmt clean, `cargo audit` free of vulnerabilities. Don't
   regress that.
 
 ## Decisions already made — do not re-litigate
 
-Recorded because each of these was proposed, considered, and rejected
-for a reason that isn't visible in the code.
+Recorded because each of these was proposed, considered, and settled for
+a reason that isn't visible in the code.
 
 - **Diffs show secrets, and that's accepted.** `path` prints a content
   diff to stderr, so a config file holding a revealed secret appears in
@@ -55,10 +55,14 @@ for a reason that isn't visible in the code.
   ("attacker can rearrange ciphertexts but not execute code") doesn't
   exist here, because ciphertexts live in the playbook source and anyone
   who can move a blob can rewrite the code that consumes it. The
-  *version byte* half of that proposal was implemented separately
-  (see git history).
+  *version byte* half of that proposal was the part worth keeping, and
+  shipped in `9c6234a`.
 - **`apt::install_all` was rejected** in favour of `impl
   Into<PackageList>`, which is what `fe3dc4e` implemented.
+- **Buster (apt < 2.1.10) is not a target.** The fleet is VyOS 1.3+
+  (apt ≥ 2.2.4) and OpenWrt (no apt), so `apt-get` relies on
+  `-o DPkg::Lock::Timeout` and doesn't need the
+  `run_check_retry_locks` wrapper `apt-mark` gets.
 - **`--forks`/`--serial` were rejected** for the current fleet: the
   fan-out cost is SSH sessions against realistic fleet sizes, and the
   RPC byte budget already throttles the heavy traffic — the knobs
@@ -72,27 +76,59 @@ for a reason that isn't visible in the code.
   coordination primitive (one orchestrator driving hosts in batches),
   not a per-playbook workaround.
 
-## Priority 1 — correctness bugs
+## Practices this codebase learned the hard way
+
+Not tasks — the review findings that recurred, and the shapes that
+stopped them. Worth applying to new code rather than rediscovering.
+
+- **Conditional behaviour belongs in a pure decision function.** Every
+  `--check` defect (the `Enablement::Disabled` unmask that mutated
+  under `--check`, `fetch` under-reporting attr drift, and the guard in
+  the reverted `09ec86e`) came from a condition replicated across call
+  sites with nothing enforcing it. The shape that survives review is
+  `plan_holds`, `system_conflict`, `disable_would_change`,
+  `file_attrs_satisfied`: extract the would-this-change decision,
+  unit-test it, and let both the real path and the dry-run path read
+  the same answer.
+- **When the message is the feature, assert on the message.**
+  `assert!(result.is_err())` let two separate regressions ship green —
+  an unknown-version error that didn't name the version, then a
+  wrong-key error that claimed to be a version problem. Error-path
+  tests assert the text in both directions: it says X, and it does
+  *not* say Y.
+- **Audit for mutations, not for guards.** Grepping existing
+  `dry_run()` call sites found nothing wrong with `daemon_reload` —
+  because it had no guard at all and so never appeared in the results.
+  Enumerate the mutating operations and check each one is covered.
 
 ## Priority 2 — robustness and consistency
 
-### `apt-get` on pre-2.1.10 apt
-
-Decided: **buster is not a target** — the fleet is VyOS 1.3+ (apt ≥
-2.2.4) and OpenWrt (no apt). `apt-get` keeps plain `run_check_retry_locks`
-coverage only via the `-o DPkg::Lock::Timeout` option old apt silently
-ignores, which is acceptable.
-
 ### `nix 0.31.3` future-incompat
 
-Every build prints a future-incompatibility warning for `nix`. Bump when
-a fixed release exists; until then it's noise that trains people to
-ignore warnings.
+Every build prints a future-incompatibility warning for `nix`. Blocked
+upstream: bump when a fixed release exists. Until then it's noise that
+trains people to ignore warnings.
 
 ## Priority 3 — architecture
 
 Bigger pieces. Each is worth its own discussion before implementation;
 don't start one without checking it's still wanted.
+
+### Integration coverage for the mutating builtins
+
+The highest-leverage item left. `examples/e2e-localhost` covers the
+happy path, worker death, both backpressure budgets, check mode and
+streaming fetch — but **nothing exercises `systemd`, `apt`, `user` or
+`group`**, because they need a real system rather than a pipe. That is
+exactly where the `--check` mutation bug shipped, and unit tests over
+pure decision functions mitigate that without closing it.
+
+A container-based harness would cover them (podman is already a
+dependency, for `cross`). Also still untested at the integration level:
+the vault-key handshake reaching a worker-side `reveal()`, preflight
+failure on a missing key, `--limit` end to end, and concurrent
+invocation of one builtin — which is the shadow-utils create race, so
+it pairs with whichever of these lands first.
 
 ### Vault key rotation
 
@@ -109,16 +145,10 @@ fetched. `State` is the natural home.
 
 ### `archive`/`unarchive` still buffer whole trees
 
-`crates/cindy/src/builtin/unarchive.rs:275` reads the whole archive into
-memory and then decompresses into a second buffer;
-`archive.rs` builds trees in a `Vec<u8>`. The same treatment `fetch` got
-in `a9f7208` — tar, zip and 7z all support streaming readers. Do the
-decompression ceiling above first; it's the safety-relevant half.
-
-### e2e coverage gaps
-
-`examples/e2e-localhost` covers the happy path, worker death,
-backpressure and streaming fetch. Untested: the vault-key handshake
-reaching a worker-side `reveal()`, preflight failure on a missing key,
-`--limit` end to end, and concurrent builtin invocation — which is where
-the shadow-utils race above lives, so that item and this one pair well.
+`crates/cindy/src/builtin/unarchive.rs:284` reads the whole archive into
+memory before handing it to `decompress::bounded`, and
+`archive.rs:62`/`:79` build tar and zip output in a `Vec<u8>`. The
+decompression *ceiling* (`2d2574b`) closed the OOM-on-hostile-input
+half; this is the remaining O(archive size) resident cost on ordinary
+input. Same treatment `fetch` got in `a9f7208` — tar, zip and 7z all
+support streaming readers.
