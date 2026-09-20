@@ -24,24 +24,27 @@ trains people to ignore warnings.
 
 ## P3 — architecture
 
-### Integration coverage for the secrets and CLI paths
+### `--limit` end to end (CLI-side host filtering; only unit-tested)
 
-The mutating-builtins half of the old coverage item is closed:
-`examples/e2e-containers` runs `systemd`, `apt`, `user` and `group`
-against a real Debian-systemd container — including the `--check` mask
-regression pinned end to end, and the shadow-utils create race (eight
-concurrent identical creates must converge to one account). It is
-required, not optional: no container engine means a failing suite, not
-a silent skip (`6f26f59`).
+The rest of the old integration-coverage item is closed. The mutating
+builtins run against a real Debian-systemd container in
+`examples/e2e-containers` (`6f26f59`, required, not optional), and the
+secrets paths are pinned in `examples/e2e-localhost`: a real vault key
+crosses the RPC handshake and reveals worker-side
+(`secret_reveals_on_the_worker_through_the_handshake`), the
+orchestrator refuses a missing key before any playbook code runs
+(`missing_key_refuses_before_any_playbook_code_runs`), and the worker
+refuses a keyless handshake at the preflight, before dispatching a
+call (`worker_refuses_a_keyless_handshake_before_any_code_runs`,
+driven by a `worker-vault-demand` cargo feature so ordinary scenario
+workers stay demand-free).
 
-Still untested at the integration level, none of it needing
-containers:
-
-- the vault-key handshake reaching a worker-side `reveal()` — the
-  localhost harness passes no keys, so a sealed secret has never
-  crossed the wire in a test;
-- preflight failure on a missing key (the worker must refuse before
-   any playbook code runs);
-- `--limit` end to end (CLI-side host filtering; only unit-tested).
-  The localhost harness can carry the first two with a real vault;
-  `--limit` needs the CLI's play path.
+What's left is driving the real CLI through `play --limit`, and the
+blocker is architectural: discovery and deployment hold
+`openssh::Session` values directly (`main.rs`), so no harness can
+inject a host transport. The seam would be a session enum —
+`Ssh(openssh::Session)` or a local stdio transport — threaded through
+discovery, worker upload and deploy. That would make the whole play
+path e2e-able (`--check`, the CLI vault preflight, the run summary),
+not just `--limit`; it's this item's real payload and its real cost.
+P3-sized: confirm before starting.

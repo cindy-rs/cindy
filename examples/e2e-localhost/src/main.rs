@@ -20,6 +20,23 @@ pub struct Vars {
     /// for a single env var (kernel `MAX_ARG_STRLEN`).
     #[serde(default)]
     padding: String,
+    /// Sealed secret riding the host context — the wire form
+    /// (`{vault, ciphertext}`) is what real sealed inventories hold.
+    /// Revealed *on the worker* by the `CINDY_E2E_SECRETS` scenario to
+    /// prove the vault key arrives through the RPC handshake.
+    #[serde(default = "plain_secret")]
+    secret: cindy::Secret<String>,
+    /// What the worker-side reveal must produce; compared in the
+    /// scenario so a mangled reveal fails the play, not the assert.
+    #[serde(default)]
+    secret_expected: String,
+}
+
+/// Pre-seal placeholder for the `secret` var: never serialised (a
+/// `Secret::Plain` refuses to be), only used when the field is absent
+/// from the host context.
+fn plain_secret() -> cindy::Secret<String> {
+    cindy::Secret::new(String::new())
 }
 
 #[cindy::inventory]
@@ -38,6 +55,8 @@ fn inventory() -> cindy::Inventory<Vars> {
                 fetch_url_unsized: "http://127.0.0.1/".into(),
                 fetch_url_authed: "http://127.0.0.1/".into(),
                 padding: String::new(),
+                secret: plain_secret(),
+                secret_expected: String::new(),
             },
         }],
     }
@@ -47,6 +66,38 @@ fn inventory() -> cindy::Inventory<Vars> {
 /// enough that overlapping executions would certainly be observed,
 /// and reports data integrity plus the highest concurrency seen so
 /// far.
+/// Reveals a sealed secret *on the worker*: the vault key must have
+/// arrived through the RPC handshake (never argv/env), so a correct
+/// return proves the key crossed the wire and decrypts worker-side.
+#[cindy::remote]
+fn reveal_on_worker(secret: cindy::Secret<String>) -> cindy::Result<String> {
+    secret.reveal()
+}
+
+/// Side-effect probe for the keyless-handshake scenario: if the worker
+/// ever dispatches it, playbook code ran despite a failed vault
+/// preflight — the test asserts this marker never appears.
+#[cindy::remote]
+fn keyless_marker(dest: PathBuf) -> cindy::Result<()> {
+    std::fs::write(dest, b"ran")?;
+    Ok(())
+}
+
+/// Never called: its `secret!` site exists so a *worker* binary built
+/// with the `worker-vault-demand` feature registers a vault demand.
+/// Double-gated (remote + the feature) because it's link-time
+/// registration: the orchestrator build must not demand the vault (its
+/// own preflight would fire first and the worker path would never be
+/// reached), and ordinary scenario workers must not either — only the
+/// `CINDY_E2E_WORKER_KEYLESS` scenario's worker variant carries it.
+/// That scenario proves the worker refuses a keyless handshake before
+/// dispatching any call.
+#[cfg(all(feature = "remote", feature = "worker-vault-demand"))]
+#[allow(dead_code, deprecated)]
+fn worker_side_vault_demand() -> cindy::Secret<String> {
+    cindy::secret!("e2e-worker-vault", "never evaluated".to_owned())
+}
+
 #[cindy::remote]
 fn budget_probe(data: Vec<u8>) -> (usize, usize) {
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -99,6 +150,34 @@ async fn main(host: cindy::Host<Vars>) -> cindy::Result<()> {
                 );
             }
         }
+        return Ok(());
+    }
+
+    // Vault-handshake scenario (see tests/e2e.rs): the sealed secret
+    // in vars must reveal *on the worker* — the key can only have
+    // arrived there via the RPC handshake — and match the expected
+    // plaintext. A marker file lands only if both hold.
+    if std::env::var_os("CINDY_E2E_SECRETS").is_some() {
+        let revealed = reveal_on_worker(host.vars.secret.clone()).await?;
+        if revealed != host.vars.secret_expected {
+            cindy::bail!(
+                "worker-side reveal returned {revealed:?}, expected {:?}",
+                host.vars.secret_expected
+            );
+        }
+        std::fs::create_dir_all(&host.vars.work_dir)?;
+        std::fs::write(host.vars.work_dir.join("reveal-ok.marker"), b"ok\n")?;
+        return Ok(());
+    }
+
+    // Keyless-handshake scenario (see tests/e2e.rs): the worker
+    // demands `e2e-worker-vault` (see `worker_side_vault_demand`) but
+    // the orchestrator ships no keys. The worker must refuse at the
+    // handshake — before this scenario's marker-creating call could
+    // ever run. Reaching the `Ok(())` here would itself be a failure
+    // caught by the test asserting the marker's absence.
+    if std::env::var_os("CINDY_E2E_WORKER_KEYLESS").is_some() {
+        keyless_marker(host.vars.work_dir.join("must-not-exist.marker")).await?;
         return Ok(());
     }
 

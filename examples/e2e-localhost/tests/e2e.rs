@@ -13,6 +13,25 @@ fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
+/// Mint a genuinely sealed `Secret<String>` ciphertext under `key`,
+/// the same way `cindy secret seal` does — real AEAD blob, real
+/// SealedPayload framing.
+fn seal_string(key: &cindy::secret::crypto::VaultKey, value: &str) -> Vec<u8> {
+    let payload = cindy::secret::SealedPayload {
+        value: cindy::__reexports::postcard::to_allocvec(value)
+            .expect("postcard serialise the secret value"),
+        source: value.to_owned(),
+    };
+    let plaintext = cindy::__reexports::postcard::to_allocvec(&payload)
+        .expect("postcard serialise the SealedPayload");
+    cindy::secret::crypto::seal(key, &plaintext).expect("seal the e2e secret")
+}
+
+fn b64(bytes: &[u8]) -> String {
+    use cindy::__reexports::base64::Engine as _;
+    cindy::__reexports::base64::engine::general_purpose::STANDARD.encode(bytes)
+}
+
 /// Build the example with one feature set and return the binary path.
 ///
 /// Memoised behind a mutex, and that is load-bearing rather than an
@@ -182,6 +201,15 @@ struct Play {
     /// Kept alive deliberately: the orchestrator reads the host context
     /// from this path at startup, so unlinking it early is a race.
     _context_file: tempfile::NamedTempFile,
+    /// Drained into `*_stderr_text` by `wait_and_collect`. Captured
+    /// rather than inherited so the vault-refusal scenarios can assert
+    /// on the exact wording of the preflight messages; every scenario's
+    /// stderr stays far below the 64 KiB pipe buffer, so a child can't
+    /// block on an unread pipe.
+    orchestrator_stderr: Option<std::process::ChildStderr>,
+    worker_stderr: Option<std::process::ChildStderr>,
+    orchestrator_stderr_text: String,
+    worker_stderr_text: String,
 }
 
 /// Build both halves, hand the host context over by temp file (as the
@@ -197,8 +225,22 @@ fn start_play(
     orchestrator_env: &[(&str, &str)],
     worker_env: &[(&str, &str)],
 ) -> Play {
+    start_play_with_worker(tmp, host_context, orchestrator_env, worker_env, "remote")
+}
+
+/// [`start_play`] with control over which worker variant to spawn —
+/// the keyless-handshake scenario needs the `worker-vault-demand`
+/// build, every other scenario the plain one.
+#[allow(clippy::too_many_arguments)]
+fn start_play_with_worker(
+    tmp: &Path,
+    host_context: &serde_json::Value,
+    orchestrator_env: &[(&str, &str)],
+    worker_env: &[(&str, &str)],
+    worker_feature: &str,
+) -> Play {
     let orchestrator_bin = build_variant("orchestrator");
-    let remote_bin_src = build_variant("remote");
+    let remote_bin_src = build_variant(worker_feature);
 
     // Staging an executable and spawning one must not interleave across
     // threads, so everything from the copy to the last spawn happens
@@ -234,7 +276,7 @@ fn start_play(
     worker_cmd
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::inherit());
+        .stderr(Stdio::piped());
     for (k, v) in worker_env {
         worker_cmd.env(k, v);
     }
@@ -248,7 +290,7 @@ fn start_play(
         .env("CINDY_HOST_CONTEXT_FILE", context_file.path())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::inherit());
+        .stderr(Stdio::piped());
     for (k, v) in orchestrator_env {
         orch_cmd.env(k, v);
     }
@@ -276,23 +318,42 @@ fn start_play(
     ];
 
     Play {
+        orchestrator_stderr: orchestrator.stderr.take(),
+        worker_stderr: worker.stderr.take(),
         orchestrator,
         worker,
         pumps,
         _context_file: context_file,
+        orchestrator_stderr_text: String::new(),
+        worker_stderr_text: String::new(),
     }
 }
 
 impl Play {
     /// Wait for the orchestrator — it drives the play and holds the
-    /// authoritative exit code — then let the worker EOF out.
-    fn wait(mut self) -> std::process::ExitStatus {
+    /// authoritative exit code — then let the worker EOF out, and
+    /// collect both children's stderr for message assertions.
+    fn wait_and_collect(mut self) -> (std::process::ExitStatus, String, String) {
         let status = self.orchestrator.wait().expect("wait orchestrator");
         for pump in std::mem::take(&mut self.pumps) {
             let _ = pump.join();
         }
         let _ = self.worker.wait();
-        status
+        if let Some(mut err) = self.orchestrator_stderr.take() {
+            let _ = err.read_to_string(&mut self.orchestrator_stderr_text);
+        }
+        if let Some(mut err) = self.worker_stderr.take() {
+            let _ = err.read_to_string(&mut self.worker_stderr_text);
+        }
+        (
+            status,
+            std::mem::take(&mut self.orchestrator_stderr_text),
+            std::mem::take(&mut self.worker_stderr_text),
+        )
+    }
+
+    fn wait(self) -> std::process::ExitStatus {
+        self.wait_and_collect().0
     }
 
     /// Kill the worker outright, simulating a host that drops mid-call.
@@ -576,4 +637,169 @@ fn fetch_streams_within_its_limits() {
         let mode = std::fs::metadata(&good).unwrap().permissions().mode() & 0o7777;
         assert_eq!(mode, 0o644, "drifted mode was not reconciled");
     }
+}
+
+/// The vault-key handshake reaching a worker-side `reveal()`: a real
+/// key minted by the test, a really sealed secret in the host context,
+/// keys shipped to the orchestrator via `CINDY_VAULT_KEYS` (as the CLI
+/// does) — and the reveal happening *on the worker*, which can only
+/// decrypt if the key arrived through the RPC handshake, never via
+/// argv/env. Until this test, no sealed secret had crossed the wire in
+/// any e2e suite.
+#[test]
+fn secret_reveals_on_the_worker_through_the_handshake() {
+    use cindy::secret::crypto;
+
+    let tmp = tempfile::tempdir().expect("create temp dir");
+    let work_dir = tmp.path().join("work");
+
+    let key = crypto::generate_vault_key();
+    let plaintext = "e2e-secret-plaintext-7512";
+    let ciphertext_b64 = b64(&seal_string(&key, plaintext));
+
+    let host_context = serde_json::json!({
+        "name": "localhost",
+        "tags": ["example:e2e"],
+        "vars": {
+            "work_dir": work_dir,
+            "fetch_url": "http://127.0.0.1/",
+            "fetch_sha256": "",
+            "secret": {
+                "vault": "e2e-vault",
+                "ciphertext": ciphertext_b64,
+            },
+            "secret_expected": plaintext,
+        }
+    });
+
+    let vault_keys = serde_json::json!({ "e2e-vault": b64(key.as_slice()) }).to_string();
+    let play = start_play(
+        tmp.path(),
+        &host_context,
+        &[
+            ("CINDY_E2E_SECRETS", "1"),
+            ("CINDY_VAULT_KEYS", &vault_keys),
+        ],
+        &[],
+    );
+    let (status, orch_stderr, _worker_stderr) = play.wait_and_collect();
+    assert!(status.success(), "orchestrator failed: {orch_stderr}");
+    assert!(
+        work_dir.join("reveal-ok.marker").exists(),
+        "the reveal scenario never completed"
+    );
+}
+
+/// Preflight refusal on a missing key: the orchestrator is handed the
+/// sealed secret but *no* key for its vault, and must refuse before
+/// any playbook code runs — a missing marker and the preflight wording
+/// (naming the vault, pointing at remediation) are the proof. The
+/// keys dir is pinned to an empty tempdir so a stray `keys/` in the
+/// working tree can't make this test pass vacuously.
+#[test]
+fn missing_key_refuses_before_any_playbook_code_runs() {
+    use cindy::secret::crypto;
+
+    let tmp = tempfile::tempdir().expect("create temp dir");
+    let work_dir = tmp.path().join("work");
+    let empty_keys_dir = tempfile::tempdir().expect("create empty keys dir");
+
+    let key = crypto::generate_vault_key();
+    let ciphertext_b64 = b64(&seal_string(&key, "plaintext-without-a-key"));
+
+    let host_context = serde_json::json!({
+        "name": "localhost",
+        "tags": ["example:e2e"],
+        "vars": {
+            "work_dir": work_dir,
+            "fetch_url": "http://127.0.0.1/",
+            "fetch_sha256": "",
+            "secret": {
+                "vault": "e2e-vault",
+                "ciphertext": ciphertext_b64,
+            },
+            "secret_expected": "plaintext-without-a-key",
+        }
+    });
+
+    let play = start_play(
+        tmp.path(),
+        &host_context,
+        &[
+            ("CINDY_E2E_SECRETS", "1"),
+            // Keys for nothing: the preflight must name the vault.
+            ("CINDY_VAULT_KEYS", "{}"),
+            ("CINDY_KEYS_DIR", empty_keys_dir.path().to_str().unwrap()),
+        ],
+        &[],
+    );
+    let (status, orch_stderr, _worker_stderr) = play.wait_and_collect();
+    assert!(!status.success(), "a keyless orchestrator must not succeed");
+    assert!(
+        orch_stderr.contains("missing decryption keys"),
+        "stderr must name the refusal: {orch_stderr}"
+    );
+    assert!(
+        orch_stderr.contains("e2e-vault"),
+        "stderr must name the vault: {orch_stderr}"
+    );
+    assert!(
+        !orch_stderr.contains("worker-side reveal"),
+        "no playbook code may run: {orch_stderr}"
+    );
+    assert!(
+        !work_dir.join("reveal-ok.marker").exists(),
+        "no playbook side effects before the refusal"
+    );
+}
+
+/// The worker-side half of the refusal: the worker binary demands
+/// `e2e-worker-vault` (registered by a remote-gated `secret!` site the
+/// orchestrator build never sees), the orchestrator ships no keys, and
+/// the worker must die at the handshake — before dispatching the
+/// scenario's marker-creating call. If it ever dispatched instead, the
+/// marker would exist and this test would fail.
+#[test]
+fn worker_refuses_a_keyless_handshake_before_any_code_runs() {
+    let tmp = tempfile::tempdir().expect("create temp dir");
+    let work_dir = tmp.path().join("work");
+    let empty_keys_dir = tempfile::tempdir().expect("create empty keys dir");
+
+    let host_context = serde_json::json!({
+        "name": "localhost",
+        "tags": ["example:e2e"],
+        "vars": {
+            "work_dir": work_dir,
+            "fetch_url": "http://127.0.0.1/",
+            "fetch_sha256": "",
+        },
+    });
+
+    let play = start_play_with_worker(
+        tmp.path(),
+        &host_context,
+        &[
+            ("CINDY_E2E_WORKER_KEYLESS", "1"),
+            ("CINDY_KEYS_DIR", empty_keys_dir.path().to_str().unwrap()),
+        ],
+        &[("CINDY_KEYS_DIR", empty_keys_dir.path().to_str().unwrap())],
+        "remote,worker-vault-demand",
+    );
+    let (status, _orch_stderr, worker_stderr) = play.wait_and_collect();
+    assert!(
+        !status.success(),
+        "the orchestrator must fail when its worker refuses the handshake"
+    );
+    assert!(
+        worker_stderr.contains("missing decryption keys on the remote worker"),
+        "the worker must state its refusal: {worker_stderr}"
+    );
+    assert!(
+        worker_stderr.contains("e2e-worker-vault"),
+        "the refusal must name the vault: {worker_stderr}"
+    );
+    assert!(
+        !work_dir.join("must-not-exist.marker").exists(),
+        "no playbook code may run after a refused handshake"
+    );
 }

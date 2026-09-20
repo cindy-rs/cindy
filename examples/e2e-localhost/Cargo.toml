@@ -24,6 +24,12 @@ default = ["orchestrator", "remote"]
 # two resulting processes — exactly what the real CLI does, minus SSH.
 orchestrator = ["cindy/orchestrator"]
 remote = ["cindy/remote"]
+# Compiles a `secret!` vault demand into the worker binary for the
+# keyless-handshake scenario only (see `worker_side_vault_demand` in
+# src/main.rs and tests/e2e.rs). A cargo feature, not an env var,
+# because PendingSecret registration is link-time: every worker built
+# without it must stay demand-free.
+worker-vault-demand = []
 
 [dependencies]
 cindy = { workspace = true }
@@ -34,3 +40,7 @@ serde_json = { workspace = true }
 serde_json = { workspace = true }
 tempfile = "3.27"
 sha2 = "0.11"
+# Sealing real ciphertexts for the vault-handshake scenarios: the
+# tests mint a genuine key + AEAD blob with the same API `cindy
+# secret seal` uses, so the handshake carries real key material.
+cindy = { workspace = true }
