@@ -105,8 +105,29 @@ pub enum Effect {
     /// **This is an assertion cindy cannot verify, and the only place
     /// `--check`'s never-mutate guarantee is delegated to you.** Mark a
     /// mutating program `ReadOnly` and `--check` will mutate the
-    /// target. Confine it to genuine queries: `systemctl is-enabled`,
-    /// `test -f`, `dpkg-query`, `--version`.
+    /// target.
+    ///
+    /// The line is "does running this write anything", not "is it safe
+    /// to re-run". Those differ: `mkdir -p` is perfectly idempotent and
+    /// still `Mutating`.
+    ///
+    /// Genuinely read-only: `systemctl is-enabled`, `test -f`,
+    /// `dpkg-query -W`, `--version`, `id -u`, `uname -m`.
+    ///
+    /// `Mutating` despite sounding like a query — the cases worth
+    /// knowing, because each is a plausible mislabel:
+    ///
+    /// - `apt-get update` "just refreshes information", and writes
+    ///   `/var/lib/apt`.
+    /// - any `shell` script with a redirect: `… > /tmp/out`, `… | tee`,
+    ///   or anything writing to a pipe, FIFO or device node.
+    /// - `mktemp`, `touch` — they create.
+    /// - `curl`/`fetch` of a remote endpoint: read-only *here*, but a
+    ///   `GET` can still change the far side, and it leaves artefacts
+    ///   if it writes a file.
+    /// - a "read" that mutates server-side state: this project hit one
+    ///   in `systemd` itself, where D-Bus `LoadUnit` loads a unit as a
+    ///   side effect where `GetUnit` only looks.
     ///
     /// Why it has to exist: without it, a play that branches on a
     /// command's output takes the *wrong branch* under `--check`,
