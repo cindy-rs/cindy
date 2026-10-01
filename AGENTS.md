@@ -113,7 +113,7 @@ raw `cargo check` only needs the file to exist.
 - `cindy play --check` must never mutate a target. Every mutating operation needs
   a `crate::dry_run()` guard, and check mode may over-report a change but must
   never under-report one. See the practices below for the shape that holds.
-  One deliberate exception: `command::Effect::ReadsOnly` (reached via
+  One deliberate exception: `command::Effect::ReadOnly` (reached via
   `command::probe` / `probe_shell`) makes check mode *run* the program, because
   a play that branches on command output takes the wrong branch when the output
   is empty — and a skipped branch is an under-report. That is the single point

@@ -28,9 +28,9 @@
 //! the change set check mode reports stops matching what a real run
 //! would do — and when the branch it skips contains work, that's an
 //! under-report, which check mode must never produce. [`probe`] (and
-//! [`probe_shell`]) are the way out: they assert [`Effect::ReadsOnly`],
+//! [`probe_shell`]) are the way out: they assert [`Effect::ReadOnly`],
 //! so check mode runs them and the branch sees real information. The
-//! assertion is yours to keep — see [`Effect::ReadsOnly`].
+//! assertion is yours to keep — see [`Effect::ReadOnly`].
 //!
 //! ```ignore
 //! command(vec!["systemctl".into(), "reload".into(), "nginx".into()], <_>::default())
@@ -89,7 +89,7 @@ impl Output {
 /// cannot work out for itself, and therefore the one thing check mode
 /// has to be told.
 ///
-/// Default is [`Mutates`](Effect::Mutates): an opaque program is
+/// Default is [`Mutating`](Effect::Mutating): an opaque program is
 /// assumed to change the host, so `--check` doesn't run it.
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
 #[crate::wire]
@@ -97,14 +97,14 @@ pub enum Effect {
     /// Running this may change the target, so check mode skips it and
     /// reports the absence. The safe default.
     #[default]
-    Mutates,
+    Mutating,
     /// Running this changes nothing — it only reports. Check mode
     /// executes it, because the *information* is what the rest of the
     /// play branches on.
     ///
     /// **This is an assertion cindy cannot verify, and the only place
     /// `--check`'s never-mutate guarantee is delegated to you.** Mark a
-    /// mutating program `ReadsOnly` and `--check` will mutate the
+    /// mutating program `ReadOnly` and `--check` will mutate the
     /// target. Confine it to genuine queries: `systemctl is-enabled`,
     /// `test -f`, `dpkg-query`, `--version`.
     ///
@@ -113,7 +113,7 @@ pub enum Effect {
     /// because the output is empty. That can silently skip work a real
     /// run would do — an under-report, which is the one thing check
     /// mode must never do.
-    ReadsOnly,
+    ReadOnly,
 }
 
 /// Execution environment shared by [`command`] and [`shell`].
@@ -122,7 +122,7 @@ pub enum Effect {
 pub struct State {
     /// Whether running this program changes the target, which decides
     /// what `--check` does with it. See [`Effect`]; defaults to
-    /// [`Effect::Mutates`], and [`probe`] is the ergonomic way to ask
+    /// [`Effect::Mutating`], and [`probe`] is the ergonomic way to ask
     /// for the other one.
     pub effect: Effect,
     /// Working directory to run the program in. `None` ⇒ inherit the
@@ -146,7 +146,7 @@ pub struct State {
 /// its one call site, with nothing holding it to the invariant. Both
 /// branches of `run` read this one answer.
 fn executes(effect: Effect, dry_run: bool) -> bool {
-    !dry_run || matches!(effect, Effect::ReadsOnly)
+    !dry_run || matches!(effect, Effect::ReadOnly)
 }
 
 /// Run an already-configured [`Command`] to completion and capture its
@@ -292,7 +292,7 @@ async fn shell_impl(
 /// Run a read-only program — one that *reports* rather than changes —
 /// so its output is available under `--check` too.
 ///
-/// The same as [`command`] with [`Effect::ReadsOnly`], which is the
+/// The same as [`command`] with [`Effect::ReadOnly`], which is the
 /// assertion you are making by calling this: cindy executes it in check
 /// mode on your word. Use it for queries whose answer the rest of the
 /// play branches on:
@@ -314,7 +314,7 @@ pub async fn probe(argv: impl Into<Vec<String>>) -> crate::Result<Output> {
     command_impl(
         argv,
         State {
-            effect: Effect::ReadsOnly,
+            effect: Effect::ReadOnly,
             ..State::default()
         },
     )
@@ -332,7 +332,7 @@ pub async fn probe_shell(
         interpreter,
         script,
         State {
-            effect: Effect::ReadsOnly,
+            effect: Effect::ReadOnly,
             ..State::default()
         },
     )
@@ -349,19 +349,19 @@ mod tests {
     #[test]
     fn executes_decides_check_mode_by_asserted_effect() {
         // Outside check mode everything runs, whatever it claims.
-        assert!(executes(Effect::Mutates, false));
-        assert!(executes(Effect::ReadsOnly, false));
+        assert!(executes(Effect::Mutating, false));
+        assert!(executes(Effect::ReadOnly, false));
         // Under --check, only an asserted read-only program runs.
-        assert!(!executes(Effect::Mutates, true));
-        assert!(executes(Effect::ReadsOnly, true));
+        assert!(!executes(Effect::Mutating, true));
+        assert!(executes(Effect::ReadOnly, true));
     }
 
-    /// `Mutates` must be what you get by forgetting to choose: a
+    /// `Mutating` must be what you get by forgetting to choose: a
     /// defaulted `State` that ran mutating programs under `--check`
     /// would break the invariant silently.
     #[test]
     fn the_default_effect_is_the_safe_one() {
-        assert_eq!(State::default().effect, Effect::Mutates);
+        assert_eq!(State::default().effect, Effect::Mutating);
         assert!(!executes(State::default().effect, true));
     }
 
