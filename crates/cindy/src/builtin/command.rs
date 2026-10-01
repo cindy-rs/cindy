@@ -57,45 +57,47 @@ pub struct Output {
     /// Captured standard error.
     pub stderr: String,
     /// True when check mode suppressed the execution: `code` is `None`
-    /// and the streams carry a not-executed note. `exit_ok` passes so
-    /// plays flow through `--check`, but logic reading `stdout` sees
-    /// the absence.
+    /// and the streams carry a not-executed note. Nothing ran, so
+    /// nothing in this `Output` is a result — see [`success`](Output::success).
     pub dry_run: bool,
 }
 
+/// Printed when [`Output::success`] is read on an output check mode
+/// suppressed. It is how the "branch on a probe" rule announces itself
+/// instead of having to be known.
+const SUPPRESSED_SUCCESS_WARNING: &str = "! success() read on a command --check didn't run: the \
+     answer is meaningless. If you branch on it, it's a query — use `probe`.";
+
 impl Output {
-    /// `true` if the program exited successfully (`code == 0`).
+    /// `true` if the program exited successfully: `code == 0`, and
+    /// nothing else.
     ///
-    /// A suppressed (check-mode) output answers `true`, so a mutation's
-    /// [`exit_ok`](Output::exit_ok) passes and the play flows through.
-    /// That is the right answer for "did my change succeed" and the
-    /// **wrong** one for "is this condition true":
-    ///
-    /// ```rust,ignore
-    /// // Silently wrong under --check: `test -e` is skipped, this says
-    /// // true anyway, and the branch runs against a device that isn't
-    /// // there.
-    /// if command(vec!["test".into(), "-e".into(), "/dev/foo0".into()], <_>::default())
-    ///     .await?.success() { … }
-    ///
-    /// // Right: a command whose result you branch on is a query.
-    /// if probe(vec!["test".into(), "-e".into(), "/dev/foo0".into()])
-    ///     .await?.success() { … }
-    /// ```
-    ///
-    /// The rule: **anything you branch on is a [`probe`]**. Branching
-    /// on observed state rather than on [`dry_run`](crate::dry_run) is
-    /// what keeps one code path for both modes — but only a probe
-    /// observes anything under `--check`.
+    /// A program check mode didn't run has no exit code, so this is
+    /// `false` for it, exactly as for one killed by a signal. No answer
+    /// would be right there: whether `true` or `false`, one of
+    /// `if out.success()` / `if !out.success()` skips a branch a real
+    /// run would take, which is an under-report. So it gives the
+    /// literal answer and says so: reading it on a suppressed output
+    /// under `--check` prints a warning naming the fix. **Anything you
+    /// branch on is a [`probe`]**, which runs under `--check` and so
+    /// has a real answer.
     pub fn success(&self) -> bool {
-        self.dry_run || self.code == Some(0)
+        if self.dry_run {
+            let _ = crate::diff::note(&mut std::io::stderr().lock(), SUPPRESSED_SUCCESS_WARNING);
+        }
+        self.code == Some(0)
     }
 
     /// Turn a non-zero (or signal-terminated) exit into an error
     /// carrying the captured stdout/stderr, for callers where anything
     /// but success should fail the play.
+    ///
+    /// Under `--check` a suppressed program passes: nothing ran, so
+    /// nothing failed, and the play flows on to report the rest. This
+    /// is the one place that pass-through belongs — it is a statement
+    /// about failure, not about a condition.
     pub fn exit_ok(self) -> crate::Result<Self> {
-        if self.success() {
+        if self.dry_run || self.code == Some(0) {
             return Ok(self);
         }
         crate::bail!(
@@ -415,6 +417,49 @@ mod tests {
     // order-dependent suite. The contract lives in `executes` above,
     // exhaustively; the end-to-end behaviour lives in the e2e suites,
     // where a real worker gets a real handshake.
+
+    fn output(code: Option<i32>, dry_run: bool) -> Output {
+        Output {
+            code,
+            stdout: String::new(),
+            stderr: String::new(),
+            dry_run,
+        }
+    }
+
+    /// The asymmetry this module settled on: `success()` is the literal
+    /// exit status, while `exit_ok()` alone lets a suppressed program
+    /// through. Before, `success()` said `true` for a program that never
+    /// ran, and a branch on it silently took the wrong path.
+    #[test]
+    fn success_is_literal_and_only_exit_ok_passes_a_suppressed_program() {
+        let suppressed = output(None, true);
+        assert!(!suppressed.success(), "nothing ran, so nothing succeeded");
+        assert!(
+            suppressed.exit_ok().is_ok(),
+            "nothing ran, so nothing failed"
+        );
+
+        let ok = output(Some(0), false);
+        assert!(ok.success());
+        assert!(ok.exit_ok().is_ok());
+
+        let failed = output(Some(1), false);
+        assert!(!failed.success());
+        let err = failed.exit_ok().unwrap_err().to_string();
+        assert!(err.contains("exited with Some(1)"), "{err}");
+
+        let signalled = output(None, false);
+        assert!(!signalled.success());
+        assert!(signalled.exit_ok().is_err());
+    }
+
+    /// The warning is the feature: it must name the fix, or it's noise.
+    #[test]
+    fn the_suppressed_success_warning_points_at_probe() {
+        assert!(SUPPRESSED_SUCCESS_WARNING.contains("probe"));
+        assert!(SUPPRESSED_SUCCESS_WARNING.contains("--check"));
+    }
 
     #[tokio::test]
     async fn timeout_kills_the_child_and_errors() {
