@@ -65,6 +65,28 @@ pub struct Output {
 
 impl Output {
     /// `true` if the program exited successfully (`code == 0`).
+    ///
+    /// A suppressed (check-mode) output answers `true`, so a mutation's
+    /// [`exit_ok`](Output::exit_ok) passes and the play flows through.
+    /// That is the right answer for "did my change succeed" and the
+    /// **wrong** one for "is this condition true":
+    ///
+    /// ```rust,ignore
+    /// // Silently wrong under --check: `test -e` is skipped, this says
+    /// // true anyway, and the branch runs against a device that isn't
+    /// // there.
+    /// if command(vec!["test".into(), "-e".into(), "/dev/foo0".into()], <_>::default())
+    ///     .await?.success() { … }
+    ///
+    /// // Right: a command whose result you branch on is a query.
+    /// if probe(vec!["test".into(), "-e".into(), "/dev/foo0".into()])
+    ///     .await?.success() { … }
+    /// ```
+    ///
+    /// The rule: **anything you branch on is a [`probe`]**. Branching
+    /// on observed state rather than on [`dry_run`](crate::dry_run) is
+    /// what keeps one code path for both modes — but only a probe
+    /// observes anything under `--check`.
     pub fn success(&self) -> bool {
         self.dry_run || self.code == Some(0)
     }
