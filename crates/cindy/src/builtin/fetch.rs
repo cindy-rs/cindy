@@ -294,33 +294,25 @@ fn digest_file(path: &Path, sum: &Checksum) -> Option<String> {
 fn desired_attrs(
     state: &State,
     existing: Option<&std::fs::Metadata>,
-) -> (String, String, super::path::Mode) {
-    match existing {
-        Some(meta) => {
-            use std::os::unix::fs::MetadataExt as _;
-            (
-                state
-                    .user
-                    .clone()
-                    .unwrap_or_else(|| super::name_of_uid(meta.uid())),
-                state
-                    .group
-                    .clone()
-                    .unwrap_or_else(|| super::name_of_gid(meta.gid())),
-                state
-                    .mode
-                    .unwrap_or(super::path::Mode::from_st_mode(meta.mode())),
-            )
-        }
-        None => {
-            let (user, group) = super::current_owner_names();
-            (
-                state.user.clone().unwrap_or(user),
-                state.group.clone().unwrap_or(group),
-                state.mode.unwrap_or(super::path::Mode(0o644)),
-            )
-        }
-    }
+) -> (super::path::Owner, super::path::Mode) {
+    use std::os::unix::fs::MetadataExt as _;
+    let (fallback, mode) = match existing {
+        Some(meta) => (
+            super::path::Owner {
+                user: super::name_of_uid(meta.uid()),
+                group: super::name_of_gid(meta.gid()),
+            },
+            super::path::Mode::from_st_mode(meta.mode()),
+        ),
+        None => (super::path::Owner::current(), super::path::Mode(0o644)),
+    };
+    (
+        super::path::Owner {
+            user: state.user.clone().unwrap_or(fallback.user),
+            group: state.group.clone().unwrap_or(fallback.group),
+        },
+        state.mode.unwrap_or(mode),
+    )
 }
 
 /// HTTP agent for one fetch. ureq's timeout defaults are all `None`, so
@@ -406,7 +398,7 @@ fn apply(state: State) -> crate::Result<super::Return> {
             None => true,
         };
 
-    let (user, group, mode) = desired_attrs(&state, existing.as_ref());
+    let (owner, mode) = desired_attrs(&state, existing.as_ref());
 
     if satisfied {
         // Content is already right, but owner/mode may have drifted —
@@ -417,10 +409,10 @@ fn apply(state: State) -> crate::Result<super::Return> {
         // file — no download is involved on either side of the
         // decision, so under-reporting here had no excuse.
         if crate::dry_run() {
-            let attrs_ok = super::path::file_attrs_satisfied(&state.dest, &user, &group, mode);
+            let attrs_ok = super::path::file_attrs_satisfied(&state.dest, &owner, mode);
             return Ok(super::Return::from_changed(!attrs_ok));
         }
-        return super::path::reconcile_file_attrs(&state.dest, &user, &group, mode);
+        return super::path::reconcile_file_attrs(&state.dest, &owner, mode);
     }
 
     // Check mode: the destination is missing or stale, so the fetch
@@ -431,7 +423,7 @@ fn apply(state: State) -> crate::Result<super::Return> {
 
     // Resolve the owner before the transfer, so a typo'd user fails in a
     // second instead of after a gigabyte has crossed the wire.
-    let (uid, gid) = super::path::resolve_owner(&user, &group)?;
+    let (uid, gid) = owner.resolve()?;
     let max = state.max_bytes.unwrap_or(DEFAULT_MAX_BYTES);
     let url = redact_url(&state.url);
 
@@ -487,7 +479,7 @@ fn apply(state: State) -> crate::Result<super::Return> {
                 "checksum mismatch for {url}: expected {}, got {got} \
                  ({} bytes transferred; {} was left untouched)",
                 sum.expected(),
-                staged.written(),
+                staged.written()?,
                 state.dest.display(),
             );
         }

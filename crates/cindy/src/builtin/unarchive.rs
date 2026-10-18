@@ -310,7 +310,7 @@ fn establish_dest(dest: &Path) -> crate::Result<()> {
     match std::fs::symlink_metadata(dest) {
         Ok(meta) if meta.is_dir() => {}
         _ => {
-            let (user, group) = super::current_owner_names();
+            let super::path::Owner { user, group } = super::path::Owner::current();
             super::path::directory_raw::inner(
                 dest.to_path_buf(),
                 user,

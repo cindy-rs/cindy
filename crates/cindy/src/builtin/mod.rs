@@ -85,13 +85,10 @@ impl Return {
     }
 }
 
-/// The worker's own user and group names, for builtins whose owner is
-/// optional but which delegate to [`path`], where it isn't.
+/// The user and group the worker runs as.
 pub fn current_owner_names() -> (String, String) {
-    (
-        name_of_uid(nix::unistd::getuid().as_raw()),
-        name_of_gid(nix::unistd::getgid().as_raw()),
-    )
+    let path::Owner { user, group } = path::Owner::current();
+    (user, group)
 }
 
 /// The user name, or the number itself when it has no NSS entry.

@@ -313,35 +313,31 @@ fn apply(state: State) -> crate::Result<super::Return> {
     // `path` requires a total owner/mode; archive only carries an
     // optional mode, so default the owner to the worker's identity and
     // an unspecified mode to `0o644`.
-    let (user, group) = super::current_owner_names();
+    let owner = super::path::Owner::current();
     let mode = state.mode.unwrap_or(super::path::Mode(0o644));
     match format {
         // Tar-based: build the tar stream through the `compress`
         // module's codec (no codec logic lives here). `None` means an
         // uncompressed tar (== `Codec::Store`).
-        Format::Tar(codec) => {
-            super::path::file_from_writer(&state.dest, &user, &group, mode, |staged| {
-                build_tar_into(
-                    codec.unwrap_or(super::Codec::Store),
-                    staged,
-                    state
-                        .dest
-                        .parent()
-                        .filter(|p| !p.as_os_str().is_empty())
-                        .unwrap_or_else(|| std::path::Path::new(".")),
-                    &state.sources,
-                )
-            })?
-        }
+        Format::Tar(codec) => super::path::file_from_writer(&state.dest, &owner, mode, |staged| {
+            build_tar_into(
+                codec.unwrap_or(super::Codec::Store),
+                staged,
+                state
+                    .dest
+                    .parent()
+                    .filter(|p| !p.as_os_str().is_empty())
+                    .unwrap_or_else(|| std::path::Path::new(".")),
+                &state.sources,
+            )
+        })?,
         // Container formats carry their own per-entry compression.
-        Format::Zip => super::path::file_from_writer(&state.dest, &user, &group, mode, |staged| {
+        Format::Zip => super::path::file_from_writer(&state.dest, &owner, mode, |staged| {
             build_zip_into(staged, &state.sources)
         })?,
-        Format::SevenZ => {
-            super::path::file_from_writer(&state.dest, &user, &group, mode, |staged| {
-                build_7z_into(staged, &state.sources)
-            })?
-        }
+        Format::SevenZ => super::path::file_from_writer(&state.dest, &owner, mode, |staged| {
+            build_7z_into(staged, &state.sources)
+        })?,
     }
     Ok(super::Return::Changed)
 }
