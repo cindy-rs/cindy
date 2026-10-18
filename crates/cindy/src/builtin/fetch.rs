@@ -1,34 +1,21 @@
 //! Download a file over HTTP(S) to a path on the remote machine.
 //!
-//! Idempotent when a [`checksum`](State::checksum) is supplied: if the
-//! destination already exists and its digest matches, the download is
-//! skipped. Without a checksum the file is (re)fetched only when it's
-//! missing — to refresh a mutable URL, remove the file first
-//! (`path::absent(dest)`) and fetch again.
+//! With a [`checksum`](State::checksum) an existing destination that
+//! matches is left alone; without one, only a missing destination is
+//! fetched (remove the file first to refresh a mutable URL).
 //!
-//! The body is **streamed** to the destination, never buffered whole.
-//! The digest is computed as the bytes pass through and the file is
-//! published only once it verifies, so a multi-gigabyte artefact costs a
-//! fixed-size buffer rather than its own size in RAM on the target —
-//! which matters, because the target is often the smallest machine in
-//! the fleet. [`State::max_bytes`] bounds what a URL is allowed to
-//! deliver at all.
-//!
-//! HTTP is performed with the pure-Rust [`ureq`] client over `rustls`
-//! (no OpenSSL / system TLS), so the build stays free of C and dynamic
-//! library dependencies.
+//! The body streams to disk and is digested on the way, then published
+//! only once it verifies — a multi-gigabyte artefact costs a fixed
+//! buffer, not its size in RAM on what is often the smallest machine in
+//! the fleet.
 
-use std::io::Read as _;
 use std::path::{Path, PathBuf};
 
 use sha2::Digest as _;
 
 use crate::Context;
 
-/// A digest to verify a downloaded file against. Pairing the algorithm
-/// with the expected hex string makes a fetch both *idempotent* (skip
-/// when the on-disk file already matches) and *safe* (a corrupted or
-/// tampered download is rejected).
+/// Expected digest, as hex.
 #[derive(Clone, PartialEq, Eq)]
 #[crate::wire]
 pub enum Checksum {
@@ -37,17 +24,14 @@ pub enum Checksum {
 }
 
 impl Checksum {
-    /// Lower-cased expected hex digest.
     fn expected(&self) -> String {
         match self {
             Checksum::Sha256(h) | Checksum::Sha512(h) => h.trim().to_ascii_lowercase(),
         }
     }
 
-    /// Reject a malformed expected digest *before* any download. A
-    /// truncated copy-paste or a stray character would otherwise just
-    /// "never match" — re-downloading every run and then failing with a
-    /// checksum mismatch that hides the real problem.
+    /// A truncated or mistyped digest would otherwise never match:
+    /// re-download every run, then fail on a mismatch that hides the typo.
     fn validate(&self) -> crate::Result<()> {
         let (want_len, algo) = match self {
             Checksum::Sha256(_) => (64, "sha256"),
@@ -73,31 +57,16 @@ fn hex(bytes: &[u8]) -> String {
     })
 }
 
-/// Ceiling on a downloaded body when [`State::max_bytes`] is `None`.
-///
-/// Streaming removed the memory blow-up but not the disk one: a
-/// misconfigured URL, or a server that simply never stops sending, would
-/// still fill the target's filesystem. 4 GiB is past any plausible
-/// artefact while still being a bound.
+/// Past any plausible artefact, short of filling a disk with a server
+/// that never stops sending.
 const DEFAULT_MAX_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 
-/// Read buffer for the streaming digest of an on-disk file.
-const DIGEST_CHUNK: usize = 64 * 1024;
-
-/// How long the server gets to produce response *headers*. The body is
-/// bounded by [`State::max_bytes`] rather than a clock, so that a slow
-/// link doesn't fail a legitimately large artefact — but a blackholed
-/// host still has to fail fast instead of hanging the play with no
-/// diagnostic. [`State::timeout`] adds a hard end-to-end deadline when
-/// that's what you want.
+// ureq has no timeouts by default. The body is bounded by size, not a
+// clock, so a slow link can still deliver a large artefact; a
+// blackholed host fails on these.
+const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 const HEADER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
-/// How long the TCP/TLS connection setup gets.
-const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
-
-/// Incremental digest for a [`Checksum`]'s algorithm, so a download is
-/// verified from the same pass that writes it to disk instead of being
-/// buffered first.
 enum Hasher {
     Sha256(sha2::Sha256),
     Sha512(sha2::Sha512),
@@ -126,9 +95,7 @@ impl Hasher {
     }
 }
 
-/// A [`Read`](std::io::Read) adapter that digests every byte it passes
-/// through. Wrapping the response body in this is what lets the verify
-/// step happen without a second copy of the artefact anywhere.
+/// Digests what passes through, so verifying needs no second copy.
 struct Digesting<R> {
     inner: R,
     hasher: Option<Hasher>,
@@ -147,65 +114,37 @@ impl<R: std::io::Read> std::io::Read for Digesting<R> {
 #[derive(Clone, Default, PartialEq, Eq)]
 #[crate::wire]
 pub struct State {
-    /// Source URL (`http`/`https`).
     pub url: String,
-    /// Destination path on the remote.
     pub dest: PathBuf,
-    /// Optional digest to verify the download against and to make the
-    /// task idempotent. `None` ⇒ skip only when the file already exists.
+    /// `None` ⇒ an existing file counts as done.
     pub checksum: Option<Checksum>,
-    /// Owning user for the downloaded file. `None` ⇒ leave as-is.
+    /// `None` ⇒ the existing file's, else the worker's.
     pub user: Option<String>,
-    /// Owning group for the downloaded file. `None` ⇒ leave as-is.
+    /// `None` ⇒ the existing file's, else the worker's.
     pub group: Option<String>,
-    /// Mode to set on the downloaded file. `None` ⇒ `0o644`.
+    /// `None` ⇒ the existing file's, else `0o644`.
     pub mode: Option<super::path::Mode>,
-    /// Largest body this fetch will accept, in bytes. A declared
-    /// `Content-Length` over the limit is rejected before any transfer;
-    /// a server that lies about (or omits) the length is cut off once it
-    /// exceeds the limit mid-stream, leaving the destination untouched.
-    /// `None` ⇒ [`DEFAULT_MAX_BYTES`].
+    /// Larger bodies are refused — up front from `Content-Length`, else
+    /// once the stream passes it — leaving the destination untouched.
+    /// `None` ⇒ 4 GiB.
     pub max_bytes: Option<u64>,
-    /// Hard end-to-end deadline for the whole fetch, DNS lookup to last
-    /// byte. `None` (the default) lets a large artefact take as long as
-    /// the link needs; the transfer is still bounded by
-    /// [`max_bytes`](Self::max_bytes) and header retrieval by its own
-    /// fixed timeout.
+    /// Deadline for the whole fetch, connect to last byte. `None` lets
+    /// a large artefact take as long as the link needs.
     pub timeout: Option<std::time::Duration>,
-    /// Extra request headers, applied verbatim — e.g.
-    /// `Authorization: Bearer …` for a private GitHub release.
-    ///
-    /// Values are [`HeaderValue`]s, which redact themselves: `Debug`
-    /// renders every one of them as `Sensitive`, because header values
-    /// routinely carry credentials and this `State` is otherwise an
-    /// ordinary `#[crate::wire]` struct with a derived `Debug`. Without
-    /// that, one `dbg!(&state)` or `bail!("{state:?}")` in a playbook
-    /// would put a bearer token in the run view. Reveal from a
-    /// [`Secret`](crate::secret::Secret) inside the remote fn when
-    /// building the `State`; cindy's own paths never log a value (the
-    /// run-view line is `dest <- url`).
+    /// Extra request headers (`Authorization: Bearer …`). Reveal the
+    /// value from a [`Secret`](crate::secret::Secret) inside the remote
+    /// fn; [`HeaderValue`] keeps it out of `Debug` output.
     pub headers: Vec<(String, HeaderValue)>,
 }
 
-/// A request header value that never prints itself.
-///
-/// Wraps `http::HeaderValue` (via ureq's re-export, so no new
-/// dependency) purely to carry it over the postcard RPC wire: the
-/// upstream type has no serde impls, but its `Debug` already writes
-/// `Sensitive` for a value marked sensitive — which is exactly the
-/// redaction wanted, from the crate that owns the concept, rather than
-/// a hand-rolled one.
-///
-/// Every value is marked sensitive on construction and after transport.
-/// A non-secret header therefore also reads as `Sensitive` in a debug
-/// dump; that is the right default for a field whose whole purpose is
-/// carrying credentials.
+/// A header value that `Debug`-prints as `Sensitive` — `http`'s own
+/// redaction, which every value gets, credential or not. The newtype
+/// exists only because `http::HeaderValue` has no serde impls.
 #[derive(Clone, PartialEq, Eq)]
 pub struct HeaderValue(ureq::http::HeaderValue);
 
 impl HeaderValue {
-    /// Build a header value, rejecting bytes a header can't carry
-    /// (control characters, newlines — the header-injection shapes).
+    /// Refuses control characters and newlines (header injection).
     pub fn new(value: impl AsRef<[u8]>) -> crate::Result<Self> {
         let mut inner = ureq::http::HeaderValue::from_bytes(value.as_ref())
             .map_err(|e| crate::Error::msg(format!("invalid header value: {e}")))?;
@@ -220,8 +159,6 @@ impl HeaderValue {
     }
 }
 
-/// Deliberately not the derived impl: this is the whole point of the
-/// newtype. Delegates to `http`'s, which writes `Sensitive`.
 impl std::fmt::Debug for HeaderValue {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         self.0.fmt(f)
@@ -238,24 +175,18 @@ impl<'de> serde::Deserialize<'de> for HeaderValue {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         use serde::de::Error as _;
         let bytes = <Vec<u8> as serde::Deserialize>::deserialize(deserializer)?;
-        // Re-marked sensitive on arrival: the flag is local state on
-        // the upstream type, not something the bytes carry.
+        // The sensitive flag doesn't travel; `new` sets it again.
         Self::new(&bytes).map_err(D::Error::custom)
     }
 }
 
-/// `url` with any `user:password@` userinfo replaced.
-///
-/// Log and error lines are forwarded to the operator's terminal and the
-/// run view's scrollback verbatim, so a token embedded in the URL would
-/// otherwise be on screen (and in any captured CI log) in the clear.
+/// `url` with any `user:password@` replaced, for log and error lines.
 fn redact_url(url: &str) -> std::borrow::Cow<'_, str> {
     let Some(scheme_end) = url.find("://") else {
         return std::borrow::Cow::Borrowed(url);
     };
     let authority_start = scheme_end + 3;
-    // Userinfo, when present, ends at the first `@` *within the
-    // authority*; a later `@` in the path or query is not credentials.
+    // Only an `@` inside the authority is userinfo.
     let authority_end = url[authority_start..]
         .find(['/', '?', '#'])
         .map_or(url.len(), |i| authority_start + i);
@@ -269,28 +200,18 @@ fn redact_url(url: &str) -> std::borrow::Cow<'_, str> {
     ))
 }
 
-/// Streaming digest of the file at `path` under `sum`'s algorithm, or
-/// `None` if it can't be read (missing, a directory, permissions) —
-/// which the caller reads as "not satisfied, download".
+/// `None` when the file can't be read, which means "download".
 fn digest_file(path: &Path, sum: &Checksum) -> Option<String> {
-    let mut file = std::fs::File::open(path).ok()?;
-    let mut hasher = Hasher::for_checksum(sum);
-    let mut buf = vec![0u8; DIGEST_CHUNK];
-    loop {
-        match file.read(&mut buf) {
-            Ok(0) => break,
-            Ok(n) => hasher.update(&buf[..n]),
-            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-            Err(_) => return None,
-        }
-    }
-    Some(hasher.finish())
+    let mut reader = Digesting {
+        inner: std::fs::File::open(path).ok()?,
+        hasher: Some(Hasher::for_checksum(sum)),
+    };
+    std::io::copy(&mut reader, &mut std::io::sink()).ok()?;
+    reader.hasher.map(Hasher::finish)
 }
 
-/// [`path`](super::path) requires a total owner/mode spec; fetch's own
-/// are optional ("`None` ⇒ leave as-is"). Fill the unspecified fields
-/// from the existing file when there is one, else from the worker's
-/// identity and a conventional `0o644`.
+/// Fill fetch's optional owner/mode from the existing file, else the
+/// worker and `0o644`, because `path` takes a total spec.
 fn desired_attrs(
     state: &State,
     existing: Option<&std::fs::Metadata>,
@@ -315,9 +236,6 @@ fn desired_attrs(
     )
 }
 
-/// HTTP agent for one fetch. ureq's timeout defaults are all `None`, so
-/// without these a blackholed server would hang the play forever with no
-/// diagnostic.
 fn agent(timeout: Option<std::time::Duration>) -> ureq::Agent {
     ureq::Agent::config_builder()
         .timeout_connect(Some(CONNECT_TIMEOUT))
@@ -327,29 +245,14 @@ fn agent(timeout: Option<std::time::Duration>) -> ureq::Agent {
         .new_agent()
 }
 
-/// Download a file to the remote, verifying its checksum if given.
-///
-/// The body streams into a temp file next to the destination, which the
-/// [`path`](super::path) module then publishes with an atomic rename —
-/// so `fetch` inherits correct file/dir/symlink transition handling,
-/// ownership and durability without reimplementing any of it, and
-/// without the artefact ever existing in memory.
-///
-/// This is the full-control entry point taking a [`State`] (owner, mode,
-/// size limit, …). For the common cases, prefer the intent-named
-/// helpers: [`url`], [`verified`].
+/// The full-control entry point; [`url`] and [`verified`] cover the
+/// common cases.
 #[crate::remote]
 pub fn fetch(state: State) -> crate::Result<super::Return> {
     apply(state)
 }
 
-// Intent-named helpers, each a single `#[crate::action]` fn whose body builds
-// a `State` and calls `apply`. The macro generates the concrete `#[remote]`
-// wire entry point, the orchestrator shim, and the in-process `::inner`.
-
-/// Download `url` to `dest`, owned by the worker's identity at `0o644`.
-/// Without a checksum the file is fetched only when missing. Orchestrator:
-/// `url(url, dest).await?`.
+/// Download `url` to `dest` if it is missing.
 #[crate::action]
 pub fn url(url: impl Into<String>, dest: impl Into<PathBuf>) -> crate::Result<super::Return> {
     apply(State {
@@ -359,10 +262,8 @@ pub fn url(url: impl Into<String>, dest: impl Into<PathBuf>) -> crate::Result<su
     })
 }
 
-/// Download `url` to `dest` and verify it against `checksum` — making the
-/// fetch both idempotent (skip when the on-disk file already matches) and
-/// safe (a corrupt/tampered download is rejected). Orchestrator:
-/// `verified(url, dest, checksum).await?`.
+/// Download `url` to `dest` unless it already matches `checksum`, and
+/// refuse a download that doesn't.
 #[crate::action]
 pub fn verified(
     url: impl Into<String>,
@@ -382,16 +283,11 @@ fn apply(state: State) -> crate::Result<super::Return> {
         sum.validate()?;
     }
 
-    // Only a regular file can satisfy the destination. Anything else —
-    // directory, symlink, special file — is what the atomic publish
-    // below replaces, and its attributes are not inherited.
+    // Anything but a regular file gets replaced, attributes and all.
     let existing = std::fs::symlink_metadata(&state.dest)
         .ok()
         .filter(std::fs::Metadata::is_file);
 
-    // Idempotency check that never loads the artefact: with a checksum,
-    // stream-hash what's on disk; without one, existence is all we can
-    // honestly check.
     let satisfied = existing.is_some()
         && match &state.checksum {
             Some(sum) => digest_file(&state.dest, sum).is_some_and(|have| have == sum.expected()),
@@ -401,13 +297,7 @@ fn apply(state: State) -> crate::Result<super::Return> {
     let (owner, mode) = desired_attrs(&state, existing.as_ref());
 
     if satisfied {
-        // Content is already right, but owner/mode may have drifted —
-        // reconcile those rather than reporting a blanket `Unchanged`.
-        // Check mode asks the same question without applying: the attr
-        // comparison is stat-level (`file_attrs_satisfied`), and the
-        // checksum that established `satisfied` hashed the *local*
-        // file — no download is involved on either side of the
-        // decision, so under-reporting here had no excuse.
+        // The content is right; owner and mode may still have drifted.
         if crate::dry_run() {
             let attrs_ok = super::path::file_attrs_satisfied(&state.dest, &owner, mode);
             return Ok(super::Return::from_changed(!attrs_ok));
@@ -415,14 +305,10 @@ fn apply(state: State) -> crate::Result<super::Return> {
         return super::path::reconcile_file_attrs(&state.dest, &owner, mode);
     }
 
-    // Check mode: the destination is missing or stale, so the fetch
-    // would change it — report that without transferring anything.
     if crate::dry_run() {
         return Ok(super::Return::Changed);
     }
 
-    // Resolve the owner before the transfer, so a typo'd user fails in a
-    // second instead of after a gigabyte has crossed the wire.
     let (uid, gid) = owner.resolve()?;
     let max = state.max_bytes.unwrap_or(DEFAULT_MAX_BYTES);
     let url = redact_url(&state.url);
@@ -434,14 +320,10 @@ fn apply(state: State) -> crate::Result<super::Return> {
 
     let mut request = agent(state.timeout).get(&state.url);
     for (name, value) in &state.headers {
-        // ureq defers header validation to `call()`, so a bad name or
-        // value surfaces as the request's own error, wrapped below.
         request = request.header(name.as_str(), value.as_str()?);
     }
     let mut response = request.call().context(format!("GET {url} failed"))?;
 
-    // Reject an over-sized artefact from the declared length before a
-    // single body byte is transferred, when the server declares one.
     if let Some(len) = response.body().content_length()
         && len > max
     {
@@ -452,9 +334,7 @@ fn apply(state: State) -> crate::Result<super::Return> {
     }
 
     let mut digesting = Digesting {
-        // `limit` errors on the read *past* its bound, so `max + 1`
-        // makes `max_bytes` an inclusive ceiling instead of one byte
-        // short of it.
+        // `limit` fails the read past its bound: `+ 1` makes it inclusive.
         inner: response
             .body_mut()
             .with_config()
@@ -469,9 +349,7 @@ fn apply(state: State) -> crate::Result<super::Return> {
             state.dest.display()
         ))?;
 
-    // Verify *before* publishing. A failed checksum must leave the
-    // destination exactly as it was, so the staged temp file is dropped
-    // — and unlinked — rather than renamed into place.
+    // A mismatch drops (and so unlinks) the staged file unpublished.
     if let (Some(sum), Some(hasher)) = (&state.checksum, digesting.hasher.take()) {
         let got = hasher.finish();
         if got != sum.expected() {
@@ -494,19 +372,13 @@ mod tests {
     use super::*;
 
     const BODY: &[u8] = b"downloaded-by-cindy-fetch-module\n";
-    /// `sha256sum` of [`BODY`], as an independent check that the
-    /// streaming digest agrees with the reference implementation and not
-    /// just with itself.
+    /// From `sha256sum`, so the digest is checked against more than itself.
     const BODY_SHA256: &str = "779d665dc1671dd5c8a59c60849873195d031352e71c9d9c3f32193ed811395d";
 
     #[test]
     fn streaming_digest_matches_the_one_shot_digest() {
-        // The whole point of `Digesting`/`digest_file` is that they
-        // agree with hashing the buffer in one go — across a chunk
-        // boundary, where an off-by-one in the adapter would show up.
-        let big: Vec<u8> = (0..(DIGEST_CHUNK * 2 + 7))
-            .map(|i| (i % 251) as u8)
-            .collect();
+        // Spans several `io::copy` buffers.
+        let big: Vec<u8> = (0..(64 * 1024 * 2 + 7)).map(|i| (i % 251) as u8).collect();
         let want = hex(&sha2::Sha256::digest(&big));
 
         let tmp = tempfile::tempdir().unwrap();
@@ -558,22 +430,17 @@ mod tests {
     fn digest_file_reports_none_for_unreadable_destinations() {
         let tmp = tempfile::tempdir().unwrap();
         let sum = Checksum::Sha256(String::new());
-        // Missing.
         assert!(digest_file(&tmp.path().join("nope"), &sum).is_none());
-        // A directory is not a readable artefact either.
         assert!(digest_file(tmp.path(), &sum).is_none());
     }
 
     #[test]
     fn expected_digest_is_normalised_and_validated() {
-        // Case and surrounding whitespace are tolerated…
         assert_eq!(
             Checksum::Sha256(format!("  {}  ", BODY_SHA256.to_uppercase())).expected(),
             BODY_SHA256,
         );
         assert!(Checksum::Sha256(BODY_SHA256.to_owned()).validate().is_ok());
-        // …but a truncated or non-hex digest is rejected up front rather
-        // than silently never matching.
         assert!(
             Checksum::Sha256(BODY_SHA256[..63].to_owned())
                 .validate()
@@ -584,14 +451,9 @@ mod tests {
                 .validate()
                 .is_err()
         );
-        // A sha256-length string in a Sha512 slot is a mixed-up algorithm.
         assert!(Checksum::Sha512(BODY_SHA256.to_owned()).validate().is_err());
     }
 
-    /// The point of the newtype: a header value must never appear in a
-    /// debug rendering of the `State` that carries it. `#[crate::wire]`
-    /// derives `Debug` on `State`, so this is the only thing standing
-    /// between a bearer token and the run view.
     #[test]
     fn header_values_never_debug_print_themselves() {
         let state = State {
@@ -605,19 +467,11 @@ mod tests {
         let rendered = format!("{state:?}");
         assert!(!rendered.contains("s3kr1t-token"), "{rendered}");
         assert!(!rendered.contains("Bearer"), "{rendered}");
-        // The header's *name* stays visible — knowing an Authorization
-        // header was sent is diagnostic, its value is not.
         assert!(rendered.contains("Authorization"), "{rendered}");
         assert!(rendered.contains("Sensitive"), "{rendered}");
-        // Control: the URL is still rendered, so this isn't passing
-        // because the whole struct went opaque.
         assert!(rendered.contains("example.com"), "{rendered}");
     }
 
-    /// The sensitive flag is local state on `http::HeaderValue`, not
-    /// something the serialised bytes carry — so it has to be re-applied
-    /// on the far side of the wire, or the worker's own debug output
-    /// would leak what the orchestrator's did not.
     #[test]
     fn redaction_survives_the_rpc_wire() {
         let before = HeaderValue::new("Bearer s3kr1t-token").unwrap();
@@ -630,8 +484,6 @@ mod tests {
 
     #[test]
     fn header_values_reject_injection_shapes() {
-        // A newline in a header value is header injection; `http`
-        // refuses it and so must we.
         assert!(HeaderValue::new("ok").is_ok());
         assert!(HeaderValue::new("bad\r\nX-Evil: 1").is_err());
         assert!(HeaderValue::new("bad\nvalue").is_err());
@@ -646,14 +498,12 @@ mod tests {
                 "https://***@example.com/a/b?x=1",
             ),
             ("https://tok3n@example.com/a", "https://***@example.com/a"),
-            // No userinfo: untouched, including an `@` further along.
             ("https://example.com/a@b", "https://example.com/a@b"),
             (
                 "https://example.com/?to=a@b.com",
                 "https://example.com/?to=a@b.com",
             ),
             ("https://example.com", "https://example.com"),
-            // Not a URL at all: don't mangle it.
             ("example.com/a@b", "example.com/a@b"),
         ];
         for (raw, want) in cases {
