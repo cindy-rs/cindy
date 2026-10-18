@@ -23,7 +23,10 @@ keywords = ["ansible", "infrastructure", "iac", "management", "provisioning"]
 
 [workspace.dependencies]
 cindy = { path = "crates/cindy", version = "0.3.0" }
-cindy-macros = { path = "crates/cindy-macros", version = "0.3.0" }
+# Exact: the macros' expansions name cindy's internals (`__reexports`,
+# `entry`, `error::wire`), so a cindy-macros newer than cindy can emit
+# paths that cindy doesn't have.
+cindy-macros = { path = "crates/cindy-macros", version = "=0.3.0" }
 
 base64 = "0.22"
 postcard = "1.1"
