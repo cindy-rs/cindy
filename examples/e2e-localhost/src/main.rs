@@ -467,22 +467,18 @@ async fn main(host: cindy::Host<Vars>) -> cindy::Result<()> {
         let out =
             builtin::command::command(vec!["true".into()], builtin::command::State::default())
                 .await?;
-        if !out.dry_run {
+        if out.status != builtin::command::Status::Skipped {
             cindy::bail!("command executed under --check: the worker never got the flag");
         }
         out.exit_ok()?;
 
-        // A probe is the opposite promise: check mode *does* run it, so
-        // a play can still branch on real information. Without this,
-        // every branch over command output takes the wrong turn under
-        // `--check` and the report stops matching what a real run would
-        // do — including skipping work, which is an under-report.
+        // A probe is the opposite promise: check mode runs it.
         let probed = builtin::command::probe(vec![
             "echo".to_string(),
             "probe-ran-under-check".to_string(),
         ])
         .await?;
-        if probed.dry_run {
+        if probed.status == builtin::command::Status::Skipped {
             cindy::bail!("probe was suppressed under --check; its whole point is to run");
         }
         if probed.stdout.trim() != "probe-ran-under-check" {
@@ -493,18 +489,14 @@ async fn main(host: cindy::Host<Vars>) -> cindy::Result<()> {
         }
         probed.exit_ok()?;
 
-        // `probe_shell` likewise, on a genuinely read-only script —
-        // interrogating the filesystem rather than changing it, which
-        // is the only shape a probe may legitimately take. The earlier
-        // `path::file` reported `Changed` without creating anything, so
-        // this also confirms check mode's two halves agree: the file is
-        // absent, and a probe can see that it is.
+        // The `path::file` above reported `Changed` without creating
+        // anything; a read-only probe must see the file still absent.
         let looked = builtin::command::probe_shell(
             "/bin/sh",
             format!("test -e {} && echo present || echo absent", probe.display()),
         )
         .await?;
-        if looked.dry_run {
+        if looked.status == builtin::command::Status::Skipped {
             cindy::bail!("probe_shell was suppressed under --check");
         }
         if looked.stdout.trim() != "absent" {

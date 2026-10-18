@@ -1,36 +1,18 @@
-//! Run an arbitrary process (`command`) or a script through an
-//! explicit interpreter (`shell`) on the remote machine.
+//! Run a process (`command`) or a script through an explicit interpreter
+//! (`shell`) on the remote machine.
 //!
-//! Unlike the other builtins, these execute opaque user-supplied
-//! programs, so the framework cannot introspect what a change *is* —
-//! there is no on-disk state to read back, and therefore no honest
-//! "changed / unchanged" to report. These modules deliberately make no
-//! idempotency claim: they always run, and they hand you back the raw
-//! [`Output`] (exit code, stdout, stderr). Deciding whether the
-//! intended effect happened is *your* job — inspect the code/output, or
-//! check filesystem state with a read-only builtin (e.g. `stat`) before
-//! and after.
-//!
-//! Consistent with that, a **non-zero exit is not an error** — it's
-//! data, reported in [`Output::code`]. Only failing to run the program
-//! at all errors. When "non-zero should fail the play" is what you
-//! mean, say so with [`Output::exit_ok`].
+//! These run opaque programs, so cindy can't read back what changed:
+//! they make no idempotency claim, always run, and return the raw
+//! [`Output`]. A non-zero exit is data ([`Output::status`]), not an
+//! error; say "non-zero fails the play" with [`Output::exit_ok`].
 //!
 //! # Check mode
 //!
-//! Under `cindy play --check` a program is not executed: cindy can't
-//! introspect an opaque binary, so it assumes the worst. The returned
-//! [`Output`] marks itself [`dry_run`](Output::dry_run) with empty
-//! streams, and `exit_ok` passes so plays flow through.
-//!
-//! That default is safe but not sufficient. A play that *branches* on a
-//! command's output takes the wrong branch when the output is empty, so
-//! the change set check mode reports stops matching what a real run
-//! would do — and when the branch it skips contains work, that's an
-//! under-report, which check mode must never produce. [`probe`] (and
-//! [`probe_shell`]) are the way out: they assert [`Effect::ReadOnly`],
-//! so check mode runs them and the branch sees real information. The
-//! assertion is yours to keep — see [`Effect::ReadOnly`].
+//! Under `--check` a program isn't run — cindy assumes it mutates — and
+//! its status is [`Status::Skipped`]. A play that *branches* on output
+//! would then take the wrong branch, so anything you branch on should
+//! be a [`probe`]: it asserts [`Effect::ReadOnly`] and runs under
+//! `--check` too.
 //!
 //! ```ignore
 //! command(vec!["systemctl".into(), "reload".into(), "nginx".into()], <_>::default())
@@ -38,126 +20,87 @@
 //!     .exit_ok()?; // non-zero exit fails the play, with stdout/stderr attached
 //! ```
 
+use std::collections::BTreeMap;
+use std::path::PathBuf;
+use std::time::Duration;
+
 use crate::Context;
 
-/// Captured result of the executed process.
-///
-/// Returned for both [`command`] and [`shell`]. Outside check mode the
-/// program always ran, so there is no "changed" flag — just the
-/// observable result for you to act on. Under check mode nothing ran
-/// and [`dry_run`](Output::dry_run) is set.
+/// The result of running (or, under `--check`, not running) a program.
 #[derive(Clone, PartialEq, Eq)]
 #[crate::wire]
 pub struct Output {
-    /// Process exit code, or `None` if the program was terminated by a
-    /// signal (no code available).
-    pub code: Option<i32>,
-    /// Captured standard output.
+    pub status: Status,
     pub stdout: String,
-    /// Captured standard error.
     pub stderr: String,
-    /// True when check mode suppressed the execution: `code` is `None`
-    /// and the streams carry a not-executed note. Nothing ran, so
-    /// nothing in this `Output` is a result — see [`success`](Output::success).
-    pub dry_run: bool,
 }
 
-/// Printed when [`Output::success`] is read on an output check mode
-/// suppressed. It is how the "branch on a probe" rule announces itself
-/// instead of having to be known.
-const SUPPRESSED_SUCCESS_WARNING: &str = "! success() read on a command --check didn't run: the \
+#[derive(Clone, Copy, PartialEq, Eq)]
+#[crate::wire]
+pub enum Status {
+    Exited(i32),
+    /// Terminated by a signal, so there is no exit code.
+    Signalled,
+    /// Check mode didn't run it: nothing in the [`Output`] is a result.
+    Skipped,
+}
+
+const SKIPPED_SUCCESS_WARNING: &str = "! success() read on a command --check didn't run: the \
      answer is meaningless. If you branch on it, it's a query — use `probe`.";
 
 impl Output {
-    /// `true` if the program exited successfully: `code == 0`, and
-    /// nothing else.
+    /// Exited with code 0.
     ///
-    /// A program check mode didn't run has no exit code, so this is
-    /// `false` for it, exactly as for one killed by a signal. No answer
-    /// would be right there: whether `true` or `false`, one of
+    /// A skipped program has no answer — `true` or `false`, one of
     /// `if out.success()` / `if !out.success()` skips a branch a real
-    /// run would take, which is an under-report. So it gives the
-    /// literal answer and says so: reading it on a suppressed output
-    /// under `--check` prints a warning naming the fix. **Anything you
-    /// branch on is a [`probe`]**, which runs under `--check` and so
-    /// has a real answer.
+    /// run takes — so it answers `false` and warns that the branch
+    /// wants a [`probe`].
     pub fn success(&self) -> bool {
-        if self.dry_run {
-            let _ = crate::diff::note(&mut std::io::stderr().lock(), SUPPRESSED_SUCCESS_WARNING);
+        if self.status == Status::Skipped {
+            let _ = crate::diff::note(&mut std::io::stderr().lock(), SKIPPED_SUCCESS_WARNING);
         }
-        self.code == Some(0)
+        self.status == Status::Exited(0)
     }
 
-    /// Turn a non-zero (or signal-terminated) exit into an error
-    /// carrying the captured stdout/stderr, for callers where anything
-    /// but success should fail the play.
-    ///
-    /// Under `--check` a suppressed program passes: nothing ran, so
-    /// nothing failed, and the play flows on to report the rest. This
-    /// is the one place that pass-through belongs — it is a statement
-    /// about failure, not about a condition.
+    /// Fail on anything but a clean exit, attaching stdout/stderr. A
+    /// skipped program passes: nothing ran, so nothing failed.
     pub fn exit_ok(self) -> crate::Result<Self> {
-        if self.dry_run || self.code == Some(0) {
+        if matches!(self.status, Status::Exited(0) | Status::Skipped) {
             return Ok(self);
         }
         crate::bail!(
-            "process exited with {:?}:\n--- stdout ---\n{}\n--- stderr ---\n{}",
-            self.code,
+            "process {:?}:\n--- stdout ---\n{}\n--- stderr ---\n{}",
+            self.status,
             self.stdout,
             self.stderr,
         );
     }
 }
 
-/// What running this program does to the target — the one thing cindy
-/// cannot work out for itself, and therefore the one thing check mode
-/// has to be told.
-///
-/// Default is [`Mutating`](Effect::Mutating): an opaque program is
-/// assumed to change the host, so `--check` doesn't run it.
+/// What running the program does to the target — the one thing check
+/// mode can't work out, so it has to be told.
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
 #[crate::wire]
 pub enum Effect {
-    /// Running this may change the target, so check mode skips it and
-    /// reports the absence. The safe default.
+    /// May change the target: `--check` skips it.
     #[default]
     Mutating,
-    /// Running this changes nothing — it only reports. Check mode
-    /// executes it, because the *information* is what the rest of the
-    /// play branches on.
+    /// Only reports: `--check` runs it, so plays can branch on the
+    /// answer.
     ///
-    /// **This is an assertion cindy cannot verify, and the only place
-    /// `--check`'s never-mutate guarantee is delegated to you.** Mark a
-    /// mutating program `ReadOnly` and `--check` will mutate the
-    /// target.
+    /// **cindy can't verify this.** It is the one place `--check`'s
+    /// never-mutate guarantee is delegated to you: mislabel a mutating
+    /// program and `--check` mutates the target. The test is "does it
+    /// write anything", not "is it safe to re-run" (`mkdir -p` is
+    /// idempotent and still `Mutating`).
     ///
-    /// The line is "does running this write anything", not "is it safe
-    /// to re-run". Those differ: `mkdir -p` is perfectly idempotent and
-    /// still `Mutating`.
-    ///
-    /// Genuinely read-only: `systemctl is-enabled`, `test -f`,
-    /// `dpkg-query -W`, `--version`, `id -u`, `uname -m`.
-    ///
-    /// `Mutating` despite sounding like a query — the cases worth
-    /// knowing, because each is a plausible mislabel:
-    ///
-    /// - `apt-get update` "just refreshes information", and writes
-    ///   `/var/lib/apt`.
-    /// - any `shell` script with a redirect: `… > /tmp/out`, `… | tee`,
-    ///   or anything writing to a pipe, FIFO or device node.
-    /// - `mktemp`, `touch` — they create.
-    /// - `curl`/`fetch` of a remote endpoint: read-only *here*, but a
-    ///   `GET` can still change the far side, and it leaves artefacts
-    ///   if it writes a file.
-    /// - a "read" that mutates server-side state: this project hit one
-    ///   in `systemd` itself, where D-Bus `LoadUnit` loads a unit as a
-    ///   side effect where `GetUnit` only looks.
-    ///
-    /// Why it has to exist: without it, a play that branches on a
-    /// command's output takes the *wrong branch* under `--check`,
-    /// because the output is empty. That can silently skip work a real
-    /// run would do — an under-report, which is the one thing check
-    /// mode must never do.
+    /// Read-only: `systemctl is-enabled`, `test -f`, `dpkg-query -W`,
+    /// `id -u`, `uname -m`, `--version`. Plausible-looking mislabels:
+    /// `apt-get update` (writes `/var/lib/apt`), any script with a
+    /// redirect or pipe into a file/FIFO/device, `mktemp`, `touch`, an
+    /// HTTP `GET` that changes the far side or saves a file, and RPCs
+    /// that load state as a side effect (D-Bus `LoadUnit`, unlike
+    /// `GetUnit`).
     ReadOnly,
 }
 
@@ -165,72 +108,44 @@ pub enum Effect {
 #[derive(Clone, Default, PartialEq, Eq)]
 #[crate::wire]
 pub struct State {
-    /// Whether running this program changes the target, which decides
-    /// what `--check` does with it. See [`Effect`]; defaults to
-    /// [`Effect::Mutating`], and [`probe`] is the ergonomic way to ask
-    /// for the other one.
     pub effect: Effect,
-    /// Working directory to run the program in. `None` ⇒ inherit the
-    /// remote worker's current directory.
-    pub chdir: Option<std::path::PathBuf>,
-    /// Extra environment variables to set for the child process. These
-    /// are layered on top of the worker's inherited environment.
-    pub env: std::collections::BTreeMap<String, String>,
-    /// Kill the program if it hasn't exited after this long, and fail
-    /// the call. The timeout is *our* intervention, not the program's
-    /// exit behavior, so it surfaces as an error rather than an
-    /// [`Output`]. `None` (the default) waits forever, like a plain
-    /// shell would.
-    pub timeout: Option<std::time::Duration>,
+    /// `None` ⇒ the worker's working directory.
+    pub chdir: Option<PathBuf>,
+    /// Layered over the worker's environment.
+    pub env: BTreeMap<String, String>,
+    /// Kill the program and fail the call after this long. `None` waits
+    /// forever.
+    pub timeout: Option<Duration>,
 }
 
-/// Does this call actually start a process?
-///
-/// A pure decision, extracted and tested because it is exactly the
-/// shape that has gone wrong before: a check-mode condition inlined at
-/// its one call site, with nothing holding it to the invariant. Both
-/// branches of `run` read this one answer.
 fn executes(effect: Effect, dry_run: bool) -> bool {
-    !dry_run || matches!(effect, Effect::ReadOnly)
+    !dry_run || effect == Effect::ReadOnly
 }
 
-/// Run an already-configured [`Command`] to completion and capture its
-/// [`Output`]. Errors only when the program couldn't be run at all (or
-/// hit [`State::timeout`]); the exit status — zero or not — is the
-/// caller's data, not our verdict (see the module docs and
-/// [`Output::exit_ok`]).
 async fn run(
     mut cmd: tokio::process::Command,
     state: &State,
     label: &str,
 ) -> crate::Result<Output> {
-    if let Some(dir) = state.chdir.as_ref() {
+    if let Some(dir) = &state.chdir {
         cmd.current_dir(dir);
     }
-    for (k, v) in &state.env {
-        cmd.env(k, v);
-    }
-    // A timed-out call drops the in-flight `output()` future; without
-    // this the orphaned child would keep running on the target.
+    cmd.envs(&state.env);
+    // A timeout drops the `output()` future; don't leave the child behind.
     cmd.kill_on_drop(true);
 
     if !executes(state.effect, crate::dry_run()) {
         let note = format!("[dry-run] {label} not executed");
         eprintln!("{note}");
         return Ok(Output {
-            code: None,
+            status: Status::Skipped,
             stdout: String::new(),
             stderr: note,
-            dry_run: true,
         });
     }
-
-    // A probe running under `--check` is the one place check mode runs
-    // a program, so it says so. An operator reading a check run must be
-    // able to account for every process it started — that is where the
-    // never-mutate guarantee was handed to the playbook author, and an
-    // invisible delegation is an unreviewable one.
     if crate::dry_run() {
+        // Every process check mode starts must be visible to the operator:
+        // this is where the never-mutate guarantee was handed off.
         let _ = crate::diff::note(
             &mut std::io::stderr().lock(),
             &format!("? probe {label} (asserted read-only)"),
@@ -239,77 +154,44 @@ async fn run(
 
     let out = match state.timeout {
         None => cmd.output().await,
-        Some(limit) => match tokio::time::timeout(limit, cmd.output()).await {
-            Ok(res) => res,
-            Err(_elapsed) => {
-                crate::bail!("{label} timed out after {limit:?} and was killed")
-            }
-        },
+        Some(limit) => tokio::time::timeout(limit, cmd.output())
+            .await
+            .map_err(|_| crate::anyhow!("{label} timed out after {limit:?} and was killed"))?,
     }
     .context(format!("Failed to spawn {label}"))?;
 
     Ok(Output {
-        code: out.status.code(),
+        status: out.status.code().map_or(Status::Signalled, Status::Exited),
         stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
         stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
-        dry_run: false,
     })
 }
 
-/// Run a program directly, without a shell.
-///
-/// `argv[0]` is the program to execute and the remaining elements are
-/// its arguments, passed verbatim — there is **no** shell, so globbing,
-/// pipes, redirection, `&&`, environment-variable expansion, etc. are
-/// *not* interpreted. If you need any of that, reach for [`shell`].
-///
-/// `argv` must be non-empty. This module makes no idempotency claim: it
-/// runs every time and reports the raw [`Output`].
+/// Run `argv[0]` with `argv[1..]` verbatim — no shell, so no globbing,
+/// pipes or expansion; use [`shell`] for those.
 #[crate::remote]
 pub async fn command(argv: Vec<String>, state: State) -> crate::Result<Output> {
     command_impl(argv, state).await
 }
 
-/// Shared body behind [`command`] and [`probe`]: not itself a remote fn
-/// (those are), just what they both funnel into — the same split every
-/// other builtin makes with its `apply`.
 async fn command_impl(argv: Vec<String>, state: State) -> crate::Result<Output> {
     let Some((program, args)) = argv.split_first() else {
         crate::bail!("`command` requires a non-empty argv (argv[0] is the program)");
     };
-
     let mut cmd = tokio::process::Command::new(program);
     cmd.args(args);
     run(cmd, &state, &format!("`command` {program:?}")).await
 }
 
-/// Run a script through an explicit interpreter.
-///
-/// `shell` deliberately refuses to assume an interpreter: `interpreter`
-/// is the **full path** to the shell binary (`/bin/sh`, `/bin/bash`,
-/// `/usr/bin/zsh`, …) and `script` is handed to it via `-c`. There is
-/// no implicit `bash`/`sh`/`zsh` — the caller must spell out exactly
-/// which interpreter runs, so plays don't silently depend on whatever
-/// `/bin/sh` happens to point at on a given host.
-///
-/// `interpreter` must be an absolute path that exists on the remote;
-/// the module fails fast otherwise rather than letting the OS produce a
-/// confusing `ENOENT`.
+/// Run `script` via `interpreter -c`. The interpreter is an absolute
+/// path on purpose: no play should depend on what `/bin/sh` happens to
+/// be on a given host.
 #[crate::remote]
-pub async fn shell(
-    interpreter: std::path::PathBuf,
-    script: String,
-    state: State,
-) -> crate::Result<Output> {
+pub async fn shell(interpreter: PathBuf, script: String, state: State) -> crate::Result<Output> {
     shell_impl(interpreter, script, state).await
 }
 
-/// Shared body behind [`shell`] and [`probe_shell`].
-async fn shell_impl(
-    interpreter: std::path::PathBuf,
-    script: String,
-    state: State,
-) -> crate::Result<Output> {
+async fn shell_impl(interpreter: PathBuf, script: String, state: State) -> crate::Result<Output> {
     if !interpreter.is_absolute() {
         crate::bail!(
             "`shell` interpreter must be an absolute path, got {}; \
@@ -323,24 +205,21 @@ async fn shell_impl(
             interpreter.display()
         );
     }
-
     let mut cmd = tokio::process::Command::new(&interpreter);
     cmd.arg("-c").arg(&script);
-    run(
-        cmd,
-        &state,
-        &format!("`shell` via {}", interpreter.display()),
-    )
-    .await
+    let label = format!("`shell` via {}", interpreter.display());
+    run(cmd, &state, &label).await
 }
 
-/// Run a read-only program — one that *reports* rather than changes —
-/// so its output is available under `--check` too.
-///
-/// The same as [`command`] with [`Effect::ReadOnly`], which is the
-/// assertion you are making by calling this: cindy executes it in check
-/// mode on your word. Use it for queries whose answer the rest of the
-/// play branches on:
+const PROBE: State = State {
+    effect: Effect::ReadOnly,
+    chdir: None,
+    env: BTreeMap::new(),
+    timeout: None,
+};
+
+/// [`command`] asserting [`Effect::ReadOnly`], so it also runs under
+/// `--check`. Use it for anything the play branches on:
 ///
 /// ```rust,ignore
 /// let enabled = probe(vec!["systemctl".into(), "is-enabled".into(), "nginx".into()]).await?;
@@ -349,122 +228,74 @@ async fn shell_impl(
 /// }
 /// ```
 ///
-/// Written with [`command`] instead, that `if` takes the wrong branch
-/// under `--check` — empty stdout never equals `"enabled"` — and check
-/// mode reports an enable the real run wouldn't do. Invert the
-/// comparison and it under-reports instead, which is worse. A probe is
-/// how the branch stays honest.
+/// With [`command`], `--check` would see empty stdout and report an
+/// enable the real run might not do (or, with the comparison inverted,
+/// skip one it would).
 #[crate::action]
 pub async fn probe(argv: impl Into<Vec<String>>) -> crate::Result<Output> {
-    command_impl(
-        argv,
-        State {
-            effect: Effect::ReadOnly,
-            ..State::default()
-        },
-    )
-    .await
+    command_impl(argv, PROBE).await
 }
 
-/// [`shell`] for a read-only script — the [`probe`] counterpart, with
-/// the same assertion and the same caveat.
+/// [`shell`] asserting [`Effect::ReadOnly`]; see [`probe`].
 #[crate::action]
 pub async fn probe_shell(
-    interpreter: impl Into<std::path::PathBuf>,
+    interpreter: impl Into<PathBuf>,
     script: impl Into<String>,
 ) -> crate::Result<Output> {
-    shell_impl(
-        interpreter,
-        script,
-        State {
-            effect: Effect::ReadOnly,
-            ..State::default()
-        },
-    )
-    .await
+    shell_impl(interpreter, script, PROBE).await
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// The whole check-mode contract, as a table. Extracted into
-    /// `executes` precisely so it can be one — every `--check` defect
-    /// so far came from this decision being inlined at its call site.
+    // Check-mode behaviour itself is covered end to end: `check::install`
+    // is a set-once process global, so installing it here would decide
+    // the answer for every later test in this binary.
+
     #[test]
-    fn executes_decides_check_mode_by_asserted_effect() {
-        // Outside check mode everything runs, whatever it claims.
+    fn check_mode_runs_only_asserted_read_only_programs() {
         assert!(executes(Effect::Mutating, false));
         assert!(executes(Effect::ReadOnly, false));
-        // Under --check, only an asserted read-only program runs.
         assert!(!executes(Effect::Mutating, true));
         assert!(executes(Effect::ReadOnly, true));
-    }
-
-    /// `Mutating` must be what you get by forgetting to choose: a
-    /// defaulted `State` that ran mutating programs under `--check`
-    /// would break the invariant silently.
-    #[test]
-    fn the_default_effect_is_the_safe_one() {
         assert_eq!(State::default().effect, Effect::Mutating);
-        assert!(!executes(State::default().effect, true));
     }
 
-    // Check-mode *behaviour* is deliberately not tested here:
-    // `check::install` is a set-once process global (it arrives in the
-    // worker's handshake), so a unit test that installed it would
-    // decide the answer for every later test in this binary — an
-    // order-dependent suite. The contract lives in `executes` above,
-    // exhaustively; the end-to-end behaviour lives in the e2e suites,
-    // where a real worker gets a real handshake.
-
-    fn output(code: Option<i32>, dry_run: bool) -> Output {
+    fn output(status: Status) -> Output {
         Output {
-            code,
+            status,
             stdout: String::new(),
             stderr: String::new(),
-            dry_run,
         }
     }
 
-    /// The asymmetry this module settled on: `success()` is the literal
-    /// exit status, while `exit_ok()` alone lets a suppressed program
-    /// through. Before, `success()` said `true` for a program that never
-    /// ran, and a branch on it silently took the wrong path.
     #[test]
-    fn success_is_literal_and_only_exit_ok_passes_a_suppressed_program() {
-        let suppressed = output(None, true);
-        assert!(!suppressed.success(), "nothing ran, so nothing succeeded");
-        assert!(
-            suppressed.exit_ok().is_ok(),
-            "nothing ran, so nothing failed"
-        );
+    fn success_is_literal_and_only_exit_ok_passes_a_skipped_program() {
+        assert!(!output(Status::Skipped).success());
+        assert!(output(Status::Skipped).exit_ok().is_ok());
 
-        let ok = output(Some(0), false);
-        assert!(ok.success());
-        assert!(ok.exit_ok().is_ok());
+        assert!(output(Status::Exited(0)).success());
+        assert!(output(Status::Exited(0)).exit_ok().is_ok());
 
-        let failed = output(Some(1), false);
-        assert!(!failed.success());
-        let err = failed.exit_ok().unwrap_err().to_string();
-        assert!(err.contains("exited with Some(1)"), "{err}");
+        assert!(!output(Status::Exited(1)).success());
+        let err = output(Status::Exited(1)).exit_ok().unwrap_err().to_string();
+        assert!(err.contains("Exited(1)"), "{err}");
 
-        let signalled = output(None, false);
-        assert!(!signalled.success());
-        assert!(signalled.exit_ok().is_err());
+        assert!(!output(Status::Signalled).success());
+        assert!(output(Status::Signalled).exit_ok().is_err());
     }
 
-    /// The warning is the feature: it must name the fix, or it's noise.
     #[test]
-    fn the_suppressed_success_warning_points_at_probe() {
-        assert!(SUPPRESSED_SUCCESS_WARNING.contains("probe"));
-        assert!(SUPPRESSED_SUCCESS_WARNING.contains("--check"));
+    fn the_skipped_success_warning_points_at_probe() {
+        assert!(SKIPPED_SUCCESS_WARNING.contains("probe"));
+        assert!(SKIPPED_SUCCESS_WARNING.contains("--check"));
     }
 
     #[tokio::test]
     async fn timeout_kills_the_child_and_errors() {
         let state = State {
-            timeout: Some(std::time::Duration::from_millis(300)),
+            timeout: Some(Duration::from_millis(300)),
             ..State::default()
         };
         let err = command::inner(vec!["sleep".into(), "30".into()], state)
@@ -474,12 +305,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn no_timeout_still_waits_forever_semantics() {
-        // No timeout configured: a plain quick command behaves exactly
-        // as before the field existed.
-        let out = command::inner(vec!["true".into()], State::default())
+    async fn exit_status_is_reported_not_raised() {
+        let out = command::inner(vec!["false".into()], State::default())
             .await
             .unwrap();
-        assert_eq!(out.code, Some(0));
+        assert_eq!(out.status, Status::Exited(1));
     }
 }
