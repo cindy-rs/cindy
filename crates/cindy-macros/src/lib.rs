@@ -94,6 +94,67 @@ fn resolve_cindy() -> Result<Cindy, syn::Error> {
         })
 }
 
+/// The package's own library, when `#[cindy::main]` is expanding in
+/// another of its targets (normally the bin).
+///
+/// Worker registrations (`#[cindy::remote]` fns, `secret!` demands)
+/// are link-time `inventory` statics. The worker build compiles none of
+/// the user's `main` body, so nothing in it names the lib, and rustc
+/// leaves an unreferenced crate out of the link — taking every
+/// registration in it along. An `extern crate` forces the link, and the
+/// lib's name has to come from the manifest: nothing else tells a proc
+/// macro which crates exist.
+fn playbook_lib() -> Option<syn::Ident> {
+    let env = |key| std::env::var(key).ok();
+    let dir = std::path::PathBuf::from(env("CARGO_MANIFEST_DIR")?);
+    let manifest = std::fs::read_to_string(dir.join("Cargo.toml")).ok()?;
+    let name = linkable_lib(&manifest, dir.join("src/lib.rs").is_file())?;
+
+    // Expanding inside the lib itself: a bin target sets
+    // `CARGO_BIN_NAME` even when it shares the lib's crate name.
+    if env("CARGO_BIN_NAME").is_none() && env("CARGO_CRATE_NAME").as_deref() == Some(&name) {
+        return None;
+    }
+    syn::parse_str(&name).ok()
+}
+
+/// The crate name of the manifest's library target, if it has one a
+/// bin can `extern crate` — the same rules cargo applies: an explicit
+/// `[lib]` (unless it's a proc-macro or has no rlib-ish crate type),
+/// else `src/lib.rs` unless `autolib = false`.
+fn linkable_lib(manifest: &str, has_src_lib_rs: bool) -> Option<String> {
+    let manifest = manifest.parse::<toml_edit::DocumentMut>().ok()?;
+    let package = manifest.get("package")?.as_table_like()?;
+
+    let name = match manifest.get("lib").and_then(|lib| lib.as_table_like()) {
+        Some(lib) => {
+            let get = |key: &str| lib.get(key).or_else(|| lib.get(&key.replace('-', "_")));
+            if get("proc-macro").and_then(|v| v.as_bool()) == Some(true) {
+                return None;
+            }
+            if let Some(types) = get("crate-type").and_then(|v| v.as_array())
+                && !types
+                    .iter()
+                    .any(|t| matches!(t.as_str(), Some("lib" | "rlib" | "dylib")))
+            {
+                return None;
+            }
+            lib.get("name").and_then(|v| v.as_str()).map(str::to_owned)
+        }
+        None => {
+            let autolib = package.get("autolib").and_then(|v| v.as_bool());
+            if autolib == Some(false) || !has_src_lib_rs {
+                return None;
+            }
+            None
+        }
+    };
+    Some(match name {
+        Some(name) => name,
+        None => package.get("name")?.as_str()?.replace('-', "_"),
+    })
+}
+
 /// Reject argument types that cannot cross the RPC wire, with a
 /// message at the argument's span. Only top-level `impl Trait` and
 /// references are checked — the realistic misuses; anything more exotic
@@ -168,6 +229,10 @@ pub fn wire(_args: TokenStream, input: TokenStream) -> TokenStream {
 /// The `async` keyword is optional either way: the body is always
 /// spliced into an async context, so a plain `fn main` can still
 /// `.await` remote calls.
+///
+/// When the package also has a library, `#[cindy::main]` links it into
+/// both builds, so `#[cindy::remote]` fns and `secret!` demands defined
+/// there reach the worker — no `extern crate` needed.
 #[proc_macro_attribute]
 pub fn main(_args: TokenStream, input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as ItemFn);
@@ -250,7 +315,13 @@ pub fn main(_args: TokenStream, input: TokenStream) -> TokenStream {
         }
     };
 
+    // `as _` so a playbook that already writes `extern crate <lib>;`
+    // doesn't collide with this one.
+    let link_lib = playbook_lib().map(|lib| quote! { extern crate #lib as _; });
+
     quote! {
+        #link_lib
+
         #(#attrs)*
         #[#c::__reexports::tokio::main(crate = #tokio_crate)]
         #vis async fn main() {
@@ -668,4 +739,53 @@ pub fn action(_args: TokenStream, input: TokenStream) -> TokenStream {
         }
     }
     .into()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::linkable_lib;
+
+    const PACKAGE: &str = "[package]\nname = \"home-infra\"\n";
+
+    #[test]
+    fn implicit_lib_takes_the_package_name_with_underscores() {
+        assert_eq!(linkable_lib(PACKAGE, true).as_deref(), Some("home_infra"));
+    }
+
+    #[test]
+    fn no_lib_rs_means_no_lib() {
+        assert_eq!(linkable_lib(PACKAGE, false), None);
+    }
+
+    #[test]
+    fn autolib_false_ignores_lib_rs() {
+        let manifest = format!("{PACKAGE}autolib = false\n");
+        assert_eq!(linkable_lib(&manifest, true), None);
+    }
+
+    #[test]
+    fn explicit_lib_section_wins_and_needs_no_lib_rs() {
+        let manifest = format!("{PACKAGE}[lib]\nname = \"infra\"\npath = \"src/infra.rs\"\n");
+        assert_eq!(linkable_lib(&manifest, false).as_deref(), Some("infra"));
+        let manifest = format!("{PACKAGE}[lib]\npath = \"src/infra.rs\"\n");
+        assert_eq!(
+            linkable_lib(&manifest, false).as_deref(),
+            Some("home_infra")
+        );
+    }
+
+    #[test]
+    fn unlinkable_libs_are_skipped() {
+        for lib in [
+            "proc-macro = true",
+            "proc_macro = true",
+            "crate-type = [\"cdylib\"]",
+            "crate_type = [\"staticlib\"]",
+        ] {
+            let manifest = format!("{PACKAGE}[lib]\n{lib}\n");
+            assert_eq!(linkable_lib(&manifest, true), None, "{lib}");
+        }
+        let manifest = format!("{PACKAGE}[lib]\ncrate-type = [\"cdylib\", \"rlib\"]\n");
+        assert_eq!(linkable_lib(&manifest, true).as_deref(), Some("home_infra"));
+    }
 }

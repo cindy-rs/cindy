@@ -690,6 +690,46 @@ fn secret_reveals_on_the_worker_through_the_handshake() {
     );
 }
 
+/// A remote fn defined in the playbook's lib reaches the worker. The
+/// worker build's `main.rs` references nothing from the lib, so rustc
+/// used to drop it from the link and its registrations with it: the
+/// call died mid-play with "called an unregistered remote function".
+#[test]
+fn remote_fns_in_the_playbook_lib_reach_the_worker() {
+    let tmp = tempfile::tempdir().expect("create temp dir");
+    let work_dir = tmp.path().join("work");
+
+    let host_context = serde_json::json!({
+        "name": "localhost",
+        "tags": ["example:e2e"],
+        "vars": {
+            "work_dir": work_dir,
+            "fetch_url": "http://127.0.0.1/",
+            "fetch_sha256": "",
+        }
+    });
+
+    let play = start_play(
+        tmp.path(),
+        &host_context,
+        &[("CINDY_E2E_LIB_REMOTE", "1")],
+        &[],
+    );
+    let (status, orch_stderr, worker_stderr) = play.wait_and_collect();
+    assert!(
+        status.success(),
+        "orchestrator failed: {orch_stderr}\nworker: {worker_stderr}"
+    );
+    assert!(
+        !worker_stderr.contains("unregistered remote function"),
+        "worker lacked the lib's remote fn: {worker_stderr}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(work_dir.join("lib-remote.marker")).unwrap(),
+        "lib:ping"
+    );
+}
+
 /// Preflight refusal on a missing key: the orchestrator is handed the
 /// sealed secret but *no* key for its vault, and must refuse before
 /// any playbook code runs — a missing marker and the preflight wording

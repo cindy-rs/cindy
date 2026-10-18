@@ -170,6 +170,16 @@ async fn main(host: cindy::Host<Vars>) -> cindy::Result<()> {
         return Ok(());
     }
 
+    // Library-remote scenario (see tests/e2e.rs): a remote fn defined
+    // in this package's lib must be registered in the worker, which
+    // never references the lib on its own.
+    if std::env::var_os("CINDY_E2E_LIB_REMOTE").is_some() {
+        let echoed = e2e_localhost::lib_side_echo("ping".to_owned()).await?;
+        std::fs::create_dir_all(&host.vars.work_dir)?;
+        std::fs::write(host.vars.work_dir.join("lib-remote.marker"), echoed)?;
+        return Ok(());
+    }
+
     // Keyless-handshake scenario (see tests/e2e.rs): the worker
     // demands `e2e-worker-vault` (see `worker_side_vault_demand`) but
     // the orchestrator ships no keys. The worker must refuse at the
