@@ -574,7 +574,7 @@ dependencies = [
 
 [[package]]
 name = "cindy"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "base64",
@@ -603,7 +603,7 @@ dependencies = [
 
 [[package]]
 name = "cindy-cli"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "ansi-to-tui",
  "base64",
@@ -635,7 +635,7 @@ dependencies = [
 
 [[package]]
 name = "cindy-macros"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "proc-macro-crate",
  "proc-macro2",
@@ -930,7 +930,7 @@ dependencies = [
 
 [[package]]
 name = "debian-nginx"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "cindy",
 ]
@@ -1048,14 +1048,14 @@ checksum = "d0881ea181b1df73ff77ffaaf9c7544ecc11e82fba9b5f27b262a3c73a332555"
 
 [[package]]
 name = "e2e-cli"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "tempfile",
 ]
 
 [[package]]
 name = "e2e-containers"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "bollard",
  "cindy",
@@ -1068,7 +1068,7 @@ dependencies = [
 
 [[package]]
 name = "e2e-localhost"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "cindy",
  "futures-util",
@@ -3107,7 +3107,7 @@ checksum = "67b1b7a3b5fe4f1376887184045fcf45c69e92af734b7aaddc05fb777b6fbd03"
 
 [[package]]
 name = "snippet-check"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "cindy",
 ]
@@ -3905,7 +3905,7 @@ dependencies = [
 
 [[package]]
 name = "website-minimal"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "cindy",
 ]

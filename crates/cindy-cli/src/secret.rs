@@ -1051,7 +1051,7 @@ mod seal_unseal_roundtrip_tests {
         std::fs::write(
             ws.join("Cargo.toml"),
             "[package]\nname = \"playbook\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n\
-             [dependencies]\ninfra = { version = \"0.3\", package = \"cindy\" }\n",
+             [dependencies]\ninfra = { version = \"0.4\", package = \"cindy\" }\n",
         )
         .unwrap();
         std::fs::create_dir(ws.join("src")).unwrap();
