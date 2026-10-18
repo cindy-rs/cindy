@@ -36,15 +36,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
 
 [[package]]
-name = "anyhow_serde"
-version = "1.0.101"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8465e1b520dce0a6c51cf17d50d086d875017b080f41c9cb6e212c6b626df99d"
-dependencies = [
- "serde",
-]
-
-[[package]]
 name = "async-broadcast"
 version = "0.7.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -226,7 +217,6 @@ name = "cindy"
 version = "0.3.0"
 dependencies = [
  "anyhow",
- "anyhow_serde",
  "base64 0.22.1",
  "chacha20poly1305",
  "cindy-macros",

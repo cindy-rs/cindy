@@ -99,10 +99,7 @@ static DISPATCH: OnceLock<Dispatch> = OnceLock::new();
 /// response arrives (worker crashed, SSH dropped), the future panics
 /// with that message instead of hanging.
 #[doc(hidden)]
-pub fn call<T: serde::de::DeserializeOwned>(
-    fn_id: &'static str,
-    args: Vec<u8>,
-) -> impl std::future::Future<Output = T> {
+pub fn call(fn_id: &'static str, args: Vec<u8>) -> impl std::future::Future<Output = Vec<u8>> {
     let (tx, rx) = oneshot::channel();
     let dispatch = DISPATCH.get().expect("DISPATCH not set");
     let uuid = Uuid::new_v4();
@@ -154,9 +151,7 @@ pub fn call<T: serde::de::DeserializeOwned>(
 
     async move {
         match rx.await {
-            Ok(RemoteFnResponse::Ok(bytes)) => postcard::from_bytes(&bytes).unwrap_or_else(|e| {
-                panic!("failed to deserialize return value of `{fn_id}`: {e:?}")
-            }),
+            Ok(RemoteFnResponse::Ok(bytes)) => bytes,
             Ok(RemoteFnResponse::Panic(msg)) => panic!("remote task panicked: {msg}"),
             Err(_) => panic!(
                 "RPC connection to the worker closed before `{fn_id}` returned \

@@ -122,12 +122,12 @@ fn render_summary(entries: &[Entry], dest: &Path) {
 /// that message verbatim instead of letting a generic tar wrapper
 /// bury it — the knob's name is the feature, per the repo's
 /// assert-on-the-message practice.
-fn bail_if_limit(e: &std::io::Error) -> Option<anyhow_serde::Error> {
+fn bail_if_limit(e: &std::io::Error) -> Option<crate::Error> {
     let mut src: Option<&dyn std::error::Error> = Some(e);
     while let Some(s) = src {
         let msg = s.to_string();
         if msg.contains("decompression limit") {
-            return Some(anyhow_serde::Error::msg(msg));
+            return Some(crate::Error::msg(msg));
         }
         src = s.source();
     }
@@ -139,8 +139,7 @@ fn list_tar(reader: &mut dyn std::io::Read) -> crate::Result<Vec<Entry>> {
     let mut out = Vec::new();
     for entry in archive.entries().context("Couldn't read tar entries")? {
         let entry = entry.map_err(|e| {
-            bail_if_limit(&e)
-                .unwrap_or_else(|| anyhow_serde::Error::msg("Couldn't read a tar entry"))
+            bail_if_limit(&e).unwrap_or_else(|| crate::Error::msg("Couldn't read a tar entry"))
         })?;
         let path = entry.path().context("tar entry has no path")?.into_owned();
         let is_dir = entry.header().entry_type().is_dir();
@@ -206,7 +205,7 @@ fn list_zip(src: &Path) -> crate::Result<Vec<Entry>> {
 /// List a 7z archive's entries (header only, no decompression).
 fn list_7z(src: &Path) -> crate::Result<Vec<Entry>> {
     let archive = sevenz_rust2::Archive::open(src)
-        .map_err(|e| anyhow_serde::Error::msg(format!("Couldn't read 7z header: {e}")))?;
+        .map_err(|e| crate::Error::msg(format!("Couldn't read 7z header: {e}")))?;
     Ok(archive
         .files
         .iter()
@@ -225,7 +224,7 @@ fn extract_tar(reader: &mut dyn std::io::Read, dest: &Path) -> crate::Result<()>
     let mut archive = tar::Archive::new(reader);
     archive.unpack(dest).map_err(|e| {
         bail_if_limit(&e).unwrap_or_else(|| {
-            anyhow_serde::Error::msg(format!("Couldn't unpack tar into {}", dest.display()))
+            crate::Error::msg(format!("Couldn't unpack tar into {}", dest.display()))
         })
     })
 }

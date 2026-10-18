@@ -208,7 +208,7 @@ impl HeaderValue {
     /// (control characters, newlines — the header-injection shapes).
     pub fn new(value: impl AsRef<[u8]>) -> crate::Result<Self> {
         let mut inner = ureq::http::HeaderValue::from_bytes(value.as_ref())
-            .map_err(|e| anyhow_serde::Error::msg(format!("invalid header value: {e}")))?;
+            .map_err(|e| crate::Error::msg(format!("invalid header value: {e}")))?;
         inner.set_sensitive(true);
         Ok(Self(inner))
     }
@@ -216,7 +216,7 @@ impl HeaderValue {
     fn as_str(&self) -> crate::Result<&str> {
         self.0
             .to_str()
-            .map_err(|e| anyhow_serde::Error::msg(format!("header value is not valid UTF-8: {e}")))
+            .map_err(|e| crate::Error::msg(format!("header value is not valid UTF-8: {e}")))
     }
 }
 

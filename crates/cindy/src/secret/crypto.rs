@@ -63,7 +63,7 @@ pub fn seal(key: &VaultKey, plaintext: &[u8]) -> crate::Result<Vec<u8>> {
     let nonce = ChaCha20Poly1305::generate_nonce(&mut AeadOsRng);
     let ciphertext = cipher
         .encrypt(&nonce, plaintext)
-        .map_err(|e| anyhow_serde::Error::msg(format!("AEAD encryption failed: {e}")))?;
+        .map_err(|e| crate::Error::msg(format!("AEAD encryption failed: {e}")))?;
 
     let mut out = Vec::with_capacity(1 + NONCE_LEN + ciphertext.len());
     out.push(BLOB_VERSION);
@@ -91,7 +91,7 @@ pub fn unseal(key: &VaultKey, framed: &[u8]) -> crate::Result<Zeroizing<Vec<u8>>
         // fails both layouts is a wrong key or corruption (the most
         // common secrets failure), and must keep that error, not be
         // sent chasing a cindy upgrade.
-        Some(&byte) if byte > BLOB_VERSION && byte < 0x10 => anyhow_serde::Error::msg(format!(
+        Some(&byte) if byte > BLOB_VERSION && byte < 0x10 => crate::Error::msg(format!(
             "sealed blob reports version {byte}, which this cindy doesn't understand \
              (it knows {BLOB_VERSION}); it was probably sealed by a newer cindy — \
              upgrade and re-run"
@@ -113,7 +113,7 @@ fn aead_decrypt(key: &VaultKey, framed: &[u8]) -> crate::Result<Zeroizing<Vec<u8
     let cipher = ChaCha20Poly1305::new(key.as_slice().into());
     let plaintext = cipher
         .decrypt(nonce, ct_and_tag)
-        .map_err(|e| anyhow_serde::Error::msg(format!("AEAD decryption failed: {e}")))?;
+        .map_err(|e| crate::Error::msg(format!("AEAD decryption failed: {e}")))?;
     Ok(Zeroizing::new(plaintext))
 }
 

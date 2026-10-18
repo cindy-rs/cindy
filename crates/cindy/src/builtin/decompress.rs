@@ -218,8 +218,8 @@ impl<R: Read> Read for BoundedReader<R> {
 /// The over-size rejection, worded like `fetch`'s so the two knobs read
 /// the same in a log. Returns the error *value* so both the reader-side
 /// and writer-side ceilings can raise it from inside `io::Result`s.
-fn limit_error(codec: &str, max_bytes: u64) -> anyhow_serde::Error {
-    anyhow_serde::Error::msg(format!(
+fn limit_error(codec: &str, max_bytes: u64) -> crate::Error {
+    crate::Error::msg(format!(
         "{codec} output exceeds the {max_bytes}-byte decompression limit \
          (raise `max_bytes` if that really is the content's size)"
     ))

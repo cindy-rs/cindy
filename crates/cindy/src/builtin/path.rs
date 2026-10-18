@@ -38,7 +38,7 @@ impl Mode {
 }
 
 impl TryFrom<u32> for Mode {
-    type Error = anyhow_serde::Error;
+    type Error = crate::Error;
 
     /// The one way to build a `Mode` from a number:
     /// `Mode::try_from(0o644)?`. (There is deliberately no `From<u32>`:

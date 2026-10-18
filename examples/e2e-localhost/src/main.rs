@@ -113,6 +113,24 @@ fn budget_probe(data: Vec<u8>) -> (usize, usize) {
     (data.len(), MAX_SEEN.load(Ordering::SeqCst))
 }
 
+/// Fails the way real builtins do: an io error under a context, for
+/// the `CINDY_E2E_REMOTE_ERRORS` scenario.
+#[cindy::remote]
+fn read_missing(path: PathBuf) -> cindy::Result<Vec<u8>> {
+    use cindy::Context;
+    std::fs::read(&path).with_context(|| format!("reading {}", path.display()))
+}
+
+#[cindy::wire]
+enum TypedFailure {
+    Missing { what: String },
+}
+
+#[cindy::remote]
+fn typed_failure(what: String) -> Result<(), TypedFailure> {
+    Err(TypedFailure::Missing { what })
+}
+
 #[cindy::main]
 async fn main(host: cindy::Host<Vars>) -> cindy::Result<()> {
     use cindy::builtin;
@@ -167,6 +185,34 @@ async fn main(host: cindy::Host<Vars>) -> cindy::Result<()> {
         }
         std::fs::create_dir_all(&host.vars.work_dir)?;
         std::fs::write(host.vars.work_dir.join("reveal-ok.marker"), b"ok\n")?;
+        return Ok(());
+    }
+
+    // Remote-error scenario (see tests/e2e.rs): errors from the worker
+    // keep their whole chain, io errors their kind, typed errors their
+    // type. Reported rather than asserted here, so the test can show
+    // what actually arrived.
+    if std::env::var_os("CINDY_E2E_REMOTE_ERRORS").is_some() {
+        let err = read_missing(host.vars.work_dir.join("does-not-exist"))
+            .await
+            .expect_err("reading a missing file succeeded");
+        let chain: Vec<String> = err.chain().map(ToString::to_string).collect();
+        let io_kind = err.downcast_ref::<std::io::Error>().map(|e| e.kind());
+        let typed = match typed_failure("eth0".to_owned()).await {
+            Err(TypedFailure::Missing { what }) => what,
+            Ok(()) => "<succeeded>".to_owned(),
+        };
+        std::fs::create_dir_all(&host.vars.work_dir)?;
+        let report = serde_json::json!({
+            "chain": chain,
+            "rendered": format!("{err:#}"),
+            "io_kind": format!("{io_kind:?}"),
+            "typed_what": typed,
+        });
+        std::fs::write(
+            host.vars.work_dir.join("remote-errors.json"),
+            serde_json::to_vec(&report)?,
+        )?;
         return Ok(());
     }
 

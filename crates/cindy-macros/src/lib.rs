@@ -475,6 +475,10 @@ pub fn inventory(_args: TokenStream, input: TokenStream) -> TokenStream {
 ///    going through the RPC channel. The enum is uninhabited; it exists
 ///    purely so the path syntax `foo::inner` works in the type namespace,
 ///    side-by-side with `fn foo` in the value namespace.
+///
+/// Arguments and the return value must be `Serialize + Deserialize`, with
+/// one exception: in a returned `cindy::Result<T>` only `T` needs to be —
+/// the error crosses with its whole chain (see `cindy::error`).
 #[proc_macro_attribute]
 pub fn remote(_args: TokenStream, input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as ItemFn);
@@ -581,11 +585,21 @@ For documentation about the actual function, please refer to [`{function_ident}`
         #[doc = #outer_docstring]
         #(#attrs)*
         #vis fn #function_ident (#inputs) -> impl ::std::future::Future<Output = #return_type> {
-            #c::orchestrator::call(
+            let response = #c::orchestrator::call(
                 #function_ident::__CINDY_REMOTE_ID,
                 #c::__reexports::postcard::to_allocvec(&( #(#arg_idents),* ))
                     .expect("Failed to serialize args"),
-            )
+            );
+            async move {
+                use #c::error::wire::{ViaSerde as _, ViaWireError as _};
+                let bytes = response.await;
+                (&#c::error::wire::Return::<#return_type>::new())
+                    .decode(&bytes)
+                    .unwrap_or_else(|e| ::std::panic!(
+                        "failed to deserialize return value of `{}`: {e:?}",
+                        #function_ident::__CINDY_REMOTE_ID,
+                    ))
+            }
         }
 
         #[cfg(feature = "remote")]
@@ -598,8 +612,10 @@ For documentation about the actual function, please refer to [`{function_ident}`
                         .expect("Failed to deserialize args");
 
                     ::std::boxed::Box::pin(async move {
+                        use #c::error::wire::{ViaSerde as _, ViaWireError as _};
                         let result = #invocation;
-                        #c::__reexports::postcard::to_allocvec(&result)
+                        (&#c::error::wire::Return::<#return_type>::new())
+                            .encode(result)
                             .expect("Failed to serialize return value")
                     })
                 },

@@ -730,6 +730,62 @@ fn remote_fns_in_the_playbook_lib_reach_the_worker() {
     );
 }
 
+/// A remote fn's error reaches the orchestrator whole: every link of
+/// the chain (the wire used to carry only the outermost message), an
+/// io error still an `io::Error` of the same kind, and a typed serde
+/// error as its own type.
+#[test]
+fn remote_errors_cross_the_wire_with_their_chain() {
+    let tmp = tempfile::tempdir().expect("create temp dir");
+    let work_dir = tmp.path().join("work");
+
+    let host_context = serde_json::json!({
+        "name": "localhost",
+        "tags": ["example:e2e"],
+        "vars": {
+            "work_dir": work_dir,
+            "fetch_url": "http://127.0.0.1/",
+            "fetch_sha256": "",
+        }
+    });
+
+    let play = start_play(
+        tmp.path(),
+        &host_context,
+        &[("CINDY_E2E_REMOTE_ERRORS", "1")],
+        &[],
+    );
+    let (status, orch_stderr, worker_stderr) = play.wait_and_collect();
+    assert!(
+        status.success(),
+        "orchestrator failed: {orch_stderr}\nworker: {worker_stderr}"
+    );
+
+    let report: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(work_dir.join("remote-errors.json")).unwrap())
+            .unwrap();
+    let missing = work_dir.join("does-not-exist");
+    let chain = report["chain"].as_array().unwrap();
+    assert_eq!(chain.len(), 2, "{report}");
+    assert_eq!(chain[0], format!("reading {}", missing.display()));
+    assert!(
+        chain[1]
+            .as_str()
+            .unwrap()
+            .contains("No such file or directory"),
+        "the io cause was lost: {report}"
+    );
+    assert!(
+        report["rendered"]
+            .as_str()
+            .unwrap()
+            .ends_with("No such file or directory (os error 2)"),
+        "{report}"
+    );
+    assert_eq!(report["io_kind"], "Some(NotFound)");
+    assert_eq!(report["typed_what"], "eth0");
+}
+
 /// Preflight refusal on a missing key: the orchestrator is handed the
 /// sealed secret but *no* key for its vault, and must refuse before
 /// any playbook code runs — a missing marker and the preflight wording

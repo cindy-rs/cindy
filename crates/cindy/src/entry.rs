@@ -65,7 +65,7 @@ pub fn host_context<H: serde::de::DeserializeOwned>() -> H {
 /// Print an error in red and exit 1. The orchestrator's stderr is the
 /// operator-facing channel (the CLI tags and forwards it per host).
 #[cfg(feature = "orchestrator")]
-fn fail(e: anyhow_serde::Error) -> ! {
+fn fail(e: crate::Error) -> ! {
     eprintln!("\x1b[31m{e:?}\x1b[0m");
     exit(1);
 }

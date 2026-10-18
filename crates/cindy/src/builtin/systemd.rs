@@ -190,7 +190,7 @@ async fn read_file_state(
         Ok(s) => {
             let parsed = s
                 .parse::<UnitState>()
-                .map_err(anyhow_serde::Error::msg)
+                .map_err(crate::Error::msg)
                 .context("Parsing UnitFileState")?;
             Ok(Some(parsed))
         }
@@ -234,7 +234,7 @@ async fn system_bus() -> crate::Result<&'static zbus::Connection> {
         .get_or_init(|| async { zbus::Connection::system().await.map_err(|e| e.to_string()) })
         .await
         .as_ref()
-        .map_err(|e| anyhow_serde::Error::msg(e.clone()))
+        .map_err(|e| crate::Error::msg(e.clone()))
 }
 
 async fn read_active_state(
@@ -274,7 +274,7 @@ async fn read_active_state(
 
     let parsed = raw
         .parse::<ActiveState>()
-        .map_err(anyhow_serde::Error::msg)
+        .map_err(crate::Error::msg)
         .context("Parsing ActiveState")?;
     Ok(Some(parsed))
 }
@@ -309,13 +309,13 @@ async fn wait_job(
                 .context("JobRemoved signal stream ended unexpectedly")?;
             let args = signal.args().context("Couldn't parse JobRemoved args")?;
             if args.job() == job {
-                return Ok::<String, anyhow_serde::Error>(args.result().clone());
+                return Ok::<String, crate::Error>(args.result().clone());
             }
         }
     };
 
     let result = tokio::time::timeout(timeout, removal).await.map_err(|_| {
-        anyhow_serde::Error::msg(format!(
+        crate::Error::msg(format!(
             "timed out after {timeout:?} waiting for the {verb} job on `{unit}` \
                  to finish (check `journalctl -u {unit}`)"
         ))

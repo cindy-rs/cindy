@@ -81,7 +81,7 @@ pub fn decode_env_keys() -> crate::Result<Option<HashMap<String, Vec<u8>>>> {
     };
     let raw = raw
         .into_string()
-        .map_err(|_| anyhow_serde::Error::msg("CINDY_VAULT_KEYS is not valid UTF-8"))?;
+        .map_err(|_| crate::Error::msg("CINDY_VAULT_KEYS is not valid UTF-8"))?;
 
     let table: HashMap<String, String> = serde_json::from_str(&raw)
         .context("CINDY_VAULT_KEYS was not a JSON map of {vault: base64-key}")?;

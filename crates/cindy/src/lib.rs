@@ -32,17 +32,8 @@ pub use diff::Diff;
 pub use inventory::{Host, Inventory};
 pub use secret::Secret;
 
-pub use anyhow_serde::Context;
-/// `anyhow`-style error that serialises, so it can cross the RPC wire.
-/// It doesn't implement `std::error::Error` (no more than
-/// `anyhow::Error` does), so `?` won't turn it into an `anyhow::Error`
-/// — use [`IntoAnyhow`].
-pub use anyhow_serde::Error;
-pub use anyhow_serde::Result;
-pub use anyhow_serde::bail;
-
-mod into_anyhow;
-pub use into_anyhow::IntoAnyhow;
+pub mod error;
+pub use error::{Context, Error, Result, anyhow, bail, ensure};
 
 pub use tokio::join;
 
