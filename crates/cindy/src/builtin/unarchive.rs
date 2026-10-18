@@ -193,8 +193,9 @@ fn list_zip(src: &Path) -> crate::Result<Vec<Entry>> {
     let mut out = Vec::with_capacity(archive.len());
     for i in 0..archive.len() {
         let f = archive.by_index(i).context("Couldn't read a zip entry")?;
+        let name = f.name().context("Couldn't decode a zip entry's name")?;
         out.push(Entry {
-            path: PathBuf::from(f.name()),
+            path: PathBuf::from(&*name),
             is_dir: f.is_dir(),
             size: f.size(),
         });
