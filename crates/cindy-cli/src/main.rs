@@ -1177,10 +1177,43 @@ fn host_needed_vaults(
     needed
 }
 
+/// Refuse a playbook built against a cindy from another release line.
+/// The CLI and the playbook's orchestrator talk through a private
+/// contract (the `CINDY_*` environment, the progress stream), so a
+/// mismatch otherwise fails in confusing ways mid-run.
+fn check_playbook_cindy(metadata: &cargo_metadata::Metadata) -> eyre::Result<()> {
+    let cli: cargo_metadata::semver::Version = env!("CARGO_PKG_VERSION").parse()?;
+    for pkg in metadata.packages.iter().filter(|p| p.name == "cindy") {
+        cindy_versions_match(&cli, &pkg.version)?;
+    }
+    Ok(())
+}
+
+/// Same semver-compatible line: equal major, and equal minor while the
+/// major is 0 (equal patch while both are).
+fn cindy_versions_match(
+    cli: &cargo_metadata::semver::Version,
+    playbook: &cargo_metadata::semver::Version,
+) -> eyre::Result<()> {
+    let same_line = cli.major == playbook.major
+        && (cli.major != 0 || cli.minor == playbook.minor)
+        && (cli.major != 0 || cli.minor != 0 || cli.patch == playbook.patch);
+    if same_line {
+        return Ok(());
+    }
+    Err(eyre::eyre!(
+        "this playbook is built against cindy {playbook}, but this is cindy-cli {cli}; \
+         the two must come from the same release line. Install the matching CLI \
+         (`cargo install cindy-cli --version {playbook}`) or move the playbook to \
+         cindy {cli}"
+    ))
+}
+
 async fn compile_orchestrator(
     workspace_root: &Path,
     metadata: &cargo_metadata::Metadata,
 ) -> eyre::Result<PathBuf> {
+    check_playbook_cindy(metadata)?;
     tracing::info!("compiling orchestrator binary");
     let target_dir = workspace_root.join("target/cindy/orchestrator");
     let output = tokio::process::Command::new("cargo")
@@ -1394,6 +1427,48 @@ async fn finish_worker_build(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn cindy_versions_match_within_a_release_line_only() {
+        let v = |s: &str| s.parse::<cargo_metadata::semver::Version>().unwrap();
+        for (cli, playbook) in [
+            ("0.4.0", "0.4.0"),
+            ("0.4.2", "0.4.0"),
+            ("0.4.0", "0.4.3"),
+            ("1.2.0", "1.0.5"),
+        ] {
+            assert!(
+                super::cindy_versions_match(&v(cli), &v(playbook)).is_ok(),
+                "{cli} vs {playbook}"
+            );
+        }
+        for (cli, playbook) in [
+            ("0.4.0", "0.3.0"),
+            ("0.3.0", "0.4.0"),
+            ("1.0.0", "2.0.0"),
+            ("0.0.1", "0.0.2"),
+        ] {
+            assert!(
+                super::cindy_versions_match(&v(cli), &v(playbook)).is_err(),
+                "{cli} vs {playbook}"
+            );
+        }
+    }
+
+    #[test]
+    fn version_mismatch_names_both_versions_and_the_fix() {
+        let v = |s: &str| s.parse::<cargo_metadata::semver::Version>().unwrap();
+        let msg = super::cindy_versions_match(&v("0.4.0"), &v("0.3.0"))
+            .unwrap_err()
+            .to_string();
+        assert!(msg.contains("built against cindy 0.3.0"), "{msg}");
+        assert!(msg.contains("cindy-cli 0.4.0"), "{msg}");
+        assert!(
+            msg.contains("cargo install cindy-cli --version 0.3.0"),
+            "{msg}"
+        );
+        assert!(!msg.contains("cindy 0.4.0, but"), "versions swapped: {msg}");
+    }
+
     use super::{RunSummary, ssh_fingerprint};
 
     /// The end-of-play summary is operator-facing text: successes state
