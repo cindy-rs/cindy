@@ -10,6 +10,10 @@ pub mod systemd;
 pub mod unarchive;
 pub mod user;
 
+/// Default ceiling on what `fetch` stages and `unarchive` expands — one
+/// pipeline, so one number.
+pub(crate) const DEFAULT_MAX_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+
 /// A stream compression layer, independent of any container.
 #[derive(Clone, Copy, PartialEq, Eq)]
 #[crate::wire]

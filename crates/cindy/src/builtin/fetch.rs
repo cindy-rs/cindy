@@ -57,10 +57,6 @@ fn hex(bytes: &[u8]) -> String {
     })
 }
 
-/// Past any plausible artefact, short of filling a disk with a server
-/// that never stops sending.
-const DEFAULT_MAX_BYTES: u64 = 4 * 1024 * 1024 * 1024;
-
 // ureq has no timeouts by default. The body is bounded by size, not a
 // clock, so a slow link can still deliver a large artefact; a
 // blackholed host fails on these.
@@ -310,7 +306,7 @@ fn apply(state: State) -> crate::Result<super::Return> {
     }
 
     let (uid, gid) = owner.resolve()?;
-    let max = state.max_bytes.unwrap_or(DEFAULT_MAX_BYTES);
+    let max = state.max_bytes.unwrap_or(super::DEFAULT_MAX_BYTES);
     let url = redact_url(&state.url);
 
     let _ = crate::diff::note(

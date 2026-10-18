@@ -1,176 +1,141 @@
-//! Decompress a byte stream with a pure-Rust codec.
+//! Decompress a byte stream (pure-Rust codecs).
 //!
-//! The decompression half of the de/compression pair, factored out of
-//! [`unarchive`](super::unarchive) so the codec logic lives in one
-//! place and is independently usable. The
-//! [`unarchive`](super::unarchive) module reuses it through
-//! `decompress::bounded` for the tar-based formats.
-//!
-//! All codecs are pure Rust — `flate2`/miniz_oxide (gzip), `lzma-rs`
-//! (xz), `ruzstd` (zstd) — so no C or dynamic libraries are pulled in.
+//! Decompression is multiplication — a few KiB of crafted input can
+//! expand without bound — so every decode here has an output ceiling.
 
-use std::io::Read;
+use std::io::{BufRead, Read, Write};
 
-// Only referenced by the macro-generated RPC/dispatch code under the
-// `remote`/`orchestrator` features; unused in the plain build.
-#[allow(unused_imports)]
 use crate::Context;
 
 use super::Codec;
 
-/// Ceiling on decompressed output when no explicit `max_bytes` is
-/// given. Kept equal to `fetch`'s default: the two knobs bound the
-/// same pipeline (`fetch` stages the archive, `unarchive` expands it),
-/// so they should agree on what "unbounded" means.
-pub(crate) const DEFAULT_MAX_BYTES: u64 = 4 * 1024 * 1024 * 1024;
-
-/// Decompress an in-memory byte buffer on the remote machine.
-///
-/// In-crate callers (e.g. [`unarchive`](super::unarchive)) invoke the
-/// core directly as `decompress::bounded(data, codec, max_bytes)`; the
-/// orchestrator can also drive this entry point over RPC, bounded by
-/// [`DEFAULT_MAX_BYTES`].
 #[crate::remote]
 pub fn decompress(data: Vec<u8>, codec: Codec) -> crate::Result<Vec<u8>> {
-    bounded(data, codec, DEFAULT_MAX_BYTES)
-}
-
-/// The decompression core with an explicit output ceiling, collecting
-/// the result in memory.
-///
-/// The ceiling exists because decompression is multiplication: a few
-/// kilobytes of crafted input can expand without bound, and the worker
-/// holds the result. `fetch` bounds what it stages to disk; without
-/// this bound, `fetch` → `unarchive` would download a small bomb and
-/// detonate it in RAM. Hitting the limit is an error that names the
-/// knob, mirroring `fetch`'s over-size rejection.
-pub(crate) fn bounded(data: Vec<u8>, codec: Codec, max_bytes: u64) -> crate::Result<Vec<u8>> {
     let mut out = Vec::new();
-    bounded_into(&data, codec, max_bytes, &mut out)?;
+    decompress_into(codec, &mut &data[..], super::DEFAULT_MAX_BYTES, &mut out)?;
     Ok(out)
 }
 
-/// The same core, streaming into any writer — a `Vec<u8>` for
-/// [`bounded`], or a temp file when `unarchive` needs the expanded tar
-/// on disk instead of in RAM.
-pub(crate) fn bounded_into(
-    data: &[u8],
+/// Decode `input` into `out`, failing with [`LimitExceeded`] past
+/// `max_bytes` of output. `Store` doesn't expand and isn't bounded.
+pub(crate) fn decompress_into(
     codec: Codec,
+    input: &mut dyn BufRead,
     max_bytes: u64,
-    out: &mut dyn std::io::Write,
+    out: &mut dyn Write,
 ) -> crate::Result<()> {
-    match codec {
-        // No expansion happens; the caller already holds the buffer.
-        Codec::Store => {
-            std::io::copy(&mut &data[..], out).context("store copy failed")?;
-        }
+    let limit = LimitExceeded {
+        codec: codec_name(codec),
+        max_bytes,
+    };
+    let mut sink = Bounded {
+        out,
+        remaining: max_bytes,
+        exceeded: false,
+    };
+    let result = match codec {
+        Codec::Store => std::io::copy(input, sink.out).map(drop),
+        // Multi-member: `pigz` and `cat a.gz b.gz` are valid gzip, and
+        // `GzDecoder` stops after the first member.
         Codec::Gzip => {
-            // `MultiGzDecoder`, not `GzDecoder`: gzip files are legally a
-            // concatenation of members (`pigz`, `cat a.gz b.gz`), and the
-            // single-member decoder silently stops after the first one.
-            let mut decoder = flate2::read::MultiGzDecoder::new(data);
-            copy_bounded(&mut decoder, out, max_bytes, "gzip")?;
+            std::io::copy(&mut flate2::read::MultiGzDecoder::new(input), &mut sink).map(drop)
         }
         Codec::Xz => {
-            // lzma-rs offers no output limit of its own (its `memlimit`
-            // bounds dictionary memory), so the bound lives on the sink.
-            let mut reader = std::io::BufReader::new(data);
-            let mut sink = BoundedWriter::new(out, max_bytes);
-            match lzma_rs::xz_decompress(&mut reader, &mut sink) {
-                Ok(()) => {}
-                Err(_) if sink.exceeded() => return Err(limit_error("xz", max_bytes)),
-                Err(e) => return Err(e).context("xz decompression failed"),
-            }
+            lzma_rs::xz_decompress(&mut &mut *input, &mut sink).map_err(std::io::Error::other)
         }
-        Codec::Zstd => {
-            // zstd files may hold multiple frames (`pzstd`, the seekable
-            // format); `StreamingDecoder` stops at the end of one frame,
-            // so per its docs we recreate it per frame until the input is
-            // exhausted, skipping over skippable frames.
-            use ruzstd::decoding::errors::{FrameDecoderError, ReadFrameHeaderError};
+        Codec::Zstd => decode_zstd_frames(input, &mut sink),
+    };
+    // Checked first: a codec may wrap or swallow the sink's error.
+    if sink.exceeded {
+        return Err(limit.into());
+    }
+    result.context(format!("{} decompression failed", limit.codec))
+}
 
-            let mut input = data;
-            let mut remaining = max_bytes;
-            while !input.is_empty() {
-                match ruzstd::decoding::StreamingDecoder::new(&mut input) {
-                    Ok(mut decoder) => {
-                        remaining -= copy_bounded(&mut decoder, out, remaining, "zstd")?;
-                    }
-                    Err(FrameDecoderError::ReadFrameHeaderError(
-                        ReadFrameHeaderError::SkipFrame { length, .. },
-                    )) => {
-                        input = input
-                            .get(length as usize..)
-                            .context("zstd skippable frame length overruns the input")?;
-                    }
-                    Err(e) => crate::bail!("Couldn't start zstd decoder: {e}"),
-                }
+/// `StreamingDecoder` stops after one frame, but a zstd file may hold
+/// several (`pzstd`, the seekable format), and skippable ones between.
+fn decode_zstd_frames(input: &mut dyn BufRead, out: &mut dyn Write) -> std::io::Result<()> {
+    use ruzstd::decoding::errors::{FrameDecoderError, ReadFrameHeaderError};
+
+    while !input.fill_buf()?.is_empty() {
+        match ruzstd::decoding::StreamingDecoder::new(&mut *input) {
+            Ok(mut frame) => {
+                std::io::copy(&mut frame, out)?;
             }
+            Err(FrameDecoderError::ReadFrameHeaderError(ReadFrameHeaderError::SkipFrame {
+                length,
+                ..
+            })) => {
+                std::io::copy(&mut input.take(u64::from(length)), &mut std::io::sink())?;
+            }
+            Err(e) => return Err(std::io::Error::other(e)),
         }
     }
     Ok(())
 }
 
-/// Pull a reader to EOF into `out`, refusing to transfer more than
-/// `max_bytes` bytes across the whole read. Returns the bytes written.
-fn copy_bounded(
-    mut reader: impl Read,
-    out: &mut dyn std::io::Write,
-    max_bytes: u64,
-    codec: &str,
-) -> crate::Result<u64> {
-    let mut chunk = [0u8; 64 * 1024];
-    let mut written = 0u64;
-    loop {
-        let n = reader
-            .read(&mut chunk)
-            .context(format!("{codec} decompression failed"))?;
-        if n == 0 {
-            return Ok(written);
-        }
-        if written + u64::try_from(n).unwrap_or(u64::MAX) > max_bytes {
-            return Err(limit_error(codec, max_bytes));
-        }
-        out.write_all(&chunk[..n])
-            .context(format!("{codec} decompression failed"))?;
-        written += n as u64;
+fn codec_name(codec: Codec) -> &'static str {
+    match codec {
+        Codec::Store => "store",
+        Codec::Gzip => "gzip",
+        Codec::Xz => "xz",
+        Codec::Zstd => "zstd",
     }
 }
 
-/// A `Write` wrapper that refuses to accept more than `max_bytes`
-/// bytes, so a decompression bomb errors instead of allocating its
-/// payload. `exceeded` distinguishes the limit being hit (a named
-/// error) from the codec failing on its own.
-struct BoundedWriter<'a> {
-    out: &'a mut dyn std::io::Write,
+/// The decompression ceiling was hit. An error type rather than a
+/// message, so callers can find it in a wrapped chain.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct LimitExceeded {
+    codec: &'static str,
     max_bytes: u64,
-    written: u64,
+}
+
+impl std::fmt::Display for LimitExceeded {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} output exceeds the {}-byte decompression limit \
+             (raise `max_bytes` if that really is the content's size)",
+            self.codec, self.max_bytes
+        )
+    }
+}
+
+impl std::error::Error for LimitExceeded {}
+
+impl LimitExceeded {
+    /// The ceiling, if it is anywhere in `err`'s chain.
+    pub(crate) fn find(err: &(dyn std::error::Error + 'static)) -> Option<Self> {
+        let mut cause = Some(err);
+        while let Some(e) = cause {
+            let found = e.downcast_ref::<Self>().or_else(|| {
+                e.downcast_ref::<std::io::Error>()
+                    .and_then(|io| io.get_ref()?.downcast_ref::<Self>())
+            });
+            if let Some(limit) = found {
+                return Some(*limit);
+            }
+            cause = e.source();
+        }
+        None
+    }
+}
+
+struct Bounded<'a> {
+    out: &'a mut dyn Write,
+    remaining: u64,
     exceeded: bool,
 }
 
-impl<'a> BoundedWriter<'a> {
-    fn new(out: &'a mut dyn std::io::Write, max_bytes: u64) -> Self {
-        Self {
-            out,
-            max_bytes,
-            written: 0,
-            exceeded: false,
-        }
-    }
-
-    fn exceeded(&self) -> bool {
-        self.exceeded
-    }
-}
-
-impl std::io::Write for BoundedWriter<'_> {
+impl Write for Bounded<'_> {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        if self.written + buf.len() as u64 > self.max_bytes {
+        let Some(left) = self.remaining.checked_sub(buf.len() as u64) else {
             self.exceeded = true;
             return Err(std::io::Error::other("decompression output over the limit"));
-        }
+        };
         self.out.write_all(buf)?;
-        self.written += buf.len() as u64;
+        self.remaining = left;
         Ok(buf.len())
     }
 
@@ -179,26 +144,23 @@ impl std::io::Write for BoundedWriter<'_> {
     }
 }
 
-/// A `Read` wrapper enforcing the same ceiling on the *reader* side —
-/// for streaming a decoded stream straight into a consumer (tar
-/// extraction) without an intermediate sink. The error carries the
-/// same wording as [`limit_error`] so the log reads identically
-/// whichever side tripped it.
+/// The same ceiling on a decoded stream that is read rather than
+/// written out (a tar being unpacked as it decodes).
 pub(crate) struct BoundedReader<R> {
     inner: R,
     remaining: u64,
-    limit_message: String,
+    limit: LimitExceeded,
 }
 
 impl<R: Read> BoundedReader<R> {
-    pub(crate) fn new(inner: R, codec: &str, max_bytes: u64) -> Self {
+    pub(crate) fn new(inner: R, codec: Codec, max_bytes: u64) -> Self {
         Self {
             inner,
             remaining: max_bytes,
-            limit_message: format!(
-                "{codec} output exceeds the {max_bytes}-byte decompression limit \
-                 (raise `max_bytes` if that really is the content's size)"
-            ),
+            limit: LimitExceeded {
+                codec: codec_name(codec),
+                max_bytes,
+            },
         }
     }
 }
@@ -206,29 +168,17 @@ impl<R: Read> BoundedReader<R> {
 impl<R: Read> Read for BoundedReader<R> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         let n = self.inner.read(buf)?;
-        if n as u64 > self.remaining {
-            self.remaining = 0;
-            return Err(std::io::Error::other(self.limit_message.clone()));
-        }
-        self.remaining -= n as u64;
+        self.remaining = self
+            .remaining
+            .checked_sub(n as u64)
+            .ok_or_else(|| std::io::Error::other(self.limit))?;
         Ok(n)
     }
-}
-
-/// The over-size rejection, worded like `fetch`'s so the two knobs read
-/// the same in a log. Returns the error *value* so both the reader-side
-/// and writer-side ceilings can raise it from inside `io::Result`s.
-fn limit_error(codec: &str, max_bytes: u64) -> crate::Error {
-    crate::Error::msg(format!(
-        "{codec} output exceeds the {max_bytes}-byte decompression limit \
-         (raise `max_bytes` if that really is the content's size)"
-    ))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write as _;
 
     fn gz(bytes: &[u8]) -> Vec<u8> {
         let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::best());
@@ -236,27 +186,52 @@ mod tests {
         encoder.finish().unwrap()
     }
 
-    /// A few hundred bytes of crafted gzip that expands to MiB — the
-    /// decompression bomb the ceiling exists for. The plan's done-when:
-    /// a named error, not an allocation.
-    #[test]
-    fn oversized_output_is_a_named_error_not_an_allocation() {
-        let bomb = gz(&[0u8; 256 * 1024]);
-        assert!(bomb.len() < 1024, "the bomb must actually be small");
-
-        let err = bounded(bomb, Codec::Gzip, 64 * 1024).unwrap_err();
-        let msg = err.to_string();
-        assert!(msg.contains("gzip"), "{msg}");
-        assert!(msg.contains("max_bytes"), "{msg}");
-        assert!(msg.contains("64 * 1024") || msg.contains("65536"), "{msg}");
+    fn decode(codec: Codec, data: &[u8], max_bytes: u64) -> crate::Result<Vec<u8>> {
+        let mut out = Vec::new();
+        decompress_into(codec, &mut &data[..], max_bytes, &mut out)?;
+        Ok(out)
     }
 
     #[test]
-    fn output_at_the_ceiling_passes_and_store_is_untouched() {
+    fn a_bomb_is_a_named_error_not_an_allocation() {
+        let bomb = gz(&[0u8; 256 * 1024]);
+        assert!(bomb.len() < 1024, "the bomb must actually be small");
+
+        let msg = decode(Codec::Gzip, &bomb, 64 * 1024)
+            .unwrap_err()
+            .to_string();
+        assert!(msg.contains("gzip"), "{msg}");
+        assert!(msg.contains("max_bytes"), "{msg}");
+        assert!(msg.contains("65536"), "{msg}");
+    }
+
+    #[test]
+    fn the_ceiling_is_inclusive_and_store_is_unbounded() {
         let data = vec![0u8; 64];
-        // Store never expands, so the ceiling doesn't apply.
-        assert_eq!(bounded(data.clone(), Codec::Store, 32).unwrap(), data);
-        // Exactly at the limit is fine — the ceiling is inclusive.
-        assert_eq!(bounded(gz(&data), Codec::Gzip, 64).unwrap(), data);
+        assert_eq!(decode(Codec::Gzip, &gz(&data), 64).unwrap(), data);
+        assert_eq!(decode(Codec::Store, &data, 32).unwrap(), data);
+    }
+
+    #[test]
+    fn multiple_zstd_frames_and_skippable_frames_all_decode() {
+        let frame = |bytes: &[u8]| {
+            let mut out = Vec::new();
+            super::super::compress::compress_into(Codec::Zstd, &mut &bytes[..], &mut out).unwrap();
+            out
+        };
+        // A skippable frame: magic 0x184D2A50, little-endian length, payload.
+        let mut input = frame(b"one ");
+        input.extend([0x50, 0x2a, 0x4d, 0x18, 3, 0, 0, 0, b'x', b'y', b'z']);
+        input.extend(frame(b"two"));
+        assert_eq!(decode(Codec::Zstd, &input, 1024).unwrap(), b"one two");
+    }
+
+    #[test]
+    fn the_reader_side_ceiling_is_findable_through_a_wrapping_error() {
+        let mut reader = BoundedReader::new(&[0u8; 10][..], Codec::Gzip, 4);
+        let io_err = reader.read(&mut [0u8; 10]).unwrap_err();
+        let wrapped = crate::Error::from(io_err).context("Couldn't unpack tar");
+        let found = LimitExceeded::find(wrapped.as_ref()).expect("limit lost in the chain");
+        assert!(found.to_string().contains("4-byte"), "{found}");
     }
 }
