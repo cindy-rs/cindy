@@ -232,15 +232,12 @@ async fn main(host: cindy::Host<Vars>) -> cindy::Result<()> {
 
         // Attribute reconcile: pin uid, shell and comment on the
         // existing account, then converge.
-        let pinned = Presence::Present {
+        let pinned = Presence::Present(user::Account {
             uid: Some(4242),
-            group: None,
-            groups: None,
             shell: Some("/bin/sh".into()),
-            home: None,
             comment: Some("cindy container e2e".into()),
-            system: None,
-        };
+            ..Default::default()
+        });
         if !user::user(user::State {
             name: "cindye2e".into(),
             presence: pinned.clone(),
@@ -272,15 +269,10 @@ async fn main(host: cindy::Host<Vars>) -> cindy::Result<()> {
         }
         if !user::user(user::State {
             name: "cindye2e".into(),
-            presence: Presence::Present {
-                uid: None,
-                group: None,
+            presence: Presence::Present(user::Account {
                 groups: Some(user::Groups::Exact(vec!["cindye2eops".into()])),
-                shell: None,
-                home: None,
-                comment: None,
-                system: None,
-            },
+                ..Default::default()
+            }),
         })
         .await?
         .changed()
