@@ -1,97 +1,105 @@
 use proc_macro::TokenStream;
+use proc_macro2::TokenStream as Tokens;
 use quote::{format_ident, quote};
-use syn::{FnArg, Item, ItemFn, Pat, PatIdent, parse_macro_input};
+use syn::{FnArg, Item, ItemFn, Pat, PatIdent, ReturnType};
 
-/// Given an argument type, if it's `impl Into<T>` return `Some(T)`; otherwise
-/// `None` (the type is used as-is for the concrete raw fn).
-fn into_target(ty: &syn::Type) -> Option<syn::Type> {
-    let syn::Type::ImplTrait(it) = ty else {
-        return None;
-    };
-    for bound in &it.bounds {
-        let syn::TypeParamBound::Trait(tb) = bound else {
-            continue;
-        };
-        let seg = tb.path.segments.last()?;
-        if seg.ident != "Into" {
-            continue;
-        }
-        if let syn::PathArguments::AngleBracketed(args) = &seg.arguments
-            && let Some(syn::GenericArgument::Type(inner)) = args.args.first()
-        {
-            return Some(inner.clone());
-        }
-    }
-    None
+fn expand<T: syn::parse::Parse>(
+    input: TokenStream,
+    f: impl FnOnce(T) -> syn::Result<Tokens>,
+) -> TokenStream {
+    syn::parse(input)
+        .and_then(f)
+        .unwrap_or_else(syn::Error::into_compile_error)
+        .into()
 }
 
-/// A spanned compile error, so misuse diagnostics point at the
-/// offending tokens instead of the whole attribute.
-fn compile_err(span: proc_macro2::Span, msg: &str) -> TokenStream {
-    syn::Error::new(span, msg).to_compile_error().into()
+fn error<T>(spanned: impl quote::ToTokens, msg: &str) -> syn::Result<T> {
+    Err(syn::Error::new_spanned(spanned, msg))
 }
 
-/// How generated code must refer to the `cindy` framework crate:
-/// `crate` when the macros are expanding inside cindy itself (its
-/// builtins), otherwise whatever name the invoking crate knows the
-/// dependency by — `cindy`, or the rename from
-/// `[dependencies] whatever = { package = "cindy", … }`.
-///
-/// Attribute macros can't see the path they were *invoked* with, so
-/// emitting a hardcoded `cindy::…` breaks every renamed-dependency
-/// user; resolving the name from the manifest (via `proc-macro-crate`)
-/// is the standard workaround.
-#[derive(Clone)]
-enum Cindy {
-    Itself,
-    Dep(String),
+/// How generated code names cindy: `crate` inside cindy itself, else
+/// whatever the invoking crate calls the dependency — an attribute
+/// macro can't see the path it was invoked by, so a hardcoded
+/// `::cindy` would break renamed dependencies.
+struct Cindy {
+    /// `crate` or `::name`; `::crate` isn't a path.
+    path: Tokens,
+    /// The same, for `#[serde(crate = "…")]`.
+    path_str: String,
 }
 
-impl Cindy {
-    /// Path prefix for generated item references. No leading `::` on
-    /// the `Itself` arm — `::crate` isn't a valid path.
-    fn ts(&self) -> proc_macro2::TokenStream {
-        match self {
-            Cindy::Itself => quote! { crate },
-            Cindy::Dep(name) => {
-                let ident = syn::Ident::new(name, proc_macro2::Span::call_site());
-                quote! { ::#ident }
-            }
-        }
-    }
-
-    /// Same prefix as a string, for `#[serde(crate = "…")]`-style
-    /// attributes that take paths as string literals.
-    fn path_str(&self) -> String {
-        match self {
-            Cindy::Itself => "crate".to_owned(),
-            Cindy::Dep(name) => format!("::{name}"),
-        }
-    }
-}
-
-fn resolve_cindy() -> Result<Cindy, syn::Error> {
+/// Not cached here: proc-macro-crate caches per manifest, and a cache
+/// of ours would be wrong in rust-analyzer's one long-lived process
+/// expanding many crates.
+fn cindy() -> syn::Result<Cindy> {
     use proc_macro_crate::{FoundCrate, crate_name};
-
-    // One manifest read per rustc invocation; expansion of a crate
-    // full of builtins would otherwise re-parse Cargo.toml per macro.
-    static CACHE: std::sync::OnceLock<Result<Cindy, String>> = std::sync::OnceLock::new();
-    CACHE
-        .get_or_init(|| match crate_name("cindy") {
-            Ok(FoundCrate::Itself) => Ok(Cindy::Itself),
-            Ok(FoundCrate::Name(name)) => Ok(Cindy::Dep(name)),
-            Err(e) => Err(e.to_string()),
-        })
-        .clone()
-        .map_err(|e| {
-            syn::Error::new(
+    let name = match crate_name("cindy") {
+        Ok(FoundCrate::Itself) => None,
+        Ok(FoundCrate::Name(name)) => Some(name),
+        Err(e) => {
+            return Err(syn::Error::new(
                 proc_macro2::Span::call_site(),
                 format!(
                     "couldn't resolve the `cindy` crate for generated code ({e}); \
                      is `cindy` a dependency of this crate?"
                 ),
-            )
-        })
+            ));
+        }
+    };
+    Ok(match name {
+        None => Cindy {
+            path: quote! { crate },
+            path_str: "crate".to_owned(),
+        },
+        Some(name) => {
+            let ident = syn::Ident::new(&name, proc_macro2::Span::call_site());
+            Cindy {
+                path: quote! { ::#ident },
+                path_str: format!("::{name}"),
+            }
+        }
+    })
+}
+
+fn return_type(sig: &syn::Signature) -> Tokens {
+    match &sig.output {
+        ReturnType::Default => quote! { () },
+        ReturnType::Type(_, ty) => quote! { #ty },
+    }
+}
+
+/// `impl Into<T>` → `Some(T)`.
+fn into_target(ty: &syn::Type) -> Option<syn::Type> {
+    let syn::Type::ImplTrait(it) = ty else {
+        return None;
+    };
+    it.bounds.iter().find_map(|bound| {
+        let syn::TypeParamBound::Trait(tb) = bound else {
+            return None;
+        };
+        let seg = tb.path.segments.last()?;
+        let syn::PathArguments::AngleBracketed(args) = &seg.arguments else {
+            return None;
+        };
+        match args.args.first() {
+            Some(syn::GenericArgument::Type(inner)) if seg.ident == "Into" => Some(inner.clone()),
+            _ => None,
+        }
+    })
+}
+
+/// A sync body runs in `spawn_blocking`, re-raising its panic.
+fn call_body(c: &Tokens, asyncness: bool, call: Tokens) -> Tokens {
+    if asyncness {
+        quote! { #call.await }
+    } else {
+        quote! {
+            match #c::__reexports::tokio::task::spawn_blocking(move || #call).await {
+                Ok(v) => v,
+                Err(je) => ::std::panic::resume_unwind(je.into_panic()),
+            }
+        }
+    }
 }
 
 /// The package's own library, when `#[cindy::main]` is expanding in
@@ -155,606 +163,397 @@ fn linkable_lib(manifest: &str, has_src_lib_rs: bool) -> Option<String> {
     })
 }
 
-/// Reject argument types that cannot cross the RPC wire, with a
-/// message at the argument's span. Only top-level `impl Trait` and
-/// references are checked — the realistic misuses; anything more exotic
-/// still fails in the generated code.
-fn check_remote_arg(ty: &syn::Type) -> Option<&'static str> {
-    match ty {
-        syn::Type::ImplTrait(_) => Some(
-            "`impl Trait` arguments are not allowed in `#[cindy::remote]` fns — use a \
-             concrete type (`#[cindy::action]` supports `impl Into<T>`)",
-        ),
-        syn::Type::Reference(_) => Some(
-            "reference arguments are not allowed in `#[cindy::remote]` fns — arguments \
-             cross the wire and must be owned (e.g. `String` instead of `&str`)",
-        ),
-        _ => None,
-    }
-}
-
-/// Shorthand for deriving `Debug` and `serde::{Deserialize, Serialize}`
-/// without an explicit `serde` dependency.
-///
-/// `Debug` is included because inventory `vars` types need it (so
-/// `cindy inventory` can render them). Don't also list `Debug` in a
-/// manual `#[derive(...)]` on the same item — that's a duplicate impl.
+/// Derive `Debug`, `Serialize` and `Deserialize` without a `serde`
+/// dependency. (`Debug` is what `cindy inventory` renders vars with;
+/// don't derive it again.)
 #[proc_macro_attribute]
 pub fn wire(_args: TokenStream, input: TokenStream) -> TokenStream {
-    let item = parse_macro_input!(input as Item);
-    if !matches!(item, Item::Enum(_) | Item::Struct(_) | Item::Union(_)) {
-        return compile_err(
-            syn::spanned::Spanned::span(&item),
-            "`#[cindy::wire]` can only be applied to structs, enums, and unions",
-        );
-    }
-
-    let cindy = match resolve_cindy() {
-        Ok(c) => c,
-        Err(e) => return e.to_compile_error().into(),
-    };
-    let c = cindy.ts();
-    let serde_crate = format!(r#"{}::__reexports::serde"#, cindy.path_str());
-
-    quote! {
-        #[derive(
-            ::std::fmt::Debug,
-            #c::__reexports::serde::Serialize,
-            #c::__reexports::serde::Deserialize
-        )]
-        #[serde(crate = #serde_crate)]
-        #item
-    }
-    .into()
+    expand(input, |item: Item| {
+        if !matches!(item, Item::Enum(_) | Item::Struct(_) | Item::Union(_)) {
+            return error(
+                &item,
+                "`#[cindy::wire]` can only be applied to structs, enums, and unions",
+            );
+        }
+        let Cindy { path: c, path_str } = cindy()?;
+        let serde_crate = format!("{path_str}::__reexports::serde");
+        Ok(quote! {
+            #[derive(
+                ::std::fmt::Debug,
+                #c::__reexports::serde::Serialize,
+                #c::__reexports::serde::Deserialize
+            )]
+            #[serde(crate = #serde_crate)]
+            #item
+        })
+    })
 }
 
-/// Specifies an entrypoint.
+/// The playbook's entry point. Built with `orchestrator`, it is the
+/// program; built with `remote`, the body is dropped and the binary
+/// serves RPC.
 ///
-/// - On `feature = "orchestrator"`
-///   - Compiles to normal program.
-/// - On `feature = "remote"`
-///   - Runs a RPC loop instead.
+/// `main` returns a `Result` and takes nothing, or the target's
+/// `cindy::Host<V>` (`Host<()>` for just `name` and `tags`). `async` is
+/// optional: the body always runs in an async context.
 ///
-/// The user's `main` may be declared in one of two shapes:
-///
-/// 1. `async fn main() -> Result<()>` - legacy, no host context.
-/// 2. `async fn main(host: cindy::Host<V>) -> Result<()>` - the macro
-///    reads the host context the CLI injected for this particular
-///    target (a JSON-serialised `cindy::Host<V>`; see
-///    `cindy::entry::host_context` for the hand-off channel) and hands
-///    it pre-parsed to the body. Any `Serialize +
-///    DeserializeOwned` `V` works; use `cindy::Host<()>` if you only
-///    need `name`/`tags`.
-///
-/// The `async` keyword is optional either way: the body is always
-/// spliced into an async context, so a plain `fn main` can still
-/// `.await` remote calls.
-///
-/// When the package also has a library, `#[cindy::main]` links it into
-/// both builds, so `#[cindy::remote]` fns and `secret!` demands defined
-/// there reach the worker — no `extern crate` needed.
+/// A library in the same package is linked into both builds, so its
+/// `#[cindy::remote]` fns and `secret!`s reach the worker.
 #[proc_macro_attribute]
 pub fn main(_args: TokenStream, input: TokenStream) -> TokenStream {
-    let input = parse_macro_input!(input as ItemFn);
+    expand(input, |input: ItemFn| {
+        let (attrs, vis, sig, block) = (&input.attrs, &input.vis, &input.sig, &input.block);
+        let (output, inputs) = (&sig.output, &sig.inputs);
 
-    let (attrs, vis, sig, block) = (&input.attrs, &input.vis, &input.sig, &input.block);
-    let output = &sig.output;
-    let inputs = &sig.inputs;
+        let returns_result = matches!(output, ReturnType::Type(_, ty)
+            if matches!(&**ty, syn::Type::Path(p) if p.path.segments.last().is_some_and(|s| s.ident == "Result")));
+        if !returns_result {
+            return error(
+                output,
+                "`#[cindy::main]` must return a `Result` (e.g. `-> cindy::Result<()>`): \
+                 the generated wrapper matches on `Ok`/`Err` to pick the process exit code",
+            );
+        }
+        if let Some(c) = &sig.constness {
+            return error(c, "`#[cindy::main]` functions cannot be `const`");
+        }
+        if let Some(u) = &sig.unsafety {
+            return error(u, "`#[cindy::main]` functions cannot be `unsafe`");
+        }
+        if let Some(abi) = &sig.abi {
+            return error(
+                abi,
+                "`#[cindy::main]` functions cannot be declared with an ABI",
+            );
+        }
+        if let Some(v) = &sig.variadic {
+            return error(v, "`#[cindy::main]` functions cannot be variadic");
+        }
+        if !sig.generics.params.is_empty() {
+            return error(
+                &sig.generics,
+                "`#[cindy::main]` functions cannot be generic",
+            );
+        }
 
-    // The expansion matches on the user fn's return value to pick the
-    // exit code, so anything but a `Result` surfaces here as a cryptic
-    // type error inside generated code. Reject it at the fn instead.
-    let returns_result = match output {
-        syn::ReturnType::Default => false,
-        syn::ReturnType::Type(_, ty) => match &**ty {
-            syn::Type::Path(p) => p.path.segments.last().is_some_and(|s| s.ident == "Result"),
-            _ => false,
-        },
-    };
-    if !returns_result {
-        return compile_err(
-            syn::spanned::Spanned::span(output),
-            "`#[cindy::main]` must return a `Result` (e.g. `-> cindy::Result<()>`): \
-             the generated wrapper matches on `Ok`/`Err` to pick the process exit code",
-        );
-    }
-    if let Some(c) = &sig.constness {
-        return compile_err(c.span, "`#[cindy::main]` functions cannot be `const`");
-    }
-    if let Some(u) = &sig.unsafety {
-        return compile_err(u.span, "`#[cindy::main]` functions cannot be `unsafe`");
-    }
-    if let Some(abi) = &sig.abi {
-        return compile_err(
-            abi.extern_token.span,
-            "`#[cindy::main]` functions cannot be declared with an ABI",
-        );
-    }
-    if let Some(v) = &sig.variadic {
-        return compile_err(
-            syn::spanned::Spanned::span(v),
-            "`#[cindy::main]` functions cannot be variadic",
-        );
-    }
-    if !sig.generics.params.is_empty() {
-        return compile_err(
-            syn::spanned::Spanned::span(&sig.generics),
-            "`#[cindy::main]` functions cannot be generic",
-        );
-    }
-
-    let cindy = match resolve_cindy() {
-        Ok(c) => c,
-        Err(e) => return e.to_compile_error().into(),
-    };
-    let c = cindy.ts();
-    let tokio_crate = format!(r#"{}::__reexports::tokio"#, cindy.path_str());
-
-    let invoke_user_main = match inputs.len() {
-        0 => quote! {
-            #c::__reexports::tokio::spawn(__user_main())
-        },
-        1 => match &inputs[0] {
-            // The host type is inferred from `__user_main`'s signature,
-            // so `entry::host_context` needs no explicit turbofish.
-            FnArg::Typed(_) => quote! {
-                #c::__reexports::tokio::spawn(__user_main(#c::entry::host_context()))
-            },
-            FnArg::Receiver(r) => {
-                return compile_err(
-                    syn::spanned::Spanned::span(r),
-                    "`#[cindy::main]` cannot take `self`",
+        let Cindy { path: c, path_str } = cindy()?;
+        let tokio_crate = format!("{path_str}::__reexports::tokio");
+        let host = match inputs.iter().collect::<Vec<_>>().as_slice() {
+            [] => quote! {},
+            // The host type comes from `__user_main`'s signature.
+            [FnArg::Typed(_)] => quote! { #c::entry::host_context() },
+            [FnArg::Receiver(r)] => return error(r, "`#[cindy::main]` cannot take `self`"),
+            _ => {
+                return error(
+                    inputs,
+                    "`#[cindy::main]` accepts at most one parameter (the host context, `cindy::Host<V>`)",
                 );
             }
-        },
-        _ => {
-            return compile_err(
-                syn::spanned::Spanned::span(inputs),
-                "`#[cindy::main]` accepts at most one parameter (the host context, `cindy::Host<V>`)",
-            );
-        }
-    };
+        };
+        // `as _`, so a playbook's own `extern crate <lib>;` doesn't collide.
+        let link_lib = playbook_lib().map(|lib| quote! { extern crate #lib as _; });
 
-    // `as _` so a playbook that already writes `extern crate <lib>;`
-    // doesn't collide with this one.
-    let link_lib = playbook_lib().map(|lib| quote! { extern crate #lib as _; });
+        Ok(quote! {
+            #link_lib
 
-    quote! {
-        #link_lib
+            #(#attrs)*
+            #[#c::__reexports::tokio::main(crate = #tokio_crate)]
+            #vis async fn main() {
+                // Without either feature, `main` would be a silent no-op.
+                #[cfg(not(any(feature = "orchestrator", feature = "remote")))]
+                ::core::compile_error!(
+                    "a cindy binary must be built with the `orchestrator` or `remote` feature \
+                     (add `default = [\"orchestrator\", \"remote\"]` to [features] for plain \
+                     `cargo check`)"
+                );
 
-        #(#attrs)*
-        #[#c::__reexports::tokio::main(crate = #tokio_crate)]
-        #vis async fn main() {
-            // A featureless build used to compile to a silent no-op
-            // `main`; catch it at compile time instead. The `cindy`
-            // CLI always builds with exactly one of the two features;
-            // for plain `cargo check` and rust-analyzer, declare
-            // `default = ["orchestrator", "remote"]` in your [features]
-            // so both halves of the program are analysed.
-            #[cfg(not(any(feature = "orchestrator", feature = "remote")))]
-            ::core::compile_error!(
-                "a cindy binary must be built with the `orchestrator` or `remote` feature \
-                 (add `default = [\"orchestrator\", \"remote\"]` to [features] for plain \
-                 `cargo check`)"
-            );
+                #[allow(unused_variables)]
+                let (rpc_in, rpc_out) = #c::common::quarantine_stdio();
 
-            #[allow(unused_variables)]
-            let (rpc_in, rpc_out) = #c::common::quarantine_stdio();
+                #[cfg(all(feature = "remote", not(feature = "orchestrator")))]
+                {
+                    #c::remote::rpc(rpc_in, rpc_out).await;
+                    ::std::process::exit(0);
+                }
 
-            // Remote-only builds skip the user's body entirely; the
-            // worker just runs the RPC dispatch loop. Vault keys arrive
-            // over the channel's first frame (the handshake) — they
-            // never touch this process's argv/env, so they're invisible
-            // in the target's `ps`.
-            #[cfg(all(feature = "remote", not(feature = "orchestrator")))]
-            {
-                #c::remote::rpc(rpc_in, rpc_out).await;
-                ::std::process::exit(0);
+                // Positive cfg, so both features at once (rust-analyzer)
+                // still analyse the body.
+                #[cfg(feature = "orchestrator")]
+                {
+                    async fn __user_main(#inputs) #output #block
+
+                    #c::entry::orchestrator_init(rpc_in, rpc_out).await;
+                    match #c::__reexports::tokio::spawn(__user_main(#host)).await {
+                        ::std::result::Result::Ok(::std::result::Result::Ok(_)) => ::std::process::exit(0),
+                        ::std::result::Result::Ok(::std::result::Result::Err(e)) => {
+                            ::std::eprintln!("\x1b[31m{:?}\x1b[0m", e);
+                            ::std::process::exit(1);
+                        }
+                        ::std::result::Result::Err(_) => ::std::process::exit(1),
+                    }
+                }
             }
-
-            // Orchestrator builds (and dual-feature LSP builds) serve
-            // the CLI side modes / set up the RPC plumbing (see
-            // `cindy::entry::orchestrator_init`), then run the user's
-            // body. Using a *positive* cfg here — rather than
-            // `not(remote)` — keeps the body in scope when both
-            // features are enabled at once, which is how rust-analyzer
-            // typically evaluates this workspace.
-            #[cfg(feature = "orchestrator")]
-            {
-                async fn __user_main(#inputs) #output #block
-
-                #c::entry::orchestrator_init(rpc_in, rpc_out).await;
-
-                match #invoke_user_main.await {
-                    ::std::result::Result::Ok(::std::result::Result::Ok(_)) => {
-                        ::std::process::exit(0);
-                    }
-                    ::std::result::Result::Ok(::std::result::Result::Err(e)) => {
-                        ::std::eprintln!("\x1b[31m{:?}\x1b[0m", e);
-                        ::std::process::exit(1);
-                    }
-                    ::std::result::Result::Err(_) => {
-                        ::std::process::exit(1);
-                    }
-                };
-            }
-        }
-    }
-    .into()
+        })
+    })
 }
 
-/// Registers an inventory function.
-///
-/// Exactly one `#[cindy::inventory]` should exist per binary. The function
-/// may be named in any way, can be sync or async, and may return either
-/// `cindy::Inventory<V>` or `cindy::Result<cindy::Inventory<V>>`.
+/// The inventory: exactly one per binary, any name, sync or async,
+/// returning `cindy::Inventory<V>` or a `Result` of one.
 ///
 /// ```rust,ignore
 /// #[cindy::wire]
-/// struct MyVars {
-///     var_a: u64,
-///     var_b: String,
-/// }
+/// struct Vars { region: String }
 ///
 /// #[cindy::inventory]
-/// async fn inventory() -> cindy::Result<cindy::Inventory<MyVars>> {
-///     Ok(cindy::Inventory {
-///         hosts: vec![
-///             cindy::Host {
-///                 name: "host-01".into(),
-///                 tags: cindy::tags!["env:production", "continent:eu", "router"],
-///                 vars: MyVars { var_a: 42, var_b: "hello".to_string() },
-///             },
-///         ],
-///     })
+/// fn inventory() -> cindy::Inventory<Vars> {
+///     cindy::Inventory::new([
+///         cindy::Host::new("web-01", ["env:prod", "web"], Vars { region: "eu".into() }),
+///     ])
 /// }
 /// ```
 #[proc_macro_attribute]
 pub fn inventory(_args: TokenStream, input: TokenStream) -> TokenStream {
-    let input = parse_macro_input!(input as ItemFn);
-
-    let (attrs, vis, sig, block) = (&input.attrs, &input.vis, &input.sig, &input.block);
-    let function_ident = &sig.ident;
-    let asyncness = &sig.asyncness;
-    let output = &sig.output;
-    let inputs = &sig.inputs;
-
-    if !inputs.is_empty() {
-        return compile_err(
-            syn::spanned::Spanned::span(inputs),
-            "`#[cindy::inventory]` functions must take no arguments",
-        );
-    }
-
-    let cindy = match resolve_cindy() {
-        Ok(c) => c,
-        Err(e) => return e.to_compile_error().into(),
-    };
-    let c = cindy.ts();
-
-    let invocation = if asyncness.is_some() {
-        quote! { #function_ident().await }
-    } else {
-        quote! {
-            match #c::__reexports::tokio::task::spawn_blocking(move || #function_ident())
-                .await
-            {
-                Ok(v) => v,
-                Err(je) => ::std::panic::resume_unwind(je.into_panic()),
-            }
+    expand(input, |input: ItemFn| {
+        let (attrs, vis, sig, block) = (&input.attrs, &input.vis, &input.sig, &input.block);
+        let (ident, asyncness, output) = (&sig.ident, &sig.asyncness, &sig.output);
+        if !sig.inputs.is_empty() {
+            return error(
+                &sig.inputs,
+                "`#[cindy::inventory]` functions must take no arguments",
+            );
         }
-    };
+        let c = cindy()?.path;
+        let invocation = call_body(&c, asyncness.is_some(), quote! { #ident() });
+        Ok(quote! {
+            #(#attrs)*
+            #vis #asyncness fn #ident () #output #block
 
-    quote! {
-        #(#attrs)*
-        #vis #asyncness fn #function_ident () #output #block
-
-        #c::__reexports::inventory::submit! {
-            #c::inventory::RegisteredInventory {
-                dump: || ::std::boxed::Box::pin(async move {
-                    #c::inventory::IntoInventoryDump::into_inventory_dump(#invocation)
-                }),
+            #c::__reexports::inventory::submit! {
+                #c::inventory::RegisteredInventory {
+                    dump: || ::std::boxed::Box::pin(async move {
+                        #c::inventory::IntoInventoryDump::into_inventory_dump(#invocation)
+                    }),
+                }
             }
-        }
-    }
-    .into()
+        })
+    })
 }
 
-/// Marks a function as "running on the remote host".
+/// A function that runs on the target. `foo(args)` becomes an RPC shim
+/// (orchestrator builds) returning a future that is dispatched eagerly;
+/// the body itself is `foo::inner(args)`, for calling from other remote
+/// code without a round trip (an uninhabited `enum foo` gives the path
+/// a type-namespace home next to `fn foo`).
 ///
-/// Each `#[cindy::remote] fn foo(args) -> T` expands to a small bundle of
-/// items at the same path:
-///
-/// 1. **`fn foo(args) -> impl Future<Output = T>`** — the RPC shim used by
-///    `#[cindy::main]` and other orchestrator-side code. Dispatches the call
-///    eagerly and resolves once the worker has replied. (Lives in the value
-///    namespace.)
-/// 2. **`enum foo {} + impl foo { fn inner(args) -> T { ..user body.. } }`** -
-///    the actual body, exposed at `foo::inner(args)`. Used inside other
-///    `#[remote]` bodies on the worker to call siblings directly without
-///    going through the RPC channel. The enum is uninhabited; it exists
-///    purely so the path syntax `foo::inner` works in the type namespace,
-///    side-by-side with `fn foo` in the value namespace.
-///
-/// Arguments and the return value must be `Serialize + Deserialize`, with
-/// one exception: in a returned `cindy::Result<T>` only `T` needs to be —
-/// the error crosses with its whole chain (see `cindy::error`).
+/// Arguments and the return value must be `Serialize + Deserialize`,
+/// except that in a returned `cindy::Result<T>` only `T` must be: the
+/// error crosses with its whole chain (see `cindy::error`).
 #[proc_macro_attribute]
 pub fn remote(_args: TokenStream, input: TokenStream) -> TokenStream {
-    let input = parse_macro_input!(input as ItemFn);
+    expand(input, |input: ItemFn| {
+        let (attrs, vis, sig, block) = (&input.attrs, &input.vis, &input.sig, &input.block);
+        if !sig.generics.params.is_empty() {
+            return error(
+                &sig.generics,
+                "`#[cindy::remote]` functions cannot be generic",
+            );
+        }
+        let c = cindy()?.path;
+        let (ident, asyncness, inputs) = (&sig.ident, &sig.asyncness, &sig.inputs);
+        let return_type = return_type(sig);
 
-    let (attrs, vis, sig, block) = (&input.attrs, &input.vis, &input.sig, &input.block);
-
-    if !sig.generics.params.is_empty() {
-        return compile_err(
-            syn::spanned::Spanned::span(&sig.generics),
-            "`#[cindy::remote]` functions cannot be generic",
-        );
-    }
-
-    let cindy = match resolve_cindy() {
-        Ok(c) => c,
-        Err(e) => return e.to_compile_error().into(),
-    };
-    let c = cindy.ts();
-
-    let function_ident = &sig.ident;
-    let asyncness = &sig.asyncness;
-    let inputs = &sig.inputs;
-    let return_type = match &sig.output {
-        syn::ReturnType::Default => quote! { () },
-        syn::ReturnType::Type(_, ty) => quote! { #ty },
-    };
-
-    let mut arg_idents = vec![];
-    let mut arg_types = vec![];
-    for input_arg in &sig.inputs {
-        match input_arg {
-            FnArg::Receiver(r) => {
-                return compile_err(
-                    syn::spanned::Spanned::span(r),
-                    "`#[cindy::remote]` functions cannot take `self`",
+        let mut arg_idents = vec![];
+        let mut arg_types = vec![];
+        for arg in inputs {
+            let FnArg::Typed(pat_type) = arg else {
+                return error(arg, "`#[cindy::remote]` functions cannot take `self`");
+            };
+            let Pat::Ident(PatIdent { ident, .. }) = &*pat_type.pat else {
+                return error(
+                    &pat_type.pat,
+                    "only plain named arguments are supported (no patterns)",
                 );
-            }
-            FnArg::Typed(pat_type) => match &*pat_type.pat {
-                Pat::Ident(PatIdent { ident, .. }) => {
-                    if let Some(why) = check_remote_arg(&pat_type.ty) {
-                        return compile_err(syn::spanned::Spanned::span(&pat_type.ty), why);
-                    }
-                    arg_idents.push(ident);
-                    arg_types.push(&pat_type.ty)
-                }
-                other => {
-                    return compile_err(
-                        syn::spanned::Spanned::span(other),
-                        "only plain named arguments are supported (no patterns)",
+            };
+            match &*pat_type.ty {
+                syn::Type::ImplTrait(_) => {
+                    return error(
+                        &pat_type.ty,
+                        "`impl Trait` arguments are not allowed in `#[cindy::remote]` fns — use a \
+                     concrete type (`#[cindy::action]` supports `impl Into<T>`)",
                     );
                 }
-            },
-        }
-    }
-
-    let invocation = if asyncness.is_some() {
-        quote! { #function_ident::inner( #(#arg_idents),* ).await }
-    } else {
-        quote! {
-            match #c::__reexports::tokio::task::spawn_blocking(move || {
-                #function_ident::inner( #(#arg_idents),* )
-            })
-            .await
-            {
-                Ok(v) => v,
-                Err(je) => ::std::panic::resume_unwind(je.into_panic()),
+                syn::Type::Reference(_) => {
+                    return error(
+                        &pat_type.ty,
+                        "reference arguments are not allowed in `#[cindy::remote]` fns — arguments \
+                     cross the wire and must be owned (e.g. `String` instead of `&str`)",
+                    );
+                }
+                _ => {}
             }
+            arg_idents.push(ident);
+            arg_types.push(&pat_type.ty);
         }
-    };
+        let invocation = call_body(
+            &c,
+            asyncness.is_some(),
+            quote! { #ident::inner( #(#arg_idents),* ) },
+        );
+        let outer_doc = format!(
+            "Runs on the target. To run the body in-process (from other remote code), \
+             see [`{ident}::inner`]."
+        );
+        let inner_doc = format!("The body of [`{ident}`], run in-process.");
 
-    let outer_docstring = format!(
-        "This function can be called from the orchestrator.
-
-To run the remote-side version of this function (e.g. to call it from another remote function),
-see [`{function_ident}::inner`]."
-    );
-    let inner_docstring = format!(
-        "This function can be called from another remote functions.
-
-For documentation about the actual function, please refer to [`{function_ident}`]."
-    );
-    quote! {
-        #[allow(non_camel_case_types)]
-        #[doc(hidden)]
-        #vis enum #function_ident {}
-
-        #[doc(hidden)]
-        impl #function_ident {
-            /// Stable identity of this remote function on the RPC wire.
-            /// `module_path!` makes it unique per item (two same-named
-            /// fns in different modules of one file can't collide) and
-            /// expands identically in the orchestrator and worker
-            /// builds, which compile the same source.
+        Ok(quote! {
+            #[allow(non_camel_case_types)]
             #[doc(hidden)]
-            pub const __CINDY_REMOTE_ID: &'static str =
-                ::core::concat!(::core::module_path!(), "::", ::core::stringify!(#function_ident));
+            #vis enum #ident {}
 
-            #[doc = #inner_docstring]
+            #[doc(hidden)]
+            impl #ident {
+                // `module_path!` keeps same-named fns in different modules
+                // apart, and expands alike in both builds.
+                #[doc(hidden)]
+                pub const __CINDY_REMOTE_ID: &'static str =
+                    ::core::concat!(::core::module_path!(), "::", ::core::stringify!(#ident));
+
+                #[doc = #inner_doc]
+                #(#attrs)*
+                pub #asyncness fn inner (#inputs) -> #return_type #block
+            }
+
+            #[cfg(feature = "orchestrator")]
+            #[doc = #outer_doc]
             #(#attrs)*
-            pub #asyncness fn inner (#inputs) -> #return_type #block
-        }
-
-        #[cfg(feature = "orchestrator")]
-        #[doc = #outer_docstring]
-        #(#attrs)*
-        #vis fn #function_ident (#inputs) -> impl ::std::future::Future<Output = #return_type> {
-            let response = #c::orchestrator::call(
-                #function_ident::__CINDY_REMOTE_ID,
-                #c::__reexports::postcard::to_allocvec(&( #(#arg_idents),* ))
-                    .expect("Failed to serialize args"),
-            );
-            async move {
-                use #c::error::wire::{ViaSerde as _, ViaWireError as _};
-                let bytes = response.await;
-                (&#c::error::wire::Return::<#return_type>::new())
-                    .decode(&bytes)
-                    .unwrap_or_else(|e| ::std::panic!(
-                        "failed to deserialize return value of `{}`: {e:?}",
-                        #function_ident::__CINDY_REMOTE_ID,
-                    ))
+            #vis fn #ident (#inputs) -> impl ::std::future::Future<Output = #return_type> {
+                let response = #c::orchestrator::call(
+                    #ident::__CINDY_REMOTE_ID,
+                    #c::__reexports::postcard::to_allocvec(&( #(#arg_idents),* ))
+                        .expect("Failed to serialize args"),
+                );
+                async move {
+                    use #c::error::wire::{ViaSerde as _, ViaWireError as _};
+                    let bytes = response.await;
+                    (&#c::error::wire::Return::<#return_type>::new())
+                        .decode(&bytes)
+                        .unwrap_or_else(|e| ::std::panic!(
+                            "failed to deserialize return value of `{}`: {e:?}",
+                            #ident::__CINDY_REMOTE_ID,
+                        ))
+                }
             }
-        }
 
-        #[cfg(feature = "remote")]
-        #c::__reexports::inventory::submit! {
-            #c::remote::RemoteFn {
-                id: #function_ident::__CINDY_REMOTE_ID,
-                function: |args_bytes| {
-                    let ( #(#arg_idents),* ): ( #(#arg_types),* ) =
-                        #c::__reexports::postcard::from_bytes(&args_bytes)
-                        .expect("Failed to deserialize args");
-
-                    ::std::boxed::Box::pin(async move {
-                        use #c::error::wire::{ViaSerde as _, ViaWireError as _};
-                        let result = #invocation;
-                        (&#c::error::wire::Return::<#return_type>::new())
-                            .encode(result)
-                            .expect("Failed to serialize return value")
-                    })
-                },
+            #[cfg(feature = "remote")]
+            #c::__reexports::inventory::submit! {
+                #c::remote::RemoteFn {
+                    id: #ident::__CINDY_REMOTE_ID,
+                    function: |args_bytes| {
+                        let ( #(#arg_idents),* ): ( #(#arg_types),* ) =
+                            #c::__reexports::postcard::from_bytes(&args_bytes)
+                            .expect("Failed to deserialize args");
+                        ::std::boxed::Box::pin(async move {
+                            use #c::error::wire::{ViaSerde as _, ViaWireError as _};
+                            let result = #invocation;
+                            (&#c::error::wire::Return::<#return_type>::new())
+                                .encode(result)
+                                .expect("Failed to serialize return value")
+                        })
+                    },
+                }
             }
-        }
-    }
-    .into()
+        })
+    })
 }
 
-/// Defines a builtin "action": one author-written function with ergonomic
-/// `impl Into<T>` arguments and a real body, from which the macro generates
-/// both the wire-level `#[remote]` entry point *and* the ergonomic layer.
+/// A builtin with `impl Into<T>` arguments. `#[remote]` needs concrete
+/// argument types, so from one fn this generates:
 ///
-/// `#[remote]` requires concrete, postcard-serializable argument types (no
-/// generics), but call sites want `impl Into<T>` so they can pass `&str`,
-/// literals, etc. Those can't be one function, so historically each action
-/// was two hand-written items: a concrete `*_raw` `#[remote]` fn plus a
-/// body-less convenience shim. `#[action]` collapses that to one: you write
-/// the `impl Into` fn with its body once, and the macro emits:
+/// - `<name>_raw` — the `#[remote]` fn, `impl Into<T>` lowered to `T`,
+///   carrying the body;
+/// - `<name>(..)` — the orchestrator shim: `.into()` each argument,
+///   await `<name>_raw`;
+/// - `<name>::inner(..)` — the same, in-process.
 ///
-/// 1. **`<name>_raw(<concrete args>)`** — a `#[remote]` fn whose body is
-///    *your* body (the `impl Into<T>` params rewritten to their concrete `T`).
-///    This is the real, registered remote entry point.
-/// 2. **`<name>(<impl Into args>)`** (orchestrator) — converts each arg with
-///    `.into()` and `.await`s the `<name>_raw` RPC shim (runs on the worker).
-/// 3. **`<name>::inner(<impl Into args>)`** (both features) — converts and
-///    calls `<name>_raw::inner(..)` directly, in-process (no RPC).
-///
-/// Asyncness is taken from the annotated fn — async fns produce an async
-/// `_raw`/`::inner` (the body is `.await`-capable); no marker needed.
+/// The body must call plain helpers, not other remote fns.
 ///
 /// ```ignore
 /// #[crate::action]
 /// pub async fn restart(name: impl Into<String>) -> crate::Result<super::Return> {
-///     apply(State { name, runtime: Some(RuntimeAction::Restarted), ..Default::default() }).await
+///     apply(intent(name, None, Some(RuntimeAction::Restarted))).await
 /// }
 /// ```
 #[proc_macro_attribute]
 pub fn action(_args: TokenStream, input: TokenStream) -> TokenStream {
-    let func = parse_macro_input!(input as ItemFn);
-    let (attrs, vis, sig, block) = (&func.attrs, &func.vis, &func.sig, &func.block);
-
-    if !sig.generics.params.is_empty() {
-        return compile_err(
-            syn::spanned::Spanned::span(&sig.generics),
-            "`#[action]` functions cannot have generic parameters (use `impl Into<T>` args)",
-        );
-    }
-
-    let ident = &sig.ident;
-    let raw_ident = format_ident!("{ident}_raw");
-    let is_async = sig.asyncness.is_some();
-
-    let cindy = match resolve_cindy() {
-        Ok(c) => c,
-        Err(e) => return e.to_compile_error().into(),
-    };
-    let c = cindy.ts();
-
-    let (maybe_async, maybe_await) = if is_async {
-        (quote! { async }, quote! { .await })
-    } else {
-        (quote! {}, quote! {})
-    };
-    let return_type = match &sig.output {
-        syn::ReturnType::Default => quote! { () },
-        syn::ReturnType::Type(_, ty) => quote! { #ty },
-    };
-
-    // Build, in lockstep:
-    //  - `ergonomic_inputs`: the original `impl Into<T>` params (the shim sig),
-    //  - `raw_inputs`: the same params with each `impl Into<T>` lowered to `T`
-    //    (the concrete `#[remote]` sig),
-    //  - `arg_idents`: param names, forwarded as `ident.into()` from the shims.
-    let mut ergonomic_inputs = vec![];
-    let mut raw_inputs = vec![];
-    let mut arg_idents = vec![];
-    for input_arg in &sig.inputs {
-        let FnArg::Typed(pat_type) = input_arg else {
-            return compile_err(
-                syn::spanned::Spanned::span(input_arg),
-                "`#[action]` functions cannot take `self`",
+    expand(input, |func: ItemFn| {
+        let (attrs, vis, sig, block) = (&func.attrs, &func.vis, &func.sig, &func.block);
+        if !sig.generics.params.is_empty() {
+            return error(
+                &sig.generics,
+                "`#[action]` functions cannot have generic parameters (use `impl Into<T>` args)",
             );
+        }
+        let c = cindy()?.path;
+        let ident = &sig.ident;
+        let raw_ident = format_ident!("{ident}_raw");
+        let (maybe_async, maybe_await) = if sig.asyncness.is_some() {
+            (quote! { async }, quote! { .await })
+        } else {
+            (quote! {}, quote! {})
         };
-        let Pat::Ident(PatIdent { ident, .. }) = &*pat_type.pat else {
-            return compile_err(
-                syn::spanned::Spanned::span(&pat_type.pat),
-                "only plain named arguments are supported in `#[action]` fns",
-            );
-        };
-        arg_idents.push(ident.clone());
-        ergonomic_inputs.push(input_arg.clone());
+        let return_type = return_type(sig);
 
-        // `impl Into<T>` lowers to `T` for the wire-level `#[remote]`
-        // fn; any *other* `impl Trait` can't cross the wire and would
-        // otherwise surface as an inscrutable error inside generated
-        // code — reject it here with a span.
-        let concrete_ty = match into_target(&pat_type.ty) {
-            Some(t) => t,
-            None if matches!(&*pat_type.ty, syn::Type::ImplTrait(_)) => {
-                return compile_err(
-                    syn::spanned::Spanned::span(&pat_type.ty),
-                    "`impl Into<T>` is the only impl-trait argument `#[action]` supports",
+        let inputs: Vec<&FnArg> = sig.inputs.iter().collect();
+        let mut raw_inputs = vec![];
+        let mut arg_idents = vec![];
+        for arg in &inputs {
+            let FnArg::Typed(pat_type) = arg else {
+                return error(arg, "`#[action]` functions cannot take `self`");
+            };
+            let Pat::Ident(PatIdent { ident, .. }) = &*pat_type.pat else {
+                return error(
+                    &pat_type.pat,
+                    "only plain named arguments are supported in `#[action]` fns",
                 );
-            }
-            None => (*pat_type.ty).clone(),
-        };
-        raw_inputs.push(quote! { #ident: #concrete_ty });
-    }
-
-    quote! {
-        // (1) The real, wire-level entry point: a `#[remote]` fn with concrete
-        // args, carrying the author's body verbatim.
-        #[doc(hidden)]
-        #[#c::remote]
-        #vis #maybe_async fn #raw_ident (#(#raw_inputs),*) -> #return_type #block
-
-        // (2) Orchestrator shim: convert args, drive the remote worker.
-        #[cfg(feature = "orchestrator")]
-        #(#attrs)*
-        #vis async fn #ident (#(#ergonomic_inputs),*) -> #return_type {
-            #raw_ident ( #(#arg_idents.into()),* ).await
+            };
+            let concrete = match into_target(&pat_type.ty) {
+                Some(t) => t,
+                None if matches!(&*pat_type.ty, syn::Type::ImplTrait(_)) => {
+                    return error(
+                        &pat_type.ty,
+                        "`impl Into<T>` is the only impl-trait argument `#[action]` supports",
+                    );
+                }
+                None => (*pat_type.ty).clone(),
+            };
+            raw_inputs.push(quote! { #ident: #concrete });
+            arg_idents.push(ident.clone());
         }
 
-        // (3) Local/in-process variant (`#ident::inner`), under BOTH features:
-        // worker builtins call siblings with it, and orchestrator code uses it
-        // to act on the *local* machine without RPC. Lives in the type
-        // namespace so it coexists with the `fn #ident` shim.
-        #[allow(non_camel_case_types)]
-        #vis enum #ident {}
+        Ok(quote! {
+            #[doc(hidden)]
+            #[#c::remote]
+            #vis #maybe_async fn #raw_ident (#(#raw_inputs),*) -> #return_type #block
 
-        impl #ident {
+            #[cfg(feature = "orchestrator")]
             #(#attrs)*
-            #vis #maybe_async fn inner (#(#ergonomic_inputs),*) -> #return_type {
-                #raw_ident ::inner( #(#arg_idents.into()),* ) #maybe_await
+            #vis async fn #ident (#(#inputs),*) -> #return_type {
+                #raw_ident ( #(#arg_idents.into()),* ).await
             }
-        }
-    }
-    .into()
+
+            // Both builds: worker code calls siblings with it, and the
+            // orchestrator uses it to act on its own machine.
+            #[allow(non_camel_case_types)]
+            #vis enum #ident {}
+
+            impl #ident {
+                #(#attrs)*
+                #vis #maybe_async fn inner (#(#inputs),*) -> #return_type {
+                    #raw_ident ::inner( #(#arg_idents.into()),* ) #maybe_await
+                }
+            }
+        })
+    })
 }
 
 #[cfg(test)]
