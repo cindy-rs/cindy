@@ -1,21 +1,12 @@
-//! Fixture playbook for the e2e-cli suite (`tests/e2e.rs`): three
-//! local hosts, one converged-state builtin and one marker-writing
-//! remote fn, so driving the real `cindy` binary proves the whole play
-//! path — inventory pull, `--limit` selection, worker build/upload/run
-//! over the local transport, and the run summary.
-//!
-//! `alpha`/`beta` share the `suite:one` tag and `gamma` wears
-//! `suite:two`, giving the `--limit` tests a tag to select and an
-//! expression to compose. The markers directory arrives via
-//! `E2E_CLI_MARKERS_DIR`, read at inventory time so it lands in the
-//! host context like any var; the default keeps a standalone
-//! `cindy play --local` from this directory runnable.
+//! The e2e-cli fixture: three local hosts (`alpha` and `beta` tagged
+//! `suite:one`, `gamma` `suite:two`), one builtin and one marker-writing
+//! remote fn. `E2E_CLI_MARKERS_DIR` arrives at inventory time, so it
+//! reaches the play in the host context like any var.
 
 use std::path::PathBuf;
 
 #[cindy::wire]
 pub struct Vars {
-    /// Where the play drops its per-host markers. See the module docs.
     #[serde(default = "default_markers_dir")]
     markers_dir: PathBuf,
 }
@@ -44,10 +35,8 @@ fn inventory() -> cindy::Inventory<Vars> {
     }
 }
 
-/// Worker-side marker: proves playbook code ran on a host — the RPC
-/// reached a genuinely spawned worker process. Runs even under
-/// `--check` (cindy can't know what user code mutates), which the
-/// check-mode test accounts for.
+/// Proof that playbook code ran on the host's worker. User code runs
+/// under `--check` too.
 #[cindy::remote]
 fn drop_marker(dest: PathBuf) -> cindy::Result<()> {
     std::fs::create_dir_all(dest.parent().expect("marker path has a parent"))?;
@@ -61,10 +50,8 @@ async fn main(host: cindy::Host<Vars>) -> cindy::Result<()> {
 
     let markers = &host.vars.markers_dir;
 
-    // A converged-state builtin: its file appears only in a real play,
-    // never under `--check` — the check-mode test's "nothing was
-    // applied" signal. The per-host content proves the host context
-    // (vars) reached the play.
+    // Applied only in a real play — the check-mode test's signal. The
+    // per-host content proves the host context arrived.
     let (user, group) = builtin::current_owner_names();
     builtin::path::directory(
         markers.clone(),

@@ -1,17 +1,10 @@
-//! Drives the *real* `cindy` binary through its whole play path —
-//! inventory pull, `--limit` selection, preflight, worker build,
-//! upload and run over the local transport, and the terminal summary —
-//! against the fixture playbook in `fixture/`. That path was the last
-//! untested stretch of the CLI: unit tests covered `--limit`'s
-//! expression engine in isolation, but nothing proved the selected
-//! set actually reaches deployment, or that unselected hosts never
-//! run playbook code.
+//! Drives the real `cindy` binary: whole plays (`play --local`) against
+//! the fixture in `fixture/` — `--limit` selection reaching deployment,
+//! the summary, `--check` applying nothing — and `secret vault rotate`
+//! in throwaway workspaces.
 //!
-//! Assertions work through the fixture's markers: a `#[remote]` fn
-//! writes `<host>.marker` (playbook code ran on that host — even
-//! under `--check`, which cindy documents as still running remote
-//! fns) and a `path::file` builtin writes `<host>.config` (applied
-//! only in a real play). See `fixture/src/main.rs`.
+//! A play's evidence is the fixture's files: `<host>.marker` (playbook
+//! code ran there) and `<host>.config` (a builtin applied).
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -19,25 +12,16 @@ use std::sync::{Mutex, OnceLock};
 
 use tempfile::TempDir;
 
-/// Serialises `cindy play` invocations across libtest's parallel
-/// threads. The CLI shells out to `rustup` before building (the
-/// rustup proxy is not concurrency-safe — see the FIXME in the CLI's
-/// build path), and every play builds into the fixture's target dirs;
-/// concurrent plays would race both for no gain — the first play's
-/// builds dominate the suite's runtime and the rest hit the cache.
+/// One play at a time: the CLI runs `rustup`, whose proxy isn't
+/// concurrency-safe, and every play builds into the fixture's target
+/// dirs.
 static PLAY_GATE: Mutex<()> = Mutex::new(());
 
-/// Build the real `cindy` CLI once for the suite, into the monorepo's
-/// own target dir. Memoised for the same reason e2e-localhost
-/// memoises `build_variant`: concurrent `cargo build`s into one
-/// target dir race (`ETXTBSY` on the binary under construction).
+/// Built once, in debug — the CLI's logic is under test; the heavy
+/// builds are the fixture's, driven by the CLI.
 fn cindy_bin() -> PathBuf {
     static BIN: OnceLock<PathBuf> = OnceLock::new();
     BIN.get_or_init(|| {
-        // examples/e2e-cli sits two levels under the repo root, whose
-        // workspace holds cindy-cli. Debug profile: the CLI's logic is
-        // what's under test — the heavy builds (the fixture's
-        // orchestrator/worker) are driven by the CLI itself.
         let root = Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .and_then(Path::parent)
