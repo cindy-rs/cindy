@@ -29,24 +29,18 @@ fn inventory() -> cindy::Inventory<Vars> {
     }
 }
 
-/// Read-only probe for the scenarios' assertions: runs `cmd` in the
-/// container and returns `(exited 0, combined output, trimmed)`.
-///
-/// Deliberately a custom `#[remote]` rather than the `command` builtin:
-/// under `--check` the builtin (correctly) refuses to execute anything,
-/// while assertions still need to *read* state to prove nothing
-/// mutated — and reads are exactly what check mode permits. It only
-/// ever reads; the scenarios pass it `systemctl is-*`, `getent`,
-/// `dpkg-query`.
-#[cindy::remote]
-fn probe(cmd: Vec<String>) -> (bool, String) {
-    let output = std::process::Command::new(&cmd[0])
-        .args(&cmd[1..])
-        .output()
+/// The scenarios' read-only assertions: `(exited 0, stdout+stderr
+/// trimmed)`. The `probe` builtin, so they also run under `--check`.
+#[cfg(feature = "orchestrator")]
+async fn probe(cmd: Vec<String>) -> (bool, String) {
+    let out = cindy::builtin::command::probe(cmd)
+        .await
         .expect("probe command spawned");
-    let mut text = String::from_utf8_lossy(&output.stdout).into_owned();
-    text.push_str(&String::from_utf8_lossy(&output.stderr));
-    (output.status.success(), text.trim().to_owned())
+    let text = format!("{}{}", out.stdout, out.stderr);
+    (
+        out.status == cindy::builtin::command::Status::Exited(0),
+        text.trim().to_owned(),
+    )
 }
 
 /// Reached only from `main`'s body, which the worker side discards —
@@ -134,6 +128,34 @@ async fn main(host: cindy::Host<Vars>) -> cindy::Result<()> {
             cindy::bail!("disable_and_stop reported Unchanged for a running enabled unit");
         }
         assert_unit("inactive", "disabled").await?;
+
+        // A runtime-only enable is gone after a reboot: not enabled.
+        let enable_runtime = || {
+            builtin::command::command(
+                vec![
+                    "systemctl".into(),
+                    "enable".into(),
+                    "--runtime".into(),
+                    UNIT.into(),
+                ],
+                Default::default(),
+            )
+        };
+        enable_runtime().await?.exit_ok()?;
+        assert_enabled(UNIT, "enabled-runtime").await?;
+        if !systemd::enable(UNIT).await?.changed() {
+            cindy::bail!("enable reported Unchanged for a runtime-only enabled unit");
+        }
+        assert_enabled(UNIT, "enabled").await?;
+        // Persistent and runtime links at once: one disable removes both.
+        enable_runtime().await?.exit_ok()?;
+        if !systemd::disable(UNIT).await?.changed() {
+            cindy::bail!("disable reported Unchanged for an enabled unit");
+        }
+        assert_enabled(UNIT, "disabled").await?;
+        if systemd::disable(UNIT).await?.changed() {
+            cindy::bail!("disable needed a second run to converge");
+        }
 
         if !systemd::mask(UNIT).await?.changed() {
             cindy::bail!("mask reported Unchanged for an unmasked unit");
