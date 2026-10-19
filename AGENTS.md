@@ -177,10 +177,10 @@ rediscover.
 
 - **Conditional behaviour goes in a pure decision function.** Every `--check`
   defect came from a condition replicated across call sites with nothing
-  enforcing it. The shape that survives review is `plan_holds`,
-  `system_conflict`, `disable_would_change`, `file_attrs_satisfied`: extract the
-  would-this-change decision, unit-test it, and have both the real path and the
-  dry-run path read the same answer.
+  enforcing it. The shape that survives review is systemd's `plan` and
+  `runtime_job`, apt's `plan_holds` + `changes`, `system_conflict`,
+  `file_attrs_satisfied`: extract the would-this-change decision, unit-test it,
+  and have both the real path and the dry-run path read the same answer.
 - **When the message is the feature, assert on the message.**
   `assert!(x.is_err())` let two separate regressions ship green — an
   unknown-version error that didn't name the version, then a wrong-key error
