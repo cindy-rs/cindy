@@ -1,22 +1,8 @@
-# CI for github.com/cindy-rs/cindy.
-#
-# No docker-in-docker anywhere, and none needed: a GitHub-hosted
-# `ubuntu-*` runner is a **virtual machine** with a real Docker daemon
-# already running, not a container. `/var/run/docker.sock` is there, so
-# testcontainers — and therefore examples/e2e-containers — works with
-# no service, no privileged mode and no DOCKER_HOST. (dind is the
-# pattern for runners that execute jobs *inside* containers; there is
-# nothing to nest here.)
-#
-# Two consequences worth knowing:
-#   * `container:` on a job would put us back inside a container, and
-#     the socket would then need mounting. Don't, unless you must.
-#   * macOS and Windows runners have no usable Linux Docker daemon, so
-#     the container suite is ubuntu-only.
-#
-# The harness needs no container CLI at all — it speaks the Docker API
-# directly (bollard) — so there is nothing to install and no
-# podman-vs-docker choice to configure.
+# A GitHub-hosted ubuntu runner is a VM with a Docker daemon at
+# /var/run/docker.sock, so the container e2e suite (testcontainers +
+# bollard, no CLI) needs no setup and no docker-in-docker. Don't add
+# `container:` to a job: that puts it inside a container, without the
+# socket. macOS and Windows runners have no Linux daemon.
 name: CI
 
 on:
@@ -40,8 +26,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # Nightly: cindy's MSRV is 1.98 but tier-3 worker builds need
-      # -Zbuild-std, and rustfmt/clippy come from the same toolchain.
+      # Nightly: tier-3 worker builds need -Zbuild-std.
       - name: Install Rust nightly
         run: |
           rustup toolchain install nightly --profile minimal \
@@ -54,27 +39,21 @@ jobs:
       - name: Format
         run: cargo fmt --check
 
-      # The e2e-cli fixture playbook is a nested workspace (excluded
-      # from the root one), so the fmt pass above doesn't reach it.
+      # A nested workspace the root fmt doesn't reach.
       - name: Format fixture playbook
         run: cargo fmt --check --manifest-path examples/e2e-cli/fixture/Cargo.toml
 
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
-      # `cargo test --workspace` includes examples/e2e-containers, which
-      # uses the runner's Docker daemon over /var/run/docker.sock. No
-      # setup and no engine choice to make: the harness talks the Docker
-      # API through bollard, so podman-vs-docker never comes up.
+      # Together the same as `cargo test --workspace`; the container
+      # suite runs on its own so its output can prove it didn't skip.
       - name: Test
-        run: cargo test --workspace
+        run: cargo test --workspace --exclude e2e-containers
 
-      # Proves the container suite actually ran rather than skipping.
-      # It fails by default when no engine is present, so a green Test
-      # step already implies it ran — this makes that explicit and
-      # would catch a future default flipping back to skip.
-      - name: Container e2e ran (not skipped)
+      - name: Container e2e (must run, not skip)
         run: |
+          set -o pipefail
           cargo test -p e2e-containers -- --nocapture 2>&1 | tee out.txt
           if grep -q "skipping container e2e" out.txt; then
             echo "::error::container e2e skipped; it must run in CI"
@@ -88,8 +67,7 @@ jobs:
       - uses: rustsec/audit-check@v2
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
-      # The site is a nested workspace with its own lockfile; the
-      # action above only audits the root one.
+      # The site's nested workspace has its own lockfile.
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-audit
@@ -97,8 +75,6 @@ jobs:
         run: cargo audit --file web/Cargo.lock
 
   web:
-    # The marketing site is a nested workspace; the root commands don't
-    # reach it, so it gets its own job.
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -116,8 +92,7 @@ jobs:
       - name: Format
         run: cargo fmt --check --manifest-path web/Cargo.toml
 
-      # `dx` compiles tailwind.css into assets/; raw cargo only needs
-      # the file to exist — its content doesn't affect compilation.
+      # `dx` generates assets/tailwind.css; cargo only needs it to exist.
       - name: Check (wasm)
         run: |
           cp web/tailwind.css web/assets/tailwind.css
