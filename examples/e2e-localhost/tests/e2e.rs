@@ -232,6 +232,27 @@ fn start_play(
 /// the keyless-handshake scenario needs the `worker-vault-demand`
 /// build, every other scenario the plain one.
 #[allow(clippy::too_many_arguments)]
+/// Staging an executable and spawning one must not interleave across
+/// threads: `fork` duplicates the fd table, so a spawn on one thread
+/// inherits another thread's mid-copy write fd, and `execve` fails with
+/// `ETXTBSY` — before `O_CLOEXEC` can close it. Hold this from the copy
+/// to the last spawn.
+fn staging_lock() -> std::sync::MutexGuard<'static, ()> {
+    static STAGE_AND_SPAWN: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    STAGE_AND_SPAWN
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// A copy of the worker: it deletes its own executable on startup.
+fn stage_worker(tmp: &Path, built: &Path) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt as _;
+    let staged = tmp.join("remote-worker");
+    std::fs::copy(built, &staged).expect("copy remote worker");
+    std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o755)).unwrap();
+    staged
+}
+
 fn start_play_with_worker(
     tmp: &Path,
     host_context: &serde_json::Value,
@@ -242,36 +263,8 @@ fn start_play_with_worker(
     let orchestrator_bin = build_variant("orchestrator");
     let remote_bin_src = build_variant(worker_feature);
 
-    // Staging an executable and spawning one must not interleave across
-    // threads, so everything from the copy to the last spawn happens
-    // under this lock.
-    //
-    // libtest runs these tests concurrently in one process, and `fork`
-    // duplicates the whole fd table: a thread mid-`fs::copy` has the
-    // destination open for writing, and a *different* thread's spawn
-    // inherits that write fd. `execve` then rejects the file with
-    // `ETXTBSY` ("Text file busy") — it checks for writers before
-    // `O_CLOEXEC` gets a chance to close the inherited fd, so Rust
-    // opening files close-on-exec doesn't save us. Rare, load-dependent,
-    // and it took a second e2e crate's parallelism to surface.
-    static STAGE_AND_SPAWN: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    let _staging = STAGE_AND_SPAWN
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-
-    // The remote worker deletes its own executable on startup (it's
-    // designed to be an uploaded throwaway). Copy it to a temp path so
-    // the cached build artifact survives for re-runs.
-    let remote_bin = tmp.join("remote-worker");
-    std::fs::copy(&remote_bin_src, &remote_bin).expect("copy remote worker");
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        let mut perms = std::fs::metadata(&remote_bin).unwrap().permissions();
-        perms.set_mode(0o755);
-        std::fs::set_permissions(&remote_bin, perms).unwrap();
-    }
-
+    let _staging = staging_lock();
+    let remote_bin = stage_worker(tmp, &remote_bin_src);
     let mut worker_cmd = Command::new(&remote_bin);
     worker_cmd
         .stdin(Stdio::piped())
@@ -784,6 +777,39 @@ fn remote_errors_cross_the_wire_with_their_chain() {
     );
     assert_eq!(report["io_kind"], "Some(NotFound)");
     assert_eq!(report["typed_what"], "eth0");
+}
+
+/// Check mode and the vault keys arrive with the handshake, so a call
+/// that overtook it would run with neither: the worker refuses it.
+#[test]
+fn worker_refuses_a_call_before_the_handshake() {
+    let tmp = tempfile::tempdir().expect("create temp dir");
+    let built = build_variant("remote");
+    let mut worker = {
+        let _staging = staging_lock();
+        Command::new(stage_worker(tmp.path(), &built))
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn remote worker")
+    };
+    let call = cindy::common::WorkerInbound::Call(cindy::common::RemoteFnPayload {
+        uuid: uuid::Uuid::nil(),
+        fn_id: "e2e_localhost::keyless_marker".to_owned(),
+        data: Vec::new(),
+    });
+    let frame = postcard::to_allocvec_cobs(&call).unwrap();
+    worker.stdin.take().unwrap().write_all(&frame).unwrap();
+
+    let out = worker.wait_with_output().expect("wait for worker");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !out.status.success(),
+        "worker accepted a call before the handshake"
+    );
+    assert!(stderr.contains("before the handshake"), "{stderr}");
+    assert!(!stderr.contains("panicked"), "{stderr}");
 }
 
 /// Preflight refusal on a missing key: the orchestrator is handed the

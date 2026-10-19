@@ -1072,9 +1072,11 @@ version = "0.4.0"
 dependencies = [
  "cindy",
  "futures-util",
+ "postcard",
  "serde_json",
  "sha2",
  "tempfile",
+ "uuid",
 ]
 
 [[package]]

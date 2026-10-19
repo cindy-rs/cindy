@@ -1,11 +1,5 @@
-//! Runtime halves of the `#[cindy::main]` expansion.
-//!
-//! The macro's job is reduced to splicing the user's `main` body and
-//! selecting the orchestrator vs worker path per feature; everything
-//! that is ordinary runtime logic — the CLI-driven side modes, vault
-//! key installation, preflight, RPC spawn — lives here, where it is
-//! reviewable and testable instead of being generated as tokens into
-//! every user crate.
+//! The runtime half of `#[cindy::main]`: everything that isn't splicing
+//! the user's body lives here, as code rather than generated tokens.
 
 #[cfg(feature = "orchestrator")]
 use std::process::exit;
@@ -13,12 +7,10 @@ use std::process::exit;
 #[cfg(feature = "orchestrator")]
 use tokio::io::AsyncWriteExt as _;
 
-/// Load the raw host-context JSON (a JSON `cindy::Host<V>`, injected
-/// per-target by the CLI) from the `CINDY_HOST_CONTEXT_FILE` temp
-/// file. A single env var is capped at ~128 KiB by the kernel
-/// (`MAX_ARG_STRLEN`), which real `vars` payloads — embedded
-/// certificates, whole config files — can exceed; a file has no such
-/// ceiling.
+/// The host context (a JSON `cindy::Host<V>`) the CLI wrote for this
+/// target. A file, not an env var: one variable is capped at 128 KiB
+/// (`MAX_ARG_STRLEN`), and `vars` carrying certificates or whole
+/// config files exceed it.
 fn load_context_json() -> Option<String> {
     let path = std::env::var("CINDY_HOST_CONTEXT_FILE").ok()?;
     Some(match std::fs::read_to_string(&path) {
@@ -34,8 +26,6 @@ fn load_context_json() -> Option<String> {
     })
 }
 
-/// Parse the host context into the host type the user's `main`
-/// declares.
 #[doc(hidden)]
 pub fn host_context<H: serde::de::DeserializeOwned>() -> H {
     let json = match load_context_json() {
@@ -62,25 +52,20 @@ pub fn host_context<H: serde::de::DeserializeOwned>() -> H {
     }
 }
 
-/// Print an error in red and exit 1. The orchestrator's stderr is the
-/// operator-facing channel (the CLI tags and forwards it per host).
+/// The orchestrator's stderr is the operator's channel (the CLI tags
+/// and forwards it per host).
 #[cfg(feature = "orchestrator")]
 fn fail(e: crate::Error) -> ! {
     eprintln!("\x1b[31m{e:?}\x1b[0m");
     exit(1);
 }
 
-/// Orchestrator-process startup, called by the `#[cindy::main]`
-/// expansion before the user's `main` body runs.
-///
-/// First serves the CLI-driven side modes — `CINDY_DUMP_INVENTORY`,
-/// `CINDY_DUMP_VAULTS`, `CINDY_SEAL_SECRETS` — each of which writes its
-/// result to `rpc_out` and exits without touching the user's `main`.
-/// Otherwise: install this run's vault keys from `CINDY_VAULT_KEYS`
-/// (env is fine here — this is the operator's machine, not a target),
-/// run the vault preflight, and spawn the RPC loop over the pipes. The
-/// same key map is forwarded to the worker over the RPC handshake, so
-/// key material never appears in the target's argv/env.
+/// Runs before the user's `main`. The CLI's side modes (dump the
+/// inventory, list the vaults, seal secrets) write to `rpc_out` and
+/// exit here. Otherwise: install the vault keys (env is fine on the
+/// operator's machine; the worker gets them over the handshake), fail
+/// early if any key the play may need is missing, and start the RPC
+/// channel.
 #[cfg(feature = "orchestrator")]
 #[doc(hidden)]
 pub async fn orchestrator_init(rpc_in: tokio::fs::File, rpc_out: tokio::fs::File) {
@@ -102,23 +87,14 @@ pub async fn orchestrator_init(rpc_in: tokio::fs::File, rpc_out: tokio::fs::File
         fail(e);
     }
 
-    // Vault preflight: before any RPC or play work, confirm this
-    // orchestrator can load every vault key it might need — the union
-    // of in-code `secret!` vaults and the sealed-secret vaults present
-    // in this host's context. Fail loudly and early instead of partway
-    // through the play.
     if let Err(e) = crate::secret::preflight("the orchestrator", load_context_json().as_deref()) {
         fail(e);
     }
 
-    let writer_rx = crate::orchestrator::install_dispatch();
-    tokio::spawn(crate::orchestrator::rpc(
-        rpc_in, rpc_out, vault_keys, writer_rx,
-    ));
+    crate::orchestrator::start(rpc_in, rpc_out, vault_keys);
 }
 
-/// Write `bytes` to the (saved) RPC stdout and exit 0. Shared tail of
-/// the dump modes; the CLI reads the payload from the pipe.
+/// The side modes answer on the RPC pipe.
 #[cfg(feature = "orchestrator")]
 async fn write_and_exit(mut out: tokio::fs::File, bytes: &[u8]) -> ! {
     out.write_all(bytes).await.expect("Failed to write output");
@@ -126,8 +102,6 @@ async fn write_and_exit(mut out: tokio::fs::File, bytes: &[u8]) -> ! {
     exit(0);
 }
 
-/// `CINDY_DUMP_INVENTORY`: serialise the registered inventory as an
-/// `InventoryDump` JSON blob for the CLI.
 #[cfg(feature = "orchestrator")]
 async fn dump_inventory(rpc_out: tokio::fs::File) -> ! {
     let entries: Vec<&crate::inventory::RegisteredInventory> =
@@ -145,11 +119,8 @@ async fn dump_inventory(rpc_out: tokio::fs::File) -> ! {
     write_and_exit(rpc_out, &bytes).await
 }
 
-/// `CINDY_DUMP_VAULTS`: print the set of vaults referenced by
-/// `secret!` invocations compiled into this binary (the "secrets in
-/// code" half of the preflight) as a JSON array. The CLI runs this once
-/// during preflight to know which vault keys every participating
-/// machine must hold.
+/// The vaults `secret!`s in this binary reference, so the CLI knows
+/// which keys every machine needs.
 #[cfg(feature = "orchestrator")]
 async fn dump_vaults(rpc_out: tokio::fs::File) -> ! {
     let vaults = crate::secret::registered_vaults();
@@ -157,10 +128,8 @@ async fn dump_vaults(rpc_out: tokio::fs::File) -> ! {
     write_and_exit(rpc_out, &bytes).await
 }
 
-/// `CINDY_SEAL_SECRETS`: encrypt every pending `secret!` value under
-/// its vault's key and emit one JSON record per secret on `rpc_out` so
-/// the CLI can patch the source files. Exits 2 if any secret failed
-/// (missing vault key, encryption error), 0 otherwise.
+/// One JSON record per pending `secret!`, sealed under its vault's
+/// key, for the CLI to patch into the source. Exits 2 if any failed.
 #[cfg(feature = "orchestrator")]
 async fn seal_secrets(rpc_out: tokio::fs::File) -> ! {
     use base64::Engine as _;
@@ -169,13 +138,9 @@ async fn seal_secrets(rpc_out: tokio::fs::File) -> ! {
     let mut failed = false;
     for pending in inventory::iter::<crate::secret::PendingSecret>() {
         let plaintext = (pending.serialize)();
-        // Refuse to bootstrap a vault on the fly. If the user didn't
-        // `cindy secret vault create <name>` before running seal,
-        // that's almost certainly a mistake — they probably meant to
-        // copy an existing team-shared key file into place. Bail with
-        // the (already actionable) error from the keychain layer
-        // instead of generating a fresh key whose ciphertext nobody
-        // else can decrypt.
+        // Never create a key here: a missing one usually means a team
+        // key file wasn't copied in, and a fresh key would seal what
+        // nobody else can open.
         let key = match crate::secret::keychain::get_vault_key(pending.vault) {
             Ok(k) => k,
             Err(e) => {
