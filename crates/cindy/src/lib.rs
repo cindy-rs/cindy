@@ -3,7 +3,7 @@
 //! run on each target — over SSH, with nothing left behind.
 //!
 //! - [`main`], [`remote`], [`inventory`], [`wire`], [`action`] — the
-//!   macros a playbook is written with.
+//!   macros a playbook is written with; [`mode!`] for file modes.
 //! - [`builtin`] — converged-state building blocks: files, packages,
 //!   services, users, archives, commands. Each reports whether it
 //!   changed anything.
@@ -43,7 +43,7 @@ pub mod builtin;
 pub mod check;
 pub mod diff;
 
-pub use cindy_macros::{action, inventory, main, remote, wire};
+pub use cindy_macros::{action, inventory, main, mode, remote, wire};
 
 pub use check::dry_run;
 pub use diff::Diff;

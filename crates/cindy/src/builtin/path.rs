@@ -24,13 +24,19 @@ impl Mode {
         Mode(st_mode & 0o7777)
     }
 
+    /// What `cindy::mode!` expands to, its literal already checked.
+    #[doc(hidden)]
+    pub const fn __checked(bits: u32) -> Self {
+        Mode(bits)
+    }
+
     fn nix(self) -> nix::sys::stat::Mode {
         nix::sys::stat::Mode::from_bits_truncate(self.0)
     }
 }
 
-// No `From<u32>`: it would make std derive an infallible `TryFrom`
-// that conflicts with this one, and would have to mask or panic.
+/// For modes known only at runtime; write literals as
+/// `cindy::mode!(0o644)`. No `From<u32>`: decimal `644` would pass.
 impl TryFrom<u32> for Mode {
     type Error = crate::Error;
 

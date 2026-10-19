@@ -556,9 +556,57 @@ pub fn action(_args: TokenStream, input: TokenStream) -> TokenStream {
     })
 }
 
+/// A file mode, checked at compile time: `cindy::mode!(0o644)`.
+///
+/// The literal must be octal — `mode!(644)` is refused, since decimal
+/// 644 is a valid but unintended mode (`0o1204`) no range check could
+/// catch. For a mode only known at runtime, use `Mode::try_from`.
+#[proc_macro]
+pub fn mode(input: TokenStream) -> TokenStream {
+    expand(input, |lit: syn::LitInt| {
+        let bits = octal_mode(&lit.to_string(), lit.suffix())
+            .map_err(|msg| syn::Error::new_spanned(&lit, msg))?;
+        let c = cindy()?.path;
+        Ok(quote! { #c::builtin::path::Mode::__checked(#bits) })
+    })
+}
+
+/// The bits of a mode literal as written (`0o644`, `0o6_44`, `0o644u32`).
+fn octal_mode(text: &str, suffix: &str) -> Result<u32, String> {
+    let digits = text.strip_suffix(suffix).unwrap_or(text);
+    let Some(octal) = digits.strip_prefix("0o") else {
+        return Err(format!(
+            "file modes are octal: write `0o{digits}` (decimal {digits} is a different mode)"
+        ));
+    };
+    let bits = u32::from_str_radix(&octal.replace('_', ""), 8)
+        .map_err(|e| format!("invalid octal mode `{text}`: {e}"))?;
+    if bits > 0o7777 {
+        return Err(format!("mode `{text}` has bits outside 0o7777"));
+    }
+    Ok(bits)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::linkable_lib;
+    use super::{linkable_lib, octal_mode};
+
+    #[test]
+    fn mode_literals_must_be_octal_and_in_range() {
+        assert_eq!(octal_mode("0o644", ""), Ok(0o644));
+        assert_eq!(octal_mode("0o4_755", ""), Ok(0o4755));
+        assert_eq!(octal_mode("0o600u32", "u32"), Ok(0o600));
+
+        let decimal = octal_mode("644", "").unwrap_err();
+        assert!(decimal.contains("`0o644`"), "{decimal}");
+        assert!(octal_mode("0x1a4", "").is_err());
+        assert!(octal_mode("0b110", "").is_err());
+        let range = octal_mode("0o17777", "").unwrap_err();
+        assert!(
+            range.contains("0o7777") && !range.contains("decimal"),
+            "{range}"
+        );
+    }
 
     const PACKAGE: &str = "[package]\nname = \"home-infra\"\n";
 

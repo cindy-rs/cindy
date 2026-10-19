@@ -144,13 +144,9 @@ mod scenarios {
     use super::*;
     use cindy::builtin::{self, command, fetch, path};
 
-    fn mode(bits: u32) -> cindy::Result<path::Mode> {
-        path::Mode::try_from(bits)
-    }
-
     async fn work_dir(vars: &Vars) -> cindy::Result<()> {
         let (user, group) = builtin::current_owner_names();
-        path::directory(vars.work_dir.clone(), &user, &group, mode(0o755)?).await?;
+        path::directory(vars.work_dir.clone(), &user, &group, cindy::mode!(0o755)).await?;
         Ok(())
     }
 
@@ -313,7 +309,7 @@ mod scenarios {
             url: vars.fetch_url.clone(),
             dest: good.clone(),
             checksum: sha256(),
-            mode: Some(mode(0o644)?),
+            mode: Some(cindy::mode!(0o644)),
             ..Default::default()
         });
         if !fetched.await?.changed() {
@@ -368,7 +364,7 @@ mod scenarios {
             url: "http://127.0.0.1:1/unreachable".into(),
             dest: good.clone(),
             checksum: sha256(),
-            mode: Some(mode(0o644)?),
+            mode: Some(cindy::mode!(0o644)),
             ..Default::default()
         });
         if !repaired.await?.changed() {
@@ -390,7 +386,7 @@ mod scenarios {
             b"must not exist after the run".to_vec(),
             &user,
             &group,
-            mode(0o644)?,
+            cindy::mode!(0o644),
         );
         if !file.await?.changed() {
             cindy::bail!("path::file reported Unchanged for a missing file under --check");
@@ -443,7 +439,7 @@ mod scenarios {
             "hello from cindy\n".as_bytes(),
             &user,
             &group,
-            mode(0o644)?,
+            cindy::mode!(0o644),
         )
         .await?;
         path::link(work.join("greeting.link"), greeting.clone(), &user, &group).await?;
@@ -469,7 +465,7 @@ mod scenarios {
             url: vars.fetch_url.clone(),
             dest: downloaded.clone(),
             checksum: Some(fetch::Checksum::Sha256(vars.fetch_sha256.clone())),
-            mode: Some(mode(0o644)?),
+            mode: Some(cindy::mode!(0o644)),
             ..Default::default()
         })
         .await?;
@@ -479,7 +475,7 @@ mod scenarios {
             sources: vec![greeting.clone()],
             dest: tarball.clone(),
             format: None,
-            mode: Some(mode(0o644)?),
+            mode: Some(cindy::mode!(0o644)),
         })
         .await?;
         let extract_dir = work.join("extracted");
@@ -504,7 +500,7 @@ mod scenarios {
             serde_json::to_vec_pretty(&report)?,
             &user,
             &group,
-            mode(0o644)?,
+            cindy::mode!(0o644),
         )
         .await?;
         Ok(())

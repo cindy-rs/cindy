@@ -57,7 +57,7 @@ async fn main(host: cindy::Host<Vars>) -> cindy::Result<()> {
         markers.clone(),
         user.clone(),
         group.clone(),
-        builtin::path::Mode::try_from(0o755)?,
+        cindy::mode!(0o755),
     )
     .await?;
     builtin::path::file(
@@ -65,7 +65,7 @@ async fn main(host: cindy::Host<Vars>) -> cindy::Result<()> {
         format!("managed by cindy for {}", host.name),
         user,
         group,
-        builtin::path::Mode::try_from(0o644)?,
+        cindy::mode!(0o644),
     )
     .await?;
 

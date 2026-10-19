@@ -112,7 +112,7 @@ mod scenarios {
              [Install]\nWantedBy=multi-user.target\n",
             "root",
             "root",
-            path::Mode::try_from(0o644)?,
+            cindy::mode!(0o644),
         )
         .await?;
         systemd::daemon_reload().await?;

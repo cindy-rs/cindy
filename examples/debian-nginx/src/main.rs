@@ -54,7 +54,7 @@ async fn main(host: cindy::Host<Vars>) -> cindy::Result<()> {
                 nginx_config,
                 "root",
                 "root",
-                path::Mode::try_from(0o644)?,
+                cindy::mode!(0o644),
             )
             .await?;
 
