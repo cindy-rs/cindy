@@ -16,4 +16,7 @@ path = "src/lib.rs"
 # working directory and must find the fixture, not the monorepo.
 
 [dev-dependencies]
-tempfile = "3.27"
+base64.workspace = true
+cindy.workspace = true
+postcard = { workspace = true, features = ["alloc"] }
+tempfile.workspace = true

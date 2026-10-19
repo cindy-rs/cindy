@@ -225,23 +225,16 @@ fn write_vault_key_overwrite(
     Ok(())
 }
 
-/// `persist`, with the file's bytes and the rename both made durable.
-///
-/// A plain `persist` can publish a rename whose data hasn't reached the
-/// platter: after a power cut the key file exists and is empty or
-/// partial. For an ordinary file that means "redeploy it"; for a vault
-/// key it can mean every blob sealed under it is gone — and a completed
-/// `rotate` has already destroyed `.previous`, so there is nothing to
-/// recover from. `path::stage_stream` takes the same care for far less
-/// valuable bytes.
+/// `persist`, with the bytes and the rename both durable. A plain
+/// `persist` can leave an empty file after a power cut — for a key, or
+/// a source file just re-sealed onto a new key, after `rotate` already
+/// destroyed the old one, that is every secret it held.
 fn persist_durably(tmp: tempfile::NamedTempFile, path: &Path) -> eyre::Result<()> {
-    tmp.as_file().sync_all().with_context(|| {
-        format!(
-            "Flushing the key bytes before installing them at {}",
-            path.display()
-        )
-    })?;
-    tmp.persist(path)?;
+    tmp.as_file()
+        .sync_all()
+        .with_context(|| format!("Flushing {} before installing it", path.display()))?;
+    tmp.persist(path)
+        .with_context(|| format!("Replacing {}", path.display()))?;
     // The rename itself, so the directory entry survives too.
     let dir = path.parent().filter(|p| !p.as_os_str().is_empty());
     let dir = dir.unwrap_or_else(|| Path::new("."));
@@ -271,6 +264,31 @@ fn persist_durably(tmp: tempfile::NamedTempFile, path: &Path) -> eyre::Result<()
 /// per-file rewrites are write-to-temp + rename, so a crash leaves
 /// whole files on the old or new key — never half a ciphertext.
 fn vault_rotate(vault: &str) -> eyre::Result<()> {
+    // Collected before any key moves: the old key is destroyed at the
+    // end, so a site this pass can't see would be lost for good.
+    let (workspace_root, cindy_names) = workspace_and_names()?;
+    let files = walk_rs_files(&workspace_root);
+    let mut per_file = Vec::new();
+    for file in &files {
+        let collected = collect_sealed_sites(file)?;
+        if collected.might_hide(vault) {
+            let why = match &collected.untokenisable {
+                Some(e) => format!("doesn't tokenise as Rust ({e}) and mentions a `{vault}` sealed secret"),
+                None => "has a `sealed_b64` call the rewriter can't read — a spelling other than \
+                         `Secret::sealed_b64(\"vault\", \"…\")`, or a vault that isn't a string literal"
+                    .to_owned(),
+            };
+            eyre::bail!(
+                "{} {why}; rotating would destroy the only key that opens it. Nothing was \
+                 changed — fix the file, then re-run `cindy secret vault rotate {vault}`.",
+                file.display(),
+            );
+        }
+        if collected.sites.iter().any(|s| s.vault == vault) {
+            per_file.push(collected);
+        }
+    }
+
     let live = keychain::vault_key_path(vault).map_err(|e| eyre::eyre!("{e:#}"))?;
     let previous = previous_key_path(vault)?;
 
@@ -312,17 +330,6 @@ fn vault_rotate(vault: &str) -> eyre::Result<()> {
         );
     }
 
-    // --- collect this vault's sealed sites --------------------------
-    let (workspace_root, cindy_names) = workspace_and_names()?;
-    let files = walk_rs_files(&workspace_root);
-    let mut per_file = Vec::new();
-    for file in &files {
-        let collected = collect_sealed_sites(file)?;
-        if collected.sites.iter().any(|s| s.vault == vault) {
-            per_file.push(collected);
-        }
-    }
-
     // --- re-seal pass: converge every site onto the current key -----
     let mut affected = Vec::new();
     let mut converged = 0usize;
@@ -346,6 +353,13 @@ fn vault_rotate(vault: &str) -> eyre::Result<()> {
     let mut verified = 0usize;
     for file in &files {
         let fs = collect_sealed_sites(file)?;
+        if fs.might_hide(vault) {
+            eyre::bail!(
+                "{} has an unreadable `{vault}` site after rotation; the previous key is kept at {}",
+                file.display(),
+                previous.display()
+            );
+        }
         for site in &fs.sites {
             if site.vault != vault {
                 continue;
@@ -417,6 +431,7 @@ fn rotate_sites(
         path,
         original,
         sites,
+        ..
     } = fs;
 
     let mut planned: Vec<(usize, usize, String)> = Vec::new();
@@ -506,7 +521,8 @@ impl CindyNames {
                     .dependencies
                     .iter()
                     .find(|d| d.name == "cindy")
-                    .and_then(|d| d.rename.clone())
+                    // A rename is a Cargo.toml key; in paths `-` is `_`.
+                    .and_then(|d| d.rename.as_ref().map(|r| r.replace('-', "_")))
                     .unwrap_or_else(|| "cindy".to_owned());
                 Some((root, name))
             })
@@ -715,6 +731,14 @@ fn unseal_all(all: bool) -> eyre::Result<()> {
     let mut per_file: Vec<FileSites> = Vec::new();
     for file in &files {
         let collected = collect_sealed_sites(file)?;
+        // One stray fixture with a syntax error mustn't block unseal for
+        // the whole workspace; unseal destroys nothing.
+        if let Some(e) = &collected.untokenisable {
+            tracing::warn!(
+                "Skipping {}: doesn't tokenise as Rust ({e})",
+                file.display()
+            );
+        }
         if !collected.sites.is_empty() {
             per_file.push(collected);
         }
@@ -794,6 +818,32 @@ struct FileSites {
     path: PathBuf,
     original: String,
     sites: Vec<SealedSite>,
+    /// The tokeniser's error, when the file isn't valid Rust: `sites` is
+    /// then empty because nothing could be looked for, not because
+    /// nothing is there.
+    untokenisable: Option<String>,
+    /// Every `sealed_b64(..)` call, however spelled, by its vault
+    /// literal (`None`: not a literal). More than `sites` holds means
+    /// a spelling the rewriter doesn't recognise.
+    calls: Vec<Option<String>>,
+}
+
+impl FileSites {
+    /// Could this file hold a `vault` site that `sites` misses? Rotation
+    /// destroys the old key, so it must not go ahead past one.
+    fn might_hide(&self, vault: &str) -> bool {
+        if self.untokenisable.is_some() {
+            return self.original.contains("sealed_b64")
+                && self.original.contains(&format!("{vault:?}"));
+        }
+        let seen = self.sites.iter().filter(|s| s.vault == vault).count();
+        let named = self
+            .calls
+            .iter()
+            .filter(|v| v.as_deref() == Some(vault))
+            .count();
+        named > seen || self.calls.iter().any(Option::is_none)
+    }
 }
 
 fn collect_sealed_sites(path: &Path) -> eyre::Result<FileSites> {
@@ -801,22 +851,15 @@ fn collect_sealed_sites(path: &Path) -> eyre::Result<FileSites> {
         .with_context(|| format!("Reading source file {}", path.display()))?;
     let line_starts = compute_line_starts(&original);
 
-    // A file that doesn't tokenize can't hold a sealed call worth
-    // finding, and a single stray fixture with a syntax error must not
-    // make `cindy secret unseal` impossible for the whole workspace.
-    // Warn and skip; read failures stay hard errors.
     let tokens: proc_macro2::TokenStream = match original.parse() {
         Ok(tokens) => tokens,
         Err(e) => {
-            tracing::warn!(
-                "Skipping {}: doesn't tokenise as Rust ({e}), so it can't hold a \
-                 `Secret::sealed_b64` call",
-                path.display()
-            );
             return Ok(FileSites {
                 path: path.to_owned(),
                 original,
                 sites: Vec::new(),
+                untokenisable: Some(e.to_string()),
+                calls: Vec::new(),
             });
         }
     };
@@ -824,10 +867,14 @@ fn collect_sealed_sites(path: &Path) -> eyre::Result<FileSites> {
     let mut sites: Vec<SealedSite> = Vec::new();
     find_sealed_calls(&tokens, &original, &line_starts, &mut sites)
         .with_context(|| format!("Locating `Secret::sealed_b64` calls in {}", path.display()))?;
+    let mut calls = Vec::new();
+    count_sealed_calls(&tokens, &mut calls);
     Ok(FileSites {
         path: path.to_owned(),
         original,
         sites,
+        untokenisable: None,
+        calls,
     })
 }
 
@@ -836,6 +883,7 @@ fn unseal_sites(fs: &FileSites, cindy_name: &str) -> eyre::Result<usize> {
         path,
         original,
         sites,
+        ..
     } = fs;
 
     let mut planned: Vec<(usize, usize, String)> = Vec::new();
@@ -934,16 +982,44 @@ mod keep_indices_tests {
 mod site_snippet_tests {
     use super::{SealedSite, collect_sealed_sites, site_snippet};
 
-    /// A file with a syntax error anywhere makes `unseal` skip it with
-    /// a warning instead of failing the whole workspace walk.
     #[test]
-    fn untokenisable_file_is_skipped_not_fatal() {
+    fn an_untokenisable_file_is_reported_not_fatal() {
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("broken.rs");
         std::fs::write(&file, "fn broken( { this is not rust").unwrap();
 
         let collected = collect_sealed_sites(&file).unwrap();
         assert!(collected.sites.is_empty());
+        assert!(collected.untokenisable.is_some());
+        assert!(!collected.might_hide("prod"), "no sealed call in it");
+
+        std::fs::write(&file, "fn broken( { Secret::sealed_b64(\"prod\", \"AAAA\")").unwrap();
+        let collected = collect_sealed_sites(&file).unwrap();
+        assert!(collected.might_hide("prod"));
+        assert!(!collected.might_hide("staging"), "a different vault");
+    }
+
+    #[test]
+    fn spellings_the_rewriter_misses_are_counted_as_calls() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("spellings.rs");
+        let scan = |src: &str| {
+            std::fs::write(&file, src).unwrap();
+            collect_sealed_sites(&file).unwrap()
+        };
+
+        let plain = scan("fn f() { ::cindy::Secret::sealed_b64(\"prod\", \"AAAA\"); }");
+        assert_eq!(plain.sites.len(), 1);
+        assert!(!plain.might_hide("prod"));
+
+        for hidden in [
+            "fn f() { ::cindy::Secret::<String>::sealed_b64(\"prod\", \"AAAA\"); }",
+            "fn f() { S::sealed_b64(\"prod\", \"AAAA\"); }",
+            "fn f() { Secret::sealed_b64(VAULT, \"AAAA\"); }",
+        ] {
+            assert!(scan(hidden).might_hide("prod"), "{hidden}");
+        }
+        assert!(!scan("pub fn sealed_b64(vault: &str, b64: &str) {}").might_hide("prod"));
     }
 
     fn site(byte_start: usize, byte_end: usize) -> SealedSite {
@@ -1037,6 +1113,28 @@ mod seal_unseal_roundtrip_tests {
             std::fs::read_to_string(&file).unwrap(),
             format!("::cindy::secret!(\"rt-vault-x7\", {source_tokens});\n"),
         );
+    }
+
+    /// `my-infra = { package = "cindy" }` is `::my_infra::` in paths.
+    #[test]
+    fn a_hyphenated_rename_becomes_its_path_form() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path();
+        std::fs::write(
+            ws.join("Cargo.toml"),
+            "[package]\nname = \"playbook\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n\
+             [dependencies]\nmy-infra = { version = \"0.4\", package = \"cindy\" }\n",
+        )
+        .unwrap();
+        std::fs::create_dir(ws.join("src")).unwrap();
+        std::fs::write(ws.join("src/main.rs"), "fn main() {}\n").unwrap();
+        let meta = cargo_metadata::MetadataCommand::new()
+            .no_deps()
+            .current_dir(ws)
+            .exec()
+            .unwrap();
+        let names = CindyNames::collect(&meta);
+        assert_eq!(names.for_file(&ws.join("src/main.rs")), "my_infra");
     }
 
     /// The done-when for the rename fix: against a real workspace whose
@@ -1368,8 +1466,8 @@ fn apply_planned_replacements(
         if let Ok(meta) = std::fs::metadata(path) {
             let _ = tmp.as_file().set_permissions(meta.permissions());
         }
-        tmp.persist(path)
-            .with_context(|| format!("Replacing {}", path.display()))?;
+        // Durable: rotate deletes the old key right after these rewrites.
+        persist_durably(tmp, path)?;
     }
     Ok(())
 }
@@ -1665,6 +1763,39 @@ fn find_sealed_calls(
         i += 1;
     }
     Ok(())
+}
+
+/// Every `sealed_b64(..)` call whatever its path — `Secret::<T>::`, an
+/// alias, a `use … as` — with its vault if that is a string literal.
+/// The definition itself (`fn sealed_b64(..)`) isn't a call.
+fn count_sealed_calls(stream: &proc_macro2::TokenStream, out: &mut Vec<Option<String>>) {
+    use proc_macro2::{Delimiter, TokenTree};
+
+    let trees: Vec<TokenTree> = stream.clone().into_iter().collect();
+    for (i, tree) in trees.iter().enumerate() {
+        match tree {
+            TokenTree::Ident(ident)
+                if ident == "sealed_b64"
+                    && !matches!(i.checked_sub(1).map(|p| &trees[p]), Some(TokenTree::Ident(f)) if f == "fn") =>
+            {
+                if let Some(TokenTree::Group(args)) = trees.get(i + 1)
+                    && args.delimiter() == Delimiter::Parenthesis
+                {
+                    let vault = match args.stream().into_iter().next() {
+                        Some(TokenTree::Literal(lit)) => {
+                            syn::parse_str::<syn::LitStr>(&lit.to_string())
+                                .ok()
+                                .map(|l| l.value())
+                        }
+                        _ => None,
+                    };
+                    out.push(vault);
+                }
+            }
+            TokenTree::Group(group) => count_sealed_calls(&group.stream(), out),
+            _ => {}
+        }
+    }
 }
 
 /// Parse `("vault-literal", "ciphertext-literal")` out of a token

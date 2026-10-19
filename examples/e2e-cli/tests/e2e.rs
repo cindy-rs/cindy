@@ -233,3 +233,131 @@ fn check_mode_applies_nothing() {
         );
     }
 }
+
+/// A throwaway workspace (no dependencies, so `cargo metadata` needs no
+/// network) holding one sealed site of vault `rot` under a fresh key,
+/// spelled `prefix sealed_b64(..)`.
+fn rotation_workspace(prefix: &str) -> (TempDir, Vec<u8>) {
+    use base64::Engine as _;
+
+    let ws = TempDir::new().expect("workspace tempdir");
+    std::fs::write(
+        ws.path().join("Cargo.toml"),
+        "[package]\nname = \"rotation\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+    )
+    .unwrap();
+    std::fs::create_dir(ws.path().join("src")).unwrap();
+    std::fs::write(ws.path().join("src/main.rs"), "fn main() {}\n").unwrap();
+    let created = Command::new(cindy_bin())
+        .args(["secret", "vault", "create", "rot"])
+        .current_dir(ws.path())
+        .output()
+        .unwrap();
+    assert!(
+        created.status.success(),
+        "{}",
+        String::from_utf8_lossy(&created.stderr)
+    );
+
+    let key = std::fs::read(ws.path().join("keys/rot.key")).unwrap();
+    let vault_key = cindy::secret::crypto::VaultKey::new(key.clone().try_into().unwrap());
+    let payload = cindy::secret::SealedPayload {
+        value: postcard::to_allocvec("hello").unwrap(),
+        source: "\"hello\"".to_owned(),
+    };
+    let blob =
+        cindy::secret::crypto::seal(&vault_key, &postcard::to_allocvec(&payload).unwrap()).unwrap();
+    let b64 = base64::engine::general_purpose::STANDARD.encode(blob);
+    std::fs::write(
+        ws.path().join("src/main.rs"),
+        format!("fn main() {{\n    let _ = {prefix}sealed_b64(\"rot\", \"{b64}\");\n}}\n"),
+    )
+    .unwrap();
+    (ws, key)
+}
+
+fn rotate(ws: &TempDir) -> (bool, String) {
+    let out = Command::new(cindy_bin())
+        .args(["secret", "vault", "rotate", "rot"])
+        .current_dir(ws.path())
+        .output()
+        .unwrap();
+    (
+        out.status.success(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    )
+}
+
+#[test]
+fn rotate_reseals_onto_a_new_key_and_destroys_the_old() {
+    use base64::Engine as _;
+
+    let (ws, old_key) = rotation_workspace("::cindy::Secret::");
+    let (ok, stderr) = rotate(&ws);
+    assert!(ok, "rotate failed: {stderr}");
+
+    let new_key = std::fs::read(ws.path().join("keys/rot.key")).unwrap();
+    assert_ne!(new_key, old_key, "the key didn't change");
+    assert!(
+        !ws.path().join("keys/rot.key.previous").exists(),
+        "the old key survived"
+    );
+
+    let source = std::fs::read_to_string(ws.path().join("src/main.rs")).unwrap();
+    let b64 = source.split('"').nth(3).expect("a sealed_b64 call");
+    let blob = base64::engine::general_purpose::STANDARD
+        .decode(b64)
+        .unwrap();
+    let new_key = cindy::secret::crypto::VaultKey::new(new_key.try_into().unwrap());
+    let plaintext =
+        cindy::secret::crypto::unseal(&new_key, &blob).expect("site isn't on the new key");
+    let payload: cindy::secret::SealedPayload = postcard::from_bytes(&plaintext).unwrap();
+    assert_eq!(
+        postcard::from_bytes::<String>(&payload.value).unwrap(),
+        "hello"
+    );
+}
+
+/// A file the scanner can't tokenise might hold a site of the vault;
+/// destroying the old key would lose it, so rotate refuses up front.
+#[test]
+fn rotate_refuses_while_an_unparseable_file_mentions_the_vault() {
+    let (ws, old_key) = rotation_workspace("::cindy::Secret::");
+    std::fs::write(
+        ws.path().join("src/broken.rs"),
+        "fn broken( { ::cindy::Secret::<String>::sealed_b64(\"rot\", \"AAAA\")",
+    )
+    .unwrap();
+
+    let (ok, stderr) = rotate(&ws);
+    assert!(!ok, "rotate went ahead past an unparseable file");
+    assert!(
+        stderr.contains("broken.rs") && stderr.contains("doesn't tokenise"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("Nothing was changed"), "{stderr}");
+    assert_eq!(
+        std::fs::read(ws.path().join("keys/rot.key")).unwrap(),
+        old_key
+    );
+    assert!(!ws.path().join("keys/rot.key.previous").exists());
+}
+
+/// The rewriter only recognises `Secret::sealed_b64("vault", "…")`. A
+/// site spelled otherwise used to be skipped, and rotation then
+/// destroyed the only key that opened it.
+#[test]
+fn rotate_refuses_a_site_spelling_it_cannot_rewrite() {
+    let (ws, old_key) = rotation_workspace("::cindy::Secret::<String>::");
+    let (ok, stderr) = rotate(&ws);
+    assert!(!ok, "rotate went ahead past a site it can't rewrite");
+    assert!(
+        stderr.contains("main.rs") && stderr.contains("can't read"),
+        "{stderr}"
+    );
+    assert_eq!(
+        std::fs::read(ws.path().join("keys/rot.key")).unwrap(),
+        old_key
+    );
+    assert!(!ws.path().join("keys/rot.key.previous").exists());
+}
