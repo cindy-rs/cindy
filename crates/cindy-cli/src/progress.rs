@@ -41,10 +41,39 @@ const LIST_PCT: u16 = 30;
 /// Advanced by the render tick, so a busy host visibly *moves*.
 const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
-/// Per-host retained output lines. A chatty host streaming for hours
-/// would otherwise grow the pane (and its per-frame re-render) without
-/// bound; the oldest lines are evicted past this point.
+/// Lines a pane keeps: a chatty host streaming for hours would
+/// otherwise grow it, and its per-frame re-render, without bound.
 const MAX_LINES: usize = 10_000;
+
+/// The newest [`MAX_LINES`] items, and how many older ones were
+/// evicted, so a pane's count stays truthful.
+struct Capped<T> {
+    items: std::collections::VecDeque<T>,
+    dropped: usize,
+}
+
+impl<T> Default for Capped<T> {
+    fn default() -> Self {
+        Self {
+            items: std::collections::VecDeque::new(),
+            dropped: 0,
+        }
+    }
+}
+
+impl<T> Capped<T> {
+    fn push(&mut self, item: T) {
+        if self.items.len() == MAX_LINES {
+            self.items.pop_front();
+            self.dropped += 1;
+        }
+        self.items.push_back(item);
+    }
+
+    fn total(&self) -> usize {
+        self.dropped + self.items.len()
+    }
+}
 
 /// Compact human-readable duration: `9.3s` under a minute, `4m07s` beyond.
 fn fmt_duration(d: std::time::Duration) -> String {
@@ -59,32 +88,10 @@ fn fmt_duration(d: std::time::Duration) -> String {
 /// Shared sink for the CLI's own `tracing` output so it can be shown in a
 /// pane instead of corrupting the alternate screen. Lines accumulate here;
 /// the TUI reads them each frame.
-static LOG: OnceLock<Mutex<LogBuffer>> = OnceLock::new();
+static LOG: OnceLock<Mutex<Capped<String>>> = OnceLock::new();
 
-/// The retained log lines plus how many were evicted past
-/// [`MAX_LINES`] — the same cap and eviction policy as the host panes,
-/// for the same reason: a chatty process streaming for hours must not
-/// grow the pane (and its per-frame re-render) without bound. The
-/// dropped count keeps the pane title truthful about what was lost.
-#[derive(Default)]
-struct LogBuffer {
-    lines: Vec<String>,
-    dropped: usize,
-}
-
-impl LogBuffer {
-    fn push(&mut self, line: String) {
-        self.lines.push(line);
-        let excess = self.lines.len().saturating_sub(MAX_LINES);
-        if excess > 0 {
-            self.lines.drain(..excess);
-            self.dropped += excess;
-        }
-    }
-}
-
-fn log_buffer() -> &'static Mutex<LogBuffer> {
-    LOG.get_or_init(|| Mutex::new(LogBuffer::default()))
+fn log_buffer() -> &'static Mutex<Capped<String>> {
+    LOG.get_or_init(Mutex::default)
 }
 
 /// A `tracing_subscriber` writer that appends formatted log lines to the
@@ -173,10 +180,7 @@ struct Host {
     name: String,
     tags: Vec<String>,
     status: Status,
-    lines: Vec<(Source, String)>,
-    /// Lines evicted from `lines` once it hit [`MAX_LINES`]; the output
-    /// title reports `dropped + lines.len()` so the count stays truthful.
-    dropped: usize,
+    lines: Capped<(Source, String)>,
     /// When the host appeared in the view (its deployment started).
     started: std::time::Instant,
     /// Total runtime, frozen at the moment a terminal status arrived.
@@ -200,11 +204,6 @@ impl Host {
 
     fn push_line(&mut self, src: Source, line: String) {
         self.lines.push((src, line));
-        let excess = self.lines.len().saturating_sub(MAX_LINES);
-        if excess > 0 {
-            self.lines.drain(..excess);
-            self.dropped += excess;
-        }
     }
 }
 
@@ -264,8 +263,7 @@ fn add_host(hosts: &mut Vec<Host>, name: String, tags: Vec<String>) {
         name,
         tags,
         status: Status::Running,
-        lines: Vec::new(),
-        dropped: 0,
+        lines: Capped::default(),
         started: std::time::Instant::now(),
         elapsed: None,
     });
@@ -646,8 +644,8 @@ fn draw_log(f: &mut ratatui::Frame, area: Rect) {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let view = area.height.saturating_sub(2);
-    let start = buf.lines.len().saturating_sub(view as usize);
-    let body: Vec<Line> = buf.lines[start..].iter().map(|l| ansi_line(l)).collect();
+    let start = buf.items.len().saturating_sub(view as usize);
+    let body: Vec<Line> = buf.items.range(start..).map(|l| ansi_line(l)).collect();
     let title = if buf.dropped > 0 {
         format!(" cli log · {} lines dropped ", buf.dropped)
     } else {
@@ -761,6 +759,7 @@ fn draw_output(
     let body: Vec<Line> = match host {
         Some(h) => h
             .lines
+            .items
             .iter()
             .map(|(src, l)| source_line(*src, l))
             .collect(),
@@ -795,7 +794,7 @@ fn draw_output(
             let mut spans = vec![
                 Span::raw(" "),
                 Span::styled(format!("{glyph} "), Style::default().fg(h.status.color())),
-                Span::raw(format!("{} · {} lines", h.name, h.dropped + h.lines.len())),
+                Span::raw(format!("{} · {} lines", h.name, h.lines.total())),
             ];
             if scroll.vert > 0 {
                 spans.push(Span::styled(
@@ -850,14 +849,14 @@ mod tests {
         let buf = log_buffer()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        assert_eq!(buf.lines.len(), MAX_LINES);
+        assert_eq!(buf.items.len(), MAX_LINES);
         assert!(buf.dropped >= 500);
         // The newest content survived; the oldest was evicted.
         assert_eq!(
-            buf.lines.last().unwrap(),
+            buf.items.back().unwrap(),
             &format!("line {}", MAX_LINES + 499)
         );
-        assert!(buf.lines[0].starts_with("line "));
+        assert!(buf.items[0].starts_with("line "));
     }
 
     fn host(name: &str, status: Status) -> Host {
@@ -865,11 +864,11 @@ mod tests {
             name: name.into(),
             tags: vec!["env:test".into()],
             status: Status::Running,
-            lines: vec![(Source::Worker, "hello".into())],
-            dropped: 0,
+            lines: Capped::default(),
             started: std::time::Instant::now(),
             elapsed: None,
         };
+        h.push_line(Source::Worker, "hello".into());
         h.set_status(status);
         h
     }
@@ -949,13 +948,13 @@ mod tests {
     #[test]
     fn output_history_is_capped_but_count_stays_truthful() {
         let mut h = host("chatty", Status::Running);
-        h.lines.clear();
+        h.lines = Capped::default();
         for i in 0..(MAX_LINES + 500) {
             h.push_line(Source::Worker, format!("line {i}"));
         }
-        assert_eq!(h.lines.len(), MAX_LINES);
-        assert_eq!(h.dropped, 500);
-        assert_eq!(h.lines[0].1, "line 500");
+        assert_eq!(h.lines.items.len(), MAX_LINES);
+        assert_eq!(h.lines.dropped, 500);
+        assert_eq!(h.lines.items[0].1, "line 500");
         let screen = render(&[h]);
         assert!(
             screen.contains(&format!("chatty · {} lines", MAX_LINES + 500)),

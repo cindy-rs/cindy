@@ -140,16 +140,9 @@ async fn forward_stderr(
 /// Non-fatal by design: an unreachable or keyscan-less host fails at
 /// the real connect with the real error.
 async fn log_tofu_fingerprints(target: &str) {
-    // `target` may carry `user@` and `:port`; keygen matches on the
-    // bare host ssh itself uses, keyscan takes `-p` for the port.
-    let rest = target.split_once('@').map_or(target, |(_, rest)| rest);
-    let (host, port) = match rest.rsplit_once(':') {
-        Some((host, port)) if port.chars().all(|c| c.is_ascii_digit()) => (host, port),
-        _ => (rest, "22"),
-    };
-
+    let (host, port) = split_ssh_target(target);
     let already_known = tokio::process::Command::new("ssh-keygen")
-        .args(["-F", host])
+        .args(["-F", &known_hosts_name(host, port)])
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
@@ -183,6 +176,27 @@ async fn log_tofu_fingerprints(target: &str) {
                  is a first connection"
             );
         }
+    }
+}
+
+/// `[user@]host[:port]` → `(host, port)`.
+fn split_ssh_target(target: &str) -> (&str, &str) {
+    let rest = target.split_once('@').map_or(target, |(_, rest)| rest);
+    match rest.rsplit_once(':') {
+        Some((host, port)) if !port.is_empty() && port.chars().all(|c| c.is_ascii_digit()) => {
+            (host, port)
+        }
+        _ => (rest, "22"),
+    }
+}
+
+/// How ssh records a host in known_hosts: bare on port 22, else
+/// `[host]:port`.
+fn known_hosts_name(host: &str, port: &str) -> String {
+    if port == "22" {
+        host.to_owned()
+    } else {
+        format!("[{host}]:{port}")
     }
 }
 
@@ -1427,6 +1441,20 @@ async fn finish_worker_build(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn known_hosts_names_follow_sshs_port_convention() {
+        use super::{known_hosts_name, split_ssh_target};
+        for (target, want) in [
+            ("router", "router"),
+            ("admin@router", "router"),
+            ("router:22", "router"),
+            ("admin@router:2222", "[router]:2222"),
+        ] {
+            let (host, port) = split_ssh_target(target);
+            assert_eq!(known_hosts_name(host, port), want, "{target}");
+        }
+    }
+
     #[test]
     fn cindy_versions_match_within_a_release_line_only() {
         let v = |s: &str| s.parse::<cargo_metadata::semver::Version>().unwrap();
