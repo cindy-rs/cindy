@@ -1,6 +1,6 @@
 [package]
 name = "e2e-containers"
-description = "End-to-end container example/test exercising the mutating builtins (systemd, apt, user, group) against a real Debian system under podman."
+description = "End-to-end test of the mutating builtins (systemd, apt, user, group) against a real Debian-systemd container."
 publish = false
 version.workspace = true
 rust-version.workspace = true
@@ -12,28 +12,24 @@ name = "e2e-containers"
 path = "src/main.rs"
 
 [features]
-# Same dual-feature shape as examples/e2e-localhost: the harness builds
-# this crate once with each feature and cross-pipes the two resulting
-# processes — the worker half running inside the container via
-# `podman exec`, where the mutating builtins finally meet a real
-# systemd, shadow-utils and apt instead of unit tests over pure
-# helpers.
+# As examples/e2e-localhost: the harness builds each half and pipes them
+# together, with the worker inside the container.
 default = ["orchestrator", "remote"]
-orchestrator = ["cindy/orchestrator"]
+orchestrator = ["cindy/orchestrator", "dep:futures-util"]
 remote = ["cindy/remote"]
 
 [dependencies]
 cindy = { workspace = true }
-futures-util = "0.3"
+futures-util = { workspace = true, optional = true }
 serde_json = { workspace = true }
 
 [dev-dependencies]
 serde_json = { workspace = true }
-tempfile = "3.27"
+tempfile.workspace = true
 testcontainers = "0.28"
 # The same version testcontainers 0.28 already depends on, so this adds
 # no new tree — only direct access to the exec-with-stdin it doesn't
 # expose.
 bollard = "0.21"
-futures-util = "0.3"
+futures-util.workspace = true
 tokio = { workspace = true, features = ["macros", "rt"] }

@@ -1,31 +1,14 @@
-//! Container e2e harness: drives the same orchestrator/worker pipe
-//! pair as `examples/e2e-localhost`, except the worker runs **inside**
-//! a Debian-systemd container — which is what puts the mutating
-//! builtins (systemd, apt, user, group) in front of a real system.
+//! The e2e-localhost pipe pair, with the worker inside a Debian-systemd
+//! container — the mutating builtins against a real system.
 //!
-//! These tests are **required, not optional**: an unusable harness
-//! fails the suite, naming what's missing. A silently-skipped container
-//! test is indistinguishable from a passing one in default `cargo test`
-//! output (libtest captures the reason), so a broken harness — image
-//! gone, socket moved, engine absent — would take the whole of this
-//! coverage with it and still read as green. Set
-//! `CINDY_E2E_CONTAINERS=skip` to opt out deliberately, on a machine
-//! where that's the right trade.
+//! Required: an unusable harness fails the suite, naming what's
+//! missing, because libtest hides a skip's reason and a skipped suite
+//! reads as green. `CINDY_E2E_CONTAINERS=skip` opts out deliberately.
 //!
-//! **No container CLI is involved**, and so nothing here has to know
-//! or care whether the engine is podman or docker: both serve the same
-//! Docker API, and everything talks to whatever `DOCKER_HOST` points
-//! at.
-//!
-//! Building the image, starting the container, copying the worker in
-//! and staging it per play all go through the testcontainers crate.
-//! Running the worker goes one layer below it, to the `bollard` client
-//! testcontainers is built on: the RPC channel needs a bidirectional
-//! pipe, and testcontainers' own `exec` surfaces stdout/stderr only
-//! (`ExecResult` has no stdin writer — see `core/client.rs`, "We only
-//! interested in stdout and stderr"), whereas bollard's
-//! `StartExecResults::Attached { input, output }` is exactly that pipe.
-//! Same socket, same container, one level down.
+//! No container CLI, so podman or docker doesn't matter: testcontainers
+//! builds the image, starts the container and stages the worker, and
+//! its client, bollard, runs the worker — testcontainers' own `exec` has
+//! no stdin, and the RPC channel needs one.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -41,8 +24,7 @@ use testcontainers::{
     runners::{AsyncBuilder as _, AsyncRunner as _},
 };
 
-/// Locally-built image name (see `Containerfile.systemd` in this
-/// crate), without a registry prefix.
+/// Built from `Containerfile.systemd`.
 const IMAGE_NAME: &str = "cindy-e2e-systemd";
 const TAG: &str = "latest";
 
@@ -51,22 +33,10 @@ const MASTER_WORKER: &str = "/worker/e2e-worker.orig";
 /// Per-play copy, consumed by the worker unlinking itself.
 const STAGED_WORKER: &str = "/worker/e2e-worker";
 
-/// Settle which engine socket bollard will use, so the container and
-/// the worker's exec land on the same one.
-///
-/// There is no container CLI in this harness — bollard's attached exec
-/// covers the one thing testcontainers' own `exec` can't — so there is
-/// nothing to choose between podman and docker: both serve the same
-/// Docker API, and `DOCKER_HOST` is the whole story.
-///
-/// 1. An explicit `DOCKER_HOST` is trusted as-is.
-/// 2. A rootless podman socket at `$XDG_RUNTIME_DIR/podman/podman.sock`
-///    is adopted — bollard defaults to Docker's path and would
-///    otherwise miss it.
-/// 3. `/var/run/docker.sock` needs no action: that is already where
-///    bollard looks. This is the GitHub Actions case — the runner is a
-///    VM with a real Docker daemon, so no dind and no setup.
-fn negotiate() -> &'static Result<(), String> {
+/// Settle the engine socket: `DOCKER_HOST` if set, else a rootless
+/// podman socket (bollard would look only at Docker's path), else
+/// `/var/run/docker.sock` (CI) as is.
+fn harness_ready() -> &'static Result<(), String> {
     static NEGOTIATED: OnceLock<Result<(), String>> = OnceLock::new();
     NEGOTIATED.get_or_init(|| {
         if std::env::var_os("DOCKER_HOST").is_some() {
@@ -76,10 +46,8 @@ fn negotiate() -> &'static Result<(), String> {
             .map(|rt| PathBuf::from(rt).join("podman/podman.sock"))
             .filter(|s| s.exists());
         if let Some(socket) = podman_socket {
-            // Safety: set once, inside this `OnceLock`, before any
-            // container exists — every test reaches it through
-            // `harness_ready` and the lock serialises them — so no
-            // thread is mid-read of the environment.
+            // Safety: once, under the OnceLock, before any container or
+            // engine client exists to read the environment.
             unsafe {
                 std::env::set_var("DOCKER_HOST", format!("unix://{}", socket.display()));
             }
@@ -96,13 +64,7 @@ fn negotiate() -> &'static Result<(), String> {
     })
 }
 
-/// The image to run: `Containerfile.systemd` in this crate, built once
-/// for the suite through testcontainers — no `podman build` /
-/// `docker build` shell-out, so no engine-specific flags to
-/// reconcile, and the engine's layer cache makes repeats cheap. What's
-/// memoised here is "the build has happened": every container start
-/// needs its own `GenericImage`, which carries no state beyond the
-/// `IMAGE_NAME:TAG` descriptor.
+/// Built once per suite; each start needs its own `GenericImage`.
 async fn image() -> GenericImage {
     static BUILT: tokio::sync::OnceCell<()> = tokio::sync::OnceCell::const_new();
     BUILT
@@ -124,27 +86,8 @@ async fn image() -> GenericImage {
     GenericImage::new(IMAGE_NAME, TAG)
 }
 
-/// Is the suite able to run? `Err(reason)` fails every test with that
-/// reason (or skips, under `CINDY_E2E_CONTAINERS=skip`). All the work
-/// is in [`negotiate`]; this is the name the tests read it by.
-fn harness_ready() -> Result<(), String> {
-    negotiate().clone()
-}
-
-/// Build the example with one feature set and return the binary path.
-///
-/// Memoised behind a mutex, and that is load-bearing rather than an
-/// optimisation. libtest runs these tests concurrently, so without it
-/// several threads invoke `cargo build` for the same feature into the
-/// same `--target-dir` at once; one test then copies or execs the
-/// output binary while another cargo is still linking it, and the spawn
-/// fails with `ETXTBSY` ("Text file busy") or the play dies on a
-/// half-written worker. Holding the lock across the build serialises
-/// them, and the cache means only the first test pays for it — the
-/// binary is identical for every test in the process.
-/// Same dedicated-target-dir trick as the localhost harness: keeps
-/// this nested `cargo build` from contending on the outer invocation's
-/// build lock.
+/// Memoised under a lock, as in e2e-localhost: concurrent builds into
+/// one target dir hand out half-linked binaries (`ETXTBSY`).
 fn build_variant(feature: &str) -> PathBuf {
     static BUILT: OnceLock<std::sync::Mutex<std::collections::HashMap<String, PathBuf>>> =
         OnceLock::new();
@@ -195,29 +138,16 @@ fn build_variant(feature: &str) -> PathBuf {
     path
 }
 
-/// A Debian-systemd container with the worker binary staged inside at
-/// `/worker/e2e-worker`. The image's HEALTHCHECK (see
-/// `Containerfile.systemd`) is the readiness gate — `degraded` counts
-/// as up, which is normal in containers.
+/// Ready when the image's HEALTHCHECK passes (`degraded` counts: normal
+/// in containers). Removed on drop.
 struct SystemdHost {
-    /// Held for its `Drop`: removing the container when the test is
-    /// done. Also the handle `stage_worker` execs through.
-    _container: ContainerAsync<GenericImage>,
-    id: String,
-    /// The same engine testcontainers is talking to, reached directly
-    /// for the one thing the crate can't express: an exec with a
-    /// writable stdin.
+    container: ContainerAsync<GenericImage>,
+    /// The engine testcontainers talks to, for an exec with stdin.
     docker: Docker,
 }
 
 impl SystemdHost {
-    /// Start a container from the systemd image, with the worker binary
-    /// already copied in as a pristine master at
-    /// `/worker/e2e-worker.orig`.
-    ///
-    /// The copy happens through testcontainers' `with_copy_to` at
-    /// create time rather than a `cp` afterwards — one fewer thing
-    /// outside the crate, and it can't race the container's startup.
+    /// The worker is copied in at create time, so it can't race startup.
     async fn start(worker_bin: &Path) -> Self {
         let request = image()
             .await
@@ -229,31 +159,15 @@ impl SystemdHost {
             .start()
             .await
             .expect("failed to start the systemd container");
-        let id = container.id().to_owned();
-        // `connect_with_defaults` honours DOCKER_HOST, which
-        // `negotiate` has already settled — so this lands on the very
-        // socket the container was created over.
+        // Honours the DOCKER_HOST `harness_ready` settled: the same socket.
         let docker = Docker::connect_with_defaults().expect("connect to the container engine");
-        Self {
-            _container: container,
-            id,
-            docker,
-        }
+        Self { container, docker }
     }
 
-    /// Stage the worker binary for one play, from the master copy.
-    ///
-    /// Per play, not per container: the worker unlinks its own
-    /// executable on startup — agent-less is load-bearing — so each
-    /// play consumes the staged copy and the next needs a fresh one.
-    /// This is the dance `cindy play` performs per host, minus SSH.
-    ///
-    /// `install -m 755` does the copy and the mode in one step, run
-    /// through testcontainers' `exec` (no stdin needed here, so the
-    /// crate is enough).
+    /// Per play: the worker deletes its own binary on startup.
     async fn stage_worker(&self) {
         let result = self
-            ._container
+            .container
             .exec(ExecCommand::new([
                 "install",
                 "-m",
@@ -271,30 +185,14 @@ impl SystemdHost {
         assert_eq!(code, 0, "staging the worker binary failed in-container");
     }
 
-    /// Start the worker inside the container and return the RPC channel
-    /// to it: a writer for its stdin and a stream of its output frames.
-    ///
-    /// This is the piece that used to need a CLI. testcontainers' own
-    /// `exec` can't do it — its `ExecResult` exposes stdout/stderr only
-    /// — but the bollard client underneath *can*, via
-    /// `StartExecResults::Attached { input, output }`, which is exactly
-    /// the bidirectional pipe the RPC channel needs. So there is no
-    /// container CLI in this harness at all, and nothing to choose
-    /// between podman and docker: both serve the same Docker API on the
-    /// socket bollard is already connected to.
-    ///
-    /// `tty: false` is load-bearing twice over. It keeps the output
-    /// frame-multiplexed, so stdout (RPC) and stderr (diagnostics) stay
-    /// separable; and it keeps the stream raw, where a TTY would
-    /// translate newlines and corrupt a postcard/COBS frame.
-    ///
-    /// The worker unlinks its own binary on startup — inside the
-    /// container's writable layer, exactly as on a real host.
+    /// The RPC channel: the worker's stdin, and its output frames.
+    /// `tty: false` keeps stdout and stderr separable, and the bytes
+    /// raw — a TTY would translate newlines inside COBS frames.
     async fn start_worker(&self) -> (WorkerStdin, WorkerOutput) {
         let exec = self
             .docker
             .create_exec(
-                &self.id,
+                self.container.id(),
                 CreateExecOptions {
                     cmd: Some(vec![STAGED_WORKER]),
                     attach_stdin: Some(true),
@@ -328,14 +226,11 @@ type WorkerOutput = std::pin::Pin<
     Box<dyn futures_util::Stream<Item = Result<LogOutput, bollard::errors::Error>> + Send>,
 >;
 
-/// A wired-up orchestrator/worker pair, plumbed exactly the way
-/// `cindy play` does it — with the worker half being an attached exec
-/// inside the container instead of an SSH child.
+/// As `cindy play` pipes them, with an attached exec for SSH.
 struct Play {
     orchestrator: tokio::process::Child,
     pumps: Vec<tokio::task::JoinHandle<()>>,
-    /// Kept alive deliberately: the orchestrator reads the host context
-    /// from this path at startup, so unlinking it early is a race.
+    /// Read by the orchestrator at startup: unlinking it early races.
     _context_file: tempfile::NamedTempFile,
 }
 
@@ -353,9 +248,7 @@ async fn start_play(
     let context_file = tempfile::NamedTempFile::new().expect("create context file");
     std::fs::write(context_file.path(), host_context.to_string()).expect("write host context");
 
-    // The orchestrator is a `tokio::process` child so both halves of
-    // the RPC bridge are async: the worker side is bollard's attached
-    // exec, which has no blocking form.
+    // Async, because the worker side (bollard) has no blocking form.
     let mut orch_cmd = tokio::process::Command::new(&orchestrator_bin);
     orch_cmd
         .env("CINDY_HOST_CONTEXT_FILE", context_file.path())
@@ -381,22 +274,18 @@ async fn start_play(
                         if worker_stdin.write_all(&buf[..n]).await.is_err() {
                             break;
                         }
-                        // The RPC is request/response: without a flush
-                        // per frame the orchestrator waits for a reply
-                        // to bytes still sitting in a buffer.
+                        // Request/response: an unflushed frame never gets
+                        // its reply.
                         if worker_stdin.flush().await.is_err() {
                             break;
                         }
                     }
                 }
             }
-            // Closing the worker's stdin is what ends its RPC read loop.
             let _ = worker_stdin.shutdown().await;
         }),
-        // Worker output → orchestrator stdin, demultiplexed. Only
-        // stdout carries RPC; the worker's stderr is diagnostics and
-        // goes to the test's, tagged, exactly as the CLI tags it
-        // per-host in a real play.
+        // Worker stdout → orchestrator stdin; stderr is diagnostics,
+        // tagged as the CLI tags it.
         tokio::spawn(async move {
             use futures_util::StreamExt as _;
             while let Some(frame) = worker_output.next().await {
@@ -412,9 +301,6 @@ async fn start_play(
                     Ok(LogOutput::StdErr { message }) => {
                         eprint!("[worker] {}", String::from_utf8_lossy(&message));
                     }
-                    // Console/StdIn frames don't occur with tty:false
-                    // and attach_stdin, but a stream error means the
-                    // exec is gone.
                     Ok(_) => {}
                     Err(e) => {
                         eprintln!("[worker] exec stream error: {e}");
@@ -422,8 +308,7 @@ async fn start_play(
                     }
                 }
             }
-            // Worker gone: EOF the orchestrator so its in-flight calls
-            // fail instead of hanging.
+            // EOF, so the orchestrator's in-flight calls fail, not hang.
             let _ = o_in.shutdown().await;
         }),
     ];
@@ -436,12 +321,7 @@ async fn start_play(
 }
 
 impl Play {
-    /// Wait for the orchestrator — it drives the play and holds the
-    /// authoritative exit code — then let the pumps drain.
-    ///
-    /// There is no worker process to reap: it lives inside the
-    /// container's exec, which the engine cleans up when the process
-    /// exits (and the container's `Drop` catches the rest).
+    /// The orchestrator's exit is the play's. The engine reaps the exec.
     async fn wait(mut self) -> std::process::ExitStatus {
         let status = self.orchestrator.wait().await.expect("wait orchestrator");
         for pump in std::mem::take(&mut self.pumps) {
@@ -459,16 +339,9 @@ fn host_context() -> serde_json::Value {
     })
 }
 
-/// Shared test prelude: skip (with the reason) or build both halves
-/// and start a fresh container. One container per test — isolation is
-/// worth the seconds, and scenarios within a test share their
-/// container on purpose.
-async fn setup() -> Option<(tempfile::TempDir, SystemdHost)> {
+/// A fresh container per test; the plays within a test share it.
+async fn setup() -> Option<SystemdHost> {
     if let Err(reason) = harness_ready() {
-        // Fail by default. Skipping silently would make this coverage
-        // evaporate without a signal: libtest captures the reason, so
-        // in normal output a skipped test and a real one both read
-        // `ok`, and the only tell is a 0.00s duration nobody reads.
         assert_eq!(
             std::env::var("CINDY_E2E_CONTAINERS").as_deref(),
             Ok("skip"),
@@ -479,18 +352,13 @@ async fn setup() -> Option<(tempfile::TempDir, SystemdHost)> {
         eprintln!("skipping container e2e (CINDY_E2E_CONTAINERS=skip): {reason}");
         return None;
     }
-    let tmp = tempfile::tempdir().expect("tempdir");
-    let worker = build_variant("remote");
-    let host = SystemdHost::start(&worker).await;
-    Some((tmp, host))
+    Some(SystemdHost::start(&build_variant("remote")).await)
 }
 
-/// `systemd`, `apt`, `user` and `group` finally meet a real system:
-/// enable/start a fresh unit, converge, stop/disable, mask — the
-/// lifecycle a VyOS play actually drives.
+/// enable+start, converge, runtime-only links, disable+stop, mask.
 #[tokio::test]
 async fn systemd_manages_a_unit_lifecycle() {
-    let Some((tmp, host)) = setup().await else {
+    let Some(host) = setup().await else {
         return;
     };
     let status = start_play(&host, &host_context(), &[("CINDY_E2E_SYSTEMD", "1")])
@@ -501,32 +369,25 @@ async fn systemd_manages_a_unit_lifecycle() {
         status.success(),
         "systemd lifecycle play failed: {status:?} — see the output above"
     );
-    drop(tmp);
 }
 
-/// The f576ecc regression, pinned end to end: under `CINDY_DRY_RUN=1`
-/// (what `cindy play --check` sets), `disable` on a **masked** unit
-/// must report the would-change without unmasking. The unit-test
-/// matrix over `disable_would_change` can't catch a missed guard; a
-/// real systemd can — this is the exact arm where the bug shipped.
+/// Under `--check`, `disable` on a masked unit reports the change
+/// without unmasking — the arm f576ecc's bug shipped in, which only a
+/// real systemd can catch.
 #[tokio::test]
 async fn systemd_check_mode_never_unmasks() {
-    let Some((tmp, host)) = setup().await else {
+    let Some(host) = setup().await else {
         return;
     };
 
-    // Setup: mask a /usr/lib-backed unit (its file survives the mask —
-    // an admin-authored one is deleted to complete the mask, by
-    // design, leaving nothing to unmask).
+    // A /usr/lib unit: its file survives the mask (an /etc one wouldn't).
     let status = start_play(&host, &host_context(), &[("CINDY_E2E_SYSTEMD_MASK", "1")])
         .await
         .wait()
         .await;
     assert!(status.success(), "mask run failed: {status:?}");
 
-    // Check mode: report, don't touch. The playbook itself asserts the
-    // mask survived via read-only probes; a failure here means a
-    // mutation leaked through check mode.
+    // The play asserts, by probe, that the mask survived.
     let status = start_play(
         &host,
         &host_context(),
@@ -547,16 +408,13 @@ async fn systemd_check_mode_never_unmasks() {
         .wait()
         .await;
     assert!(status.success(), "unmask run failed: {status:?}");
-    drop(tmp);
 }
 
-/// `user` and `group` against real shadow-utils: create, converge,
-/// reconcile pinned attributes, supplementary groups, the shadow-utils
-/// create race (eight concurrent identical creates must converge to
-/// exactly one account), and absence.
+/// Real shadow-utils: create, converge, pinned attributes, groups, eight
+/// concurrent identical creates converging to one account, absence.
 #[tokio::test]
 async fn users_and_groups_reconcile_on_a_real_system() {
-    let Some((tmp, host)) = setup().await else {
+    let Some(host) = setup().await else {
         return;
     };
     let status = start_play(&host, &host_context(), &[("CINDY_E2E_USERS", "1")])
@@ -567,15 +425,13 @@ async fn users_and_groups_reconcile_on_a_real_system() {
         status.success(),
         "user/group play failed: {status:?} — see the output above"
     );
-    drop(tmp);
 }
 
-/// `apt` against the image's baked-in `file://` repo: install, converge,
-/// no-op on an already-installed package (no upgrade chase), remove.
-/// No test-time network — the repo is a build-time artifact.
+/// Against a `file://` repo baked into the image (no network at test
+/// time): install, converge, no upgrade chase, remove.
 #[tokio::test]
 async fn apt_installs_converges_and_removes() {
-    let Some((tmp, host)) = setup().await else {
+    let Some(host) = setup().await else {
         return;
     };
     let status = start_play(&host, &host_context(), &[("CINDY_E2E_APT", "1")])
@@ -586,5 +442,4 @@ async fn apt_installs_converges_and_removes() {
         status.success(),
         "apt play failed: {status:?} — see the output above"
     );
-    drop(tmp);
 }

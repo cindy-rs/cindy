@@ -12,37 +12,25 @@ name = "e2e-localhost"
 path = "src/main.rs"
 
 [features]
-# The `cindy` CLI always builds with --no-default-features and exactly
-# one of the two. Defaulting to *both* makes plain `cargo check` (and
-# rust-analyzer) analyse the orchestrator and the worker halves at once
-# — `#[cindy::main]` is built for exactly this dual-feature shape — so
-# the whole program is type-checked without special editor setup.
+# The CLI builds each half with exactly one; both by default makes
+# `cargo check` and rust-analyzer analyse the whole program.
 default = ["orchestrator", "remote"]
-# Forwarded to cindy so the `#[cindy::main]`/`#[cindy::remote]` macros
-# expand to the orchestrator side or the remote-worker side. The test
-# harness builds this crate once with each feature and cross-pipes the
-# two resulting processes — exactly what the real CLI does, minus SSH.
 orchestrator = ["cindy/orchestrator", "dep:futures-util"]
 remote = ["cindy/remote"]
-# Compiles a `secret!` vault demand into the worker binary for the
-# keyless-handshake scenario only (see `worker_side_vault_demand` in
-# src/main.rs and tests/e2e.rs). A cargo feature, not an env var,
-# because PendingSecret registration is link-time: every worker built
-# without it must stay demand-free.
+# A `secret!` vault demand in the worker, for the keyless-handshake
+# test only. A feature, not an env var: the registration is link-time.
 worker-vault-demand = []
 
 [dependencies]
 cindy = { workspace = true }
-futures-util = { version = "0.3", optional = true }
+futures-util = { workspace = true, optional = true }
 serde_json = { workspace = true }
 
 [dev-dependencies]
 postcard = { workspace = true, features = ["alloc"] }
 uuid = { workspace = true, features = ["serde"] }
 serde_json = { workspace = true }
-tempfile = "3.27"
+tempfile.workspace = true
 sha2 = "0.11"
-# Sealing real ciphertexts for the vault-handshake scenarios: the
-# tests mint a genuine key + AEAD blob with the same API `cindy
-# secret seal` uses, so the handshake carries real key material.
+# The tests seal real ciphertexts, as `cindy secret seal` does.
 cindy = { workspace = true }
