@@ -1,19 +1,7 @@
-//! Pretty-printable structural diffs.
-//!
-//! The [`Diff`] trait renders a unified-style diff of two values of the same
-//! type. The default implementation pretty-prints both sides with `{:#?}` and
-//! runs [`similar`]'s line-based text diff over the result, so any type that
-//! implements [`Debug`] gets a usable diff for free.
-//!
-//! Types holding payloads that don't survive `Debug` well (binary blobs,
-//! large blobs, secrets, ...) should override [`Diff::diff`] and call
-//! [`text_diff`] with a custom string representation.
-//!
-//! ```rust,ignore
-//! use cindy::diff::Diff;
-//! let mut out = std::io::stderr().lock();
-//! old.diff(&new, &mut out)?;
-//! ```
+//! Line diffs of two values' `{:#?}` renderings. A type whose `Debug`
+//! renders badly in a diff gives a field a better `Debug` (as
+//! `builtin::path` does for file content), or overrides [`Diff::diff`]
+//! and calls [`text_diff`].
 
 use std::fmt::Debug;
 use std::io::{self, Write};
@@ -29,14 +17,8 @@ pub trait Diff: Debug {
     }
 }
 
-/// Line-based text diff helper, exposed so manual [`Diff`] impls can build a
-/// custom string representation and still share the rendering.
-///
-/// Output is colorized with ANSI escapes (red for removals, green for
-/// additions) unless the `NO_COLOR` environment variable is set
-/// (<https://no-color.org/>). TTY detection is deliberately not used: this
-/// crate's primary writer is a pipe from a remote process back to the
-/// orchestrator, where a `is_terminal()` check would always be wrong.
+/// Coloured unless `NO_COLOR` is set. No tty detection: the usual
+/// writer is the worker's stderr pipe, which is never a terminal.
 pub fn text_diff(old: &str, new: &str, out: &mut dyn Write) -> io::Result<()> {
     let style = Style::detect();
     let textdiff = TextDiff::from_lines(old, new);
@@ -53,9 +35,8 @@ pub fn text_diff(old: &str, new: &str, out: &mut dyn Write) -> io::Result<()> {
                 ChangeTag::Equal => (' ', ""),
             };
 
-            // Split the trailing newline (if any) off so the ANSI reset
-            // lands *before* it. Otherwise some terminals carry the color
-            // attribute into the next line on resize/copy.
+            // Reset before the newline, or some terminals carry the
+            // colour onto the next line.
             let value = change.value();
             let (body, nl) = match value.strip_suffix('\n') {
                 Some(body) => (body, "\n"),
@@ -72,14 +53,8 @@ pub fn text_diff(old: &str, new: &str, out: &mut dyn Write) -> io::Result<()> {
     Ok(())
 }
 
-/// Write a one-line note about work that has no structural diff to show
-/// — an action taken (`restart`, `reload`), an attribute reconciled
-/// without touching content — so it is still visible in the play's
-/// output instead of passing silently.
-///
-/// Styled like a hunk header and honouring `NO_COLOR` exactly as
-/// [`text_diff`] does, so every line a builtin emits comes out in one
-/// voice rather than each module rolling its own escape codes.
+/// One line for work with no structural diff (a restart, an attribute
+/// fix), styled like a hunk header.
 pub fn note(out: &mut dyn Write, body: &str) -> io::Result<()> {
     let style = Style::detect();
     write_styled_line(out, style.header, body, style.reset)

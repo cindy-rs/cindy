@@ -1,28 +1,16 @@
-/// The entire fleet as the user's [`cindy::inventory`] function declares
-/// it.
+/// The fleet, as the playbook's `#[cindy::inventory]` fn declares it.
 #[crate::wire]
 pub struct Inventory<V> {
     pub hosts: Vec<Host<V>>,
 }
 
-/// Dummy key in [`InventoryDump::debug`] for the whole-inventory
-/// `Debug` rendering.
+/// The [`InventoryDump::debug`] key of the whole inventory.
 pub const WHOLE_INVENTORY_KEY: &str = "__cindy:all";
 
-/// Walk an arbitrary JSON value and collect the names of every vault a
-/// sealed `Secret<T>` in it references.
-///
-/// A sealed secret serialises (see `secret::WireForm`) as an object
-/// `{ "vault": "<name>", "ciphertext": "<base64>" }`, so any object
-/// carrying *both* a string `vault` and a string `ciphertext` is taken
-/// to be a sealed secret. This is the precise, per-host half of the
-/// vault preflight: given a host's (sealed) `vars` as JSON, it yields
-/// exactly the vaults that host's data needs — no over-approximation.
-///
-/// The two-key shape is specific enough that a user struct accidentally
-/// matching it would be a remarkable coincidence; even if one did, the
-/// only consequence is requiring an extra key, which preflight reports
-/// rather than silently mis-handling.
+/// Every vault a sealed secret in `value` names — the exact per-host
+/// half of the key preflight. A sealed secret serialises as
+/// `{ "vault": "…", "ciphertext": "…" }`; a user struct of that shape
+/// would at worst demand one extra key, reported by the preflight.
 pub fn collect_sealed_vaults(
     value: &serde_json::Value,
     out: &mut std::collections::BTreeSet<String>,
@@ -47,23 +35,14 @@ pub fn collect_sealed_vaults(
     }
 }
 
-/// What the orchestrator emits on the wire in `CINDY_DUMP_INVENTORY`
-/// mode.
+/// The inventory as the CLI gets it, which never names the playbook's
+/// `V`.
 ///
-/// The `json` field is the type-erased `Inventory<serde_json::Value>`
-/// the CLI consults for `--limit` targeting (it never names the user's
-/// `V`). Secrets in it stay sealed; it never depends on vault keys, so
-/// targeting and plain `cindy inventory --json` always work. The
-/// `debug` field carries `Debug` renderings produced *inside* the
-/// orchestrator, where the real `V` and its `Debug` impl are in scope —
-/// keyed by host name, plus [`WHOLE_INVENTORY_KEY`] for the entire
-/// `Inventory<V>`. This lets `cindy inventory` print the user's actual
-/// struct rather than a JSON-`Value` `Debug`.
-///
-/// When `cindy inventory --reveal` runs, `debug` is rendered with
-/// `Secret<T>` values decrypted, and `json_revealed` is populated with
-/// a secrets-decrypted JSON (or an error string if a vault key was
-/// missing). Outside reveal mode `json_revealed` is `None`.
+/// `json` keeps secrets sealed, so targeting works without any key.
+/// `debug` is rendered here, where `V`'s own `Debug` is in scope — per
+/// host and under [`WHOLE_INVENTORY_KEY`]. Under `--reveal`, `debug` is
+/// rendered decrypted and `json_revealed` holds the decrypted JSON (or
+/// the error, if a key was missing).
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(crate = "crate::__reexports::serde")]
 #[doc(hidden)]
@@ -74,25 +53,14 @@ pub struct InventoryDump {
     pub json_revealed: Option<Result<serde_json::Value, String>>,
 }
 
-/// Conversion glue so `#[cindy::inventory]` can accept *either*
-/// `Inventory<V>` or `Result<Inventory<V>, E>` and always emit the same
-/// [`InventoryDump`] shape on the wire.
-///
-/// The infallible impl serialises through and renders `Debug`. The
-/// fallible impl does the same on `Ok`, prints the debug rendering of
-/// the error to stderr and exits 1 on `Err`. A `V` whose `Serialize`
-/// impl fails is treated like the `Err` case — reported on stderr,
-/// exit 1 — rather than a panic. Either way the CLI reads a clean
-/// `InventoryDump` from FD 1 — no `{"Ok": {...}}` wrapper for it to
-/// peel.
+/// Lets `#[cindy::inventory]` return `Inventory<V>` or a `Result` of
+/// one. An `Err`, or a `V` that fails to serialise, is reported on
+/// stderr and exits 1.
 #[doc(hidden)]
 pub trait IntoInventoryDump {
     fn into_inventory_dump(self) -> InventoryDump;
 }
 
-/// Build the debug map for an inventory: one entry per host (keyed by
-/// `host.name`) plus the whole-inventory rendering under
-/// [`WHOLE_INVENTORY_KEY`].
 fn build_debug_map<V: std::fmt::Debug>(
     inv: &Inventory<V>,
 ) -> std::collections::BTreeMap<String, String> {
@@ -104,33 +72,26 @@ fn build_debug_map<V: std::fmt::Debug>(
     debug
 }
 
-/// Fallible core of [`IntoInventoryDump::into_inventory_dump`]: build
-/// the dump from a serialisable, `Debug`-able inventory. Kept separate
-/// from the trait impl so the serialisation-failure path is testable
-/// — the impl turns an error into a stderr report + exit 1 (matching
-/// the `Result` impl's `Err` arm), which can't be exercised in-process.
+/// Separate from the trait impl, which exits, so failure is testable.
 fn try_into_inventory_dump<V: serde::Serialize + std::fmt::Debug>(
     inv: Inventory<V>,
-) -> ::std::result::Result<InventoryDump, serde_json::Error> {
+) -> Result<InventoryDump, serde_json::Error> {
     let json = serde_json::to_value(&inv)?;
-
-    if std::env::var_os("CINDY_REVEAL_SECRETS").is_some() {
-        ::std::result::Result::Ok(crate::secret::with_revealed_secrets(|| {
-            let debug = build_debug_map(&inv);
-            let json_revealed = serde_json::to_value(&inv).map_err(|e| e.to_string());
-            InventoryDump {
-                json,
-                debug,
-                json_revealed: Some(json_revealed),
-            }
-        }))
+    let reveal = std::env::var_os("CINDY_REVEAL_SECRETS").is_some();
+    let render = || {
+        let revealed = reveal.then(|| serde_json::to_value(&inv).map_err(|e| e.to_string()));
+        (build_debug_map(&inv), revealed)
+    };
+    let (debug, json_revealed) = if reveal {
+        crate::secret::with_revealed_secrets(render)
     } else {
-        ::std::result::Result::Ok(InventoryDump {
-            json,
-            debug: build_debug_map(&inv),
-            json_revealed: None,
-        })
-    }
+        render()
+    };
+    Ok(InventoryDump {
+        json,
+        debug,
+        json_revealed,
+    })
 }
 
 impl<V: serde::Serialize + serde::de::DeserializeOwned + std::fmt::Debug> IntoInventoryDump
@@ -140,24 +101,22 @@ impl<V: serde::Serialize + serde::de::DeserializeOwned + std::fmt::Debug> IntoIn
         match try_into_inventory_dump(self) {
             Ok(dump) => dump,
             Err(e) => {
-                ::std::eprintln!(
-                    "`#[cindy::inventory]` failed to serialise the inventory to JSON: {e:?}"
-                );
-                ::std::process::exit(1);
+                eprintln!("`#[cindy::inventory]` failed to serialise the inventory to JSON: {e:?}");
+                std::process::exit(1);
             }
         }
     }
 }
 
 impl<V: serde::Serialize + serde::de::DeserializeOwned + std::fmt::Debug, E: std::fmt::Debug>
-    IntoInventoryDump for ::std::result::Result<Inventory<V>, E>
+    IntoInventoryDump for Result<Inventory<V>, E>
 {
     fn into_inventory_dump(self) -> InventoryDump {
         match self {
             Ok(inv) => inv.into_inventory_dump(),
             Err(e) => {
-                ::std::eprintln!("`#[cindy::inventory]` failed: {e:?}");
-                ::std::process::exit(1);
+                eprintln!("`#[cindy::inventory]` failed: {e:?}");
+                std::process::exit(1);
             }
         }
     }
@@ -169,40 +128,22 @@ pub struct RegisteredInventory {
 }
 inventory::collect!(RegisteredInventory);
 
-/// A single deployment target as the orchestrator sees it at run-time.
-///
-/// `Host<V>` is the runtime view that the `#[cindy::main]`-generated entry
-/// hands to your `main`. The generic `V` is *your* per-host vars struct
-/// — anything `Serialize + DeserializeOwned`. The CLI itself never
-/// names `V`; it only deals with the structural fields (`name`,
-/// `tags`) and treats `vars` as an opaque JSON blob that round-trips
-/// through `serde_json::Value`. That keeps the CLI ignorant of your
-/// project's types while still letting your code reach typed vars.
+/// One target, as `main` receives it. `V` is the playbook's own vars
+/// type; the CLI only sees `name` and `tags`, and carries `vars` as JSON.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(crate = "crate::__reexports::serde")]
 pub struct Host<V = ()> {
-    /// Operator-facing host name. Whatever the CLI calls this target —
-    /// typically the SSH host alias.
+    /// Usually the SSH host alias.
     pub name: String,
-
-    /// Free-form labels for filtering via `--limit`. Pure targeting
-    /// metadata — no implicit vars resolution / no inheritance.
-    /// Composition of per-host vars is done explicitly in the
-    /// (eventual) `#[cindy::inventory]` function with normal Rust.
+    /// For `--limit`. Targeting only: no vars inheritance — compose vars
+    /// in the inventory fn, in plain Rust.
     #[serde(default)]
     pub tags: Vec<String>,
-
-    /// Whatever per-host typed data your inventory wants to surface.
-    /// Round-trips through JSON between the CLI and the orchestrator
-    /// process; the CLI never deserialises it past
-    /// `serde_json::Value`.
     pub vars: V,
 }
 
 impl<V> Host<V> {
-    /// Build a [`Host`] without spelling out `.into()` / `tags!`. The
-    /// struct-literal form (`Host { name, tags, vars }`) still works; this
-    /// is just the compact path:
+    /// The literal form works too; this skips the `.into()`s:
     ///
     /// ```ignore
     /// Host::new("web-01", ["env:prod", "web"], MyVars { .. })
@@ -222,9 +163,6 @@ impl<V> Host<V> {
 }
 
 impl<V> Inventory<V> {
-    /// Build an [`Inventory`] from anything iterable of [`Host`]s, e.g. a
-    /// `Vec`, an array, or a `map(..)` chain — no explicit `.collect()`.
-    /// The struct-literal form (`Inventory { hosts }`) still works.
     pub fn new(hosts: impl IntoIterator<Item = Host<V>>) -> Self {
         Self {
             hosts: hosts.into_iter().collect(),
@@ -232,9 +170,7 @@ impl<V> Inventory<V> {
     }
 }
 
-/// A simple wrapper around the `vec!` macro; all it does is wrap the passed elements inside a
-/// `Into::<String>::into` so they're automatically coerced into a `String` without an explicit
-/// `.into()` call
+/// `vec!` of `String`s, converting each element with `Into`.
 #[macro_export]
 macro_rules! tags {
     ($($el:expr),* $(,)?) => {
@@ -248,21 +184,17 @@ mod tests {
 
     #[test]
     fn host_and_inventory_constructors_accept_into() {
-        // `&str` name + `&str` array tags, no `.into()` / `tags!`.
         let a = Host::new("web-01", ["env:prod", "web"], 42u64);
         assert_eq!(a.name, "web-01");
         assert_eq!(a.tags, vec!["env:prod", "web"]);
         assert_eq!(a.vars, 42);
 
-        // `String` name + `Vec<String>` tags also fit the `Into` bounds.
         let b = Host::new(String::from("web-02"), vec![String::from("db")], 7u64);
         assert_eq!(b.name, "web-02");
 
-        // No tags: a typed empty iterator (no annotation needed on `Host`).
         let c = Host::new("web-03", std::iter::empty::<&str>(), 1u64);
         assert!(c.tags.is_empty());
 
-        // The struct-literal form is untouched and interops with `::new`.
         let d = Host {
             name: "web-04".into(),
             tags: crate::tags!["t"],
@@ -275,10 +207,6 @@ mod tests {
 
     #[test]
     fn failing_serialize_is_an_error_not_a_panic() {
-        // `#[cindy::inventory]` vars are user types; a `Serialize` impl
-        // that errors (custom impls, non-string map keys) used to
-        // `expect()`-panic inside the dump. The fallible core must
-        // surface it as an error for the trait impl to report + exit.
         #[derive(Debug, serde::Deserialize)]
         struct FailsSerialize;
 
