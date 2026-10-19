@@ -739,6 +739,15 @@ fn unseal_all(all: bool) -> eyre::Result<()> {
                 file.display()
             );
         }
+        if let Some(missed) = collected.calls.len().checked_sub(collected.sites.len())
+            && missed > 0
+        {
+            tracing::warn!(
+                "{}: {missed} `sealed_b64` call(s) not spelled \
+                 `Secret::sealed_b64(\"vault\", \"…\")`; left sealed",
+                file.display()
+            );
+        }
         if !collected.sites.is_empty() {
             per_file.push(collected);
         }
