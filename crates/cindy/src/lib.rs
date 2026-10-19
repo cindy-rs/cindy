@@ -1,3 +1,21 @@
+//! Infrastructure as a Rust crate: a playbook is a binary whose
+//! `#[cindy::main]` runs on your machine, while `#[cindy::remote]` fns
+//! run on each target — over SSH, with nothing left behind.
+//!
+//! - [`main`], [`remote`], [`inventory`], [`wire`], [`action`] — the
+//!   macros a playbook is written with.
+//! - [`builtin`] — converged-state building blocks: files, packages,
+//!   services, users, archives, commands. Each reports whether it
+//!   changed anything.
+//! - [`check`] — `cindy play --check`, report without applying.
+//! - [`Secret`] and [`secret!`] — values sealed at rest, revealed only
+//!   where they are used.
+//! - [`error`] — `cindy::Result` is `anyhow::Result`; remote errors keep
+//!   their chain.
+//!
+//! The `cindy` command line tool builds, deploys and runs playbooks;
+//! see <https://cindy.rs>.
+
 #[doc(hidden)]
 pub mod common;
 #[doc(hidden)]
