@@ -13,9 +13,7 @@ fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-/// Mint a genuinely sealed `Secret<String>` ciphertext under `key`,
-/// the same way `cindy secret seal` does — real AEAD blob, real
-/// SealedPayload framing.
+/// Sealed exactly as `cindy secret seal` does.
 fn seal_string(key: &cindy::secret::crypto::VaultKey, value: &str) -> Vec<u8> {
     let payload = cindy::secret::SealedPayload {
         value: cindy::__reexports::postcard::to_allocvec(value)
@@ -32,20 +30,10 @@ fn b64(bytes: &[u8]) -> String {
     cindy::__reexports::base64::engine::general_purpose::STANDARD.encode(bytes)
 }
 
-/// Build the example with one feature set and return the binary path.
-///
-/// Memoised behind a mutex, and that is load-bearing rather than an
-/// optimisation. libtest runs these tests concurrently, so without it
-/// several threads invoke `cargo build` for the same feature into the
-/// same `--target-dir` at once; one test then copies or execs the
-/// output binary while another cargo is still linking it, and the spawn
-/// fails with `ETXTBSY` ("Text file busy") or the play dies on a
-/// half-written worker. Holding the lock across the build serialises
-/// them, and the cache means only the first test pays for it — the
-/// binary is identical for every test in the process.
-///
-/// A dedicated `--target-dir` keeps this nested `cargo build` from
-/// contending on the outer test invocation's build lock.
+/// One build per feature set, memoised under a lock: concurrent tests
+/// building into one target dir would exec a binary another cargo is
+/// still linking (`ETXTBSY`). Its own target dir keeps it off the
+/// outer cargo's lock.
 fn build_variant(feature: &str) -> PathBuf {
     static BUILT: OnceLock<std::sync::Mutex<std::collections::HashMap<String, PathBuf>>> =
         OnceLock::new();
@@ -98,9 +86,7 @@ fn build_variant(feature: &str) -> PathBuf {
     path
 }
 
-/// Spin up a one-shot localhost HTTP/1.0 server that answers every
-/// request with `FETCH_BODY`. Returns its `http://127.0.0.1:PORT/` URL;
-/// the server thread runs until the test process exits.
+/// A localhost server answering every request with `FETCH_BODY`.
 fn start_http_server() -> String {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind localhost");
     let addr = listener.local_addr().expect("local addr");
@@ -124,9 +110,7 @@ fn start_http_server() -> String {
     format!("http://{addr}/")
 }
 
-/// Like [`start_http_server`], but demands an `Authorization` header
-/// (`Bearer cindy-e2e-token`) and answers `403` without it — the
-/// counterpart for exercising `fetch::State::headers`.
+/// Demands `Authorization: Bearer cindy-e2e-token`, else `403`.
 fn start_http_server_authed() -> String {
     // Header *names* arrive lower-cased (HTTP names are
     // case-insensitive and ureq normalises); the value is exact.
@@ -165,12 +149,7 @@ fn start_http_server_authed() -> String {
     format!("http://{addr}/")
 }
 
-/// Like [`start_http_server`] but sends **no** `Content-Length`, so the
-/// body is delimited only by the connection close.
-///
-/// That's the case `max_bytes` has to police mid-stream: with no
-/// declared length there is nothing to reject up front, so the limit can
-/// only be enforced as the bytes actually arrive.
+/// No `Content-Length`, so `max_bytes` can only bite as bytes arrive.
 fn start_http_server_unsized() -> String {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind localhost");
     let addr = listener.local_addr().expect("local addr");
@@ -192,8 +171,7 @@ fn start_http_server_unsized() -> String {
     format!("http://{addr}/")
 }
 
-/// A wired-up orchestrator/worker pair, plumbed exactly the way
-/// `cindy play` does it.
+/// An orchestrator and worker, piped together as `cindy play` does.
 struct Play {
     orchestrator: std::process::Child,
     worker: std::process::Child,
@@ -212,13 +190,8 @@ struct Play {
     worker_stderr_text: String,
 }
 
-/// Build both halves, hand the host context over by temp file (as the
-/// CLI does), and cross the pipes: orchestrator stdout → worker stdin,
-/// worker stdout → orchestrator stdin.
-///
-/// The scenarios below differ only in their host context and the env var
-/// that selects a branch of the playbook, so they share this driver
-/// instead of each repeating the plumbing.
+/// Host context by temp file, as the CLI hands it over; each test
+/// picks its scenario with an env var.
 fn start_play(
     tmp: &Path,
     host_context: &serde_json::Value,
@@ -228,9 +201,7 @@ fn start_play(
     start_play_with_worker(tmp, host_context, orchestrator_env, worker_env, "remote")
 }
 
-/// [`start_play`] with control over which worker variant to spawn —
-/// the keyless-handshake scenario needs the `worker-vault-demand`
-/// build, every other scenario the plain one.
+/// [`start_play`] with a chosen worker build.
 #[allow(clippy::too_many_arguments)]
 /// Staging an executable and spawning one must not interleave across
 /// threads: `fork` duplicates the fd table, so a spawn on one thread
@@ -432,9 +403,7 @@ fn e2e_localhost_play() {
     );
 }
 
-/// Killing the worker while a call is in flight must fail the
-/// orchestrator promptly — a dead worker used to leave every pending
-/// future `Pending` forever, hanging the play until ^C.
+/// A worker killed mid-call fails the play promptly, instead of hanging.
 #[test]
 fn worker_death_fails_fast() {
     let tmp = tempfile::tempdir().expect("create temp dir");
@@ -464,10 +433,8 @@ fn worker_death_fails_fast() {
     );
 }
 
-/// Check mode (`cindy play --check`): the dry-run flag travels the
-/// handshake, builtins report would-changes without applying anything,
-/// and the play still exits 0 — with the probe file it "created" nowhere
-/// on disk and the command it ran marked not-executed.
+/// `--check`: the flag travels the handshake, builtins report and
+/// apply nothing, and the play exits 0.
 #[test]
 fn check_mode_applies_nothing() {
     let tmp = tempfile::tempdir().expect("create temp dir");
@@ -500,11 +467,7 @@ fn check_mode_applies_nothing() {
     );
 }
 
-/// The worker's RPC byte budget must gate dispatch: with the budget
-/// forced to 64 KiB, a fan-out of eight ~40 KiB calls may only run
-/// one at a time. The play's probes observe their own concurrency and
-/// fail the run if it ever exceeds 1 (see `CINDY_E2E_BUDGET` in
-/// src/main.rs).
+/// A 64 KiB worker budget lets one ~40 KiB call run at a time.
 #[test]
 fn backpressure_serialises_oversized_fanout() {
     let tmp = tempfile::tempdir().expect("create temp dir");
@@ -534,14 +497,9 @@ fn backpressure_serialises_oversized_fanout() {
     );
 }
 
-/// The orchestrator's own RPC byte budget must park dispatch, not
-/// response routing: with the budget forced to 64 KiB, a fan-out of
-/// 32 ~40 KiB calls still completes — every frame waits its turn to
-/// reach the pipe while responses keep flowing. Acquiring the budget
-/// inside the routing loop (the obvious-but-wrong mirror of the
-/// worker's read-loop acquire) deadlocks right here: the worker's
-/// budget only releases as responses flow, and responses can't flow
-/// through a parked loop.
+/// A 64 KiB orchestrator budget parks dispatch, never response
+/// routing — parking routing would deadlock against the worker's
+/// budget, which frees only as responses flow.
 #[test]
 fn orchestrator_backpressure_completes_under_tiny_budget() {
     let tmp = tempfile::tempdir().expect("create temp dir");
@@ -574,14 +532,8 @@ fn orchestrator_backpressure_completes_under_tiny_budget() {
     );
 }
 
-/// `fetch` streams its body instead of buffering it, which puts three
-/// promises on the line: an over-sized body is refused (declared length
-/// or not), a failed checksum leaves the destination untouched because
-/// verification happens before the atomic publish, and an
-/// already-satisfied destination is never re-downloaded. The play
-/// asserts all of them from the inside (see `CINDY_E2E_FETCH_LIMITS` in
-/// src/main.rs) and fails the run if any breaks; here we re-check the
-/// filesystem independently.
+/// The play checks streaming fetch's promises from inside
+/// (`fetch_limits`); this re-checks the filesystem from outside.
 #[test]
 fn fetch_streams_within_its_limits() {
     let tmp = tempfile::tempdir().expect("create temp dir");
@@ -632,13 +584,9 @@ fn fetch_streams_within_its_limits() {
     }
 }
 
-/// The vault-key handshake reaching a worker-side `reveal()`: a real
-/// key minted by the test, a really sealed secret in the host context,
-/// keys shipped to the orchestrator via `CINDY_VAULT_KEYS` (as the CLI
-/// does) — and the reveal happening *on the worker*, which can only
-/// decrypt if the key arrived through the RPC handshake, never via
-/// argv/env. Until this test, no sealed secret had crossed the wire in
-/// any e2e suite.
+/// A really sealed secret, its key given to the orchestrator as the CLI
+/// gives it, revealed on the worker — possible only if the key crossed
+/// in the handshake.
 #[test]
 fn secret_reveals_on_the_worker_through_the_handshake() {
     use cindy::secret::crypto;
@@ -683,10 +631,8 @@ fn secret_reveals_on_the_worker_through_the_handshake() {
     );
 }
 
-/// A remote fn defined in the playbook's lib reaches the worker. The
-/// worker build's `main.rs` references nothing from the lib, so rustc
-/// used to drop it from the link and its registrations with it: the
-/// call died mid-play with "called an unregistered remote function".
+/// A remote fn from the playbook's lib reaches the worker, though the
+/// worker's `main.rs` never names the lib.
 #[test]
 fn remote_fns_in_the_playbook_lib_reach_the_worker() {
     let tmp = tempfile::tempdir().expect("create temp dir");
@@ -723,10 +669,8 @@ fn remote_fns_in_the_playbook_lib_reach_the_worker() {
     );
 }
 
-/// A remote fn's error reaches the orchestrator whole: every link of
-/// the chain (the wire used to carry only the outermost message), an
-/// io error still an `io::Error` of the same kind, and a typed serde
-/// error as its own type.
+/// A remote error arrives whole: its chain, an io error's kind, a typed
+/// error as its type.
 #[test]
 fn remote_errors_cross_the_wire_with_their_chain() {
     let tmp = tempfile::tempdir().expect("create temp dir");
@@ -812,12 +756,9 @@ fn worker_refuses_a_call_before_the_handshake() {
     assert!(!stderr.contains("panicked"), "{stderr}");
 }
 
-/// Preflight refusal on a missing key: the orchestrator is handed the
-/// sealed secret but *no* key for its vault, and must refuse before
-/// any playbook code runs — a missing marker and the preflight wording
-/// (naming the vault, pointing at remediation) are the proof. The
-/// keys dir is pinned to an empty tempdir so a stray `keys/` in the
-/// working tree can't make this test pass vacuously.
+/// No key for a sealed secret's vault: the orchestrator refuses before
+/// any playbook code runs, naming the vault. The keys dir is an empty
+/// tempdir, so a stray `keys/` can't make this pass.
 #[test]
 fn missing_key_refuses_before_any_playbook_code_runs() {
     use cindy::secret::crypto;
@@ -875,12 +816,8 @@ fn missing_key_refuses_before_any_playbook_code_runs() {
     );
 }
 
-/// The worker-side half of the refusal: the worker binary demands
-/// `e2e-worker-vault` (registered by a remote-gated `secret!` site the
-/// orchestrator build never sees), the orchestrator ships no keys, and
-/// the worker must die at the handshake — before dispatching the
-/// scenario's marker-creating call. If it ever dispatched instead, the
-/// marker would exist and this test would fail.
+/// The worker's half: its build demands `e2e-worker-vault`, no key
+/// arrives, and it dies at the handshake — before the marker call.
 #[test]
 fn worker_refuses_a_keyless_handshake_before_any_code_runs() {
     let tmp = tempfile::tempdir().expect("create temp dir");

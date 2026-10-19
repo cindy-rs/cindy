@@ -22,7 +22,7 @@ default = ["orchestrator", "remote"]
 # expand to the orchestrator side or the remote-worker side. The test
 # harness builds this crate once with each feature and cross-pipes the
 # two resulting processes — exactly what the real CLI does, minus SSH.
-orchestrator = ["cindy/orchestrator"]
+orchestrator = ["cindy/orchestrator", "dep:futures-util"]
 remote = ["cindy/remote"]
 # Compiles a `secret!` vault demand into the worker binary for the
 # keyless-handshake scenario only (see `worker_side_vault_demand` in
@@ -33,7 +33,7 @@ worker-vault-demand = []
 
 [dependencies]
 cindy = { workspace = true }
-futures-util = "0.3"
+futures-util = { version = "0.3", optional = true }
 serde_json = { workspace = true }
 
 [dev-dependencies]

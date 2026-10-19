@@ -1,3 +1,7 @@
+//! The e2e-localhost playbook. Each test in `tests/e2e.rs` picks a
+//! scenario by setting its `CINDY_E2E_*` variable; with none set, it is
+//! a play over every builtin.
+
 use std::path::PathBuf;
 
 #[cindy::wire]
@@ -5,99 +9,75 @@ pub struct Vars {
     work_dir: PathBuf,
     fetch_url: String,
     fetch_sha256: String,
-    /// Same body as `fetch_url`, served without a `Content-Length` — the
-    /// only shape in which `max_bytes` has to bite mid-stream rather
-    /// than off the declared length. Defaulted so the scenarios that
-    /// don't exercise fetch can leave it out of their host context.
+    /// The same body without a `Content-Length`, so `max_bytes` has to
+    /// bite mid-stream.
     #[serde(default)]
     fetch_url_unsized: String,
-    /// Same body again, behind a server that demands an
-    /// `Authorization` header — for the `fetch::State::headers` path.
+    /// The same body, behind a server that demands `Authorization`.
     #[serde(default)]
     fetch_url_authed: String,
-    /// Bulk payload holder: the e2e test stuffs >128 KiB into it to
-    /// prove the host-context hand-off survives contexts too large
-    /// for a single env var (kernel `MAX_ARG_STRLEN`).
+    /// Stuffed past 128 KiB: the host context must survive being larger
+    /// than one env var can hold.
     #[serde(default)]
     padding: String,
-    /// Sealed secret riding the host context — the wire form
-    /// (`{vault, ciphertext}`) is what real sealed inventories hold.
-    /// Revealed *on the worker* by the `CINDY_E2E_SECRETS` scenario to
-    /// prove the vault key arrives through the RPC handshake.
+    /// Sealed, revealed on the worker: the key can only have arrived
+    /// over the handshake.
     #[serde(default = "plain_secret")]
     secret: cindy::Secret<String>,
-    /// What the worker-side reveal must produce; compared in the
-    /// scenario so a mangled reveal fails the play, not the assert.
     #[serde(default)]
     secret_expected: String,
 }
 
-/// Pre-seal placeholder for the `secret` var: never serialised (a
-/// `Secret::Plain` refuses to be), only used when the field is absent
-/// from the host context.
+/// Only used when the context has no `secret` (a `Plain` never
+/// serialises).
 fn plain_secret() -> cindy::Secret<String> {
     cindy::Secret::new(String::new())
 }
 
+/// The tests supply the host context; this only has to exist.
 #[cindy::inventory]
 fn inventory() -> cindy::Inventory<Vars> {
-    // The test overrides this via the host-context hand-off; the
-    // inventory body just needs to exist and type-check. Defaults are
-    // harmless placeholders.
-    cindy::Inventory {
-        hosts: vec![cindy::Host {
-            name: "localhost".into(),
-            tags: vec!["example:e2e".into()],
-            vars: Vars {
-                work_dir: std::env::temp_dir().join("cindy-e2e"),
-                fetch_url: "http://127.0.0.1/".into(),
-                fetch_sha256: String::new(),
-                fetch_url_unsized: "http://127.0.0.1/".into(),
-                fetch_url_authed: "http://127.0.0.1/".into(),
-                padding: String::new(),
-                secret: plain_secret(),
-                secret_expected: String::new(),
-            },
-        }],
-    }
+    cindy::Inventory::new([cindy::Host::new(
+        "localhost",
+        ["example:e2e"],
+        Vars {
+            work_dir: std::env::temp_dir().join("cindy-e2e"),
+            fetch_url: "http://127.0.0.1/".into(),
+            fetch_sha256: String::new(),
+            fetch_url_unsized: "http://127.0.0.1/".into(),
+            fetch_url_authed: "http://127.0.0.1/".into(),
+            padding: String::new(),
+            secret: plain_secret(),
+            secret_expected: String::new(),
+        },
+    )])
 }
 
-/// RPC fan-out probe for the backpressure e2e scenario: sleeps long
-/// enough that overlapping executions would certainly be observed,
-/// and reports data integrity plus the highest concurrency seen so
-/// far.
-/// Reveals a sealed secret *on the worker*: the vault key must have
-/// arrived through the RPC handshake (never argv/env), so a correct
-/// return proves the key crossed the wire and decrypts worker-side.
 #[cindy::remote]
 fn reveal_on_worker(secret: cindy::Secret<String>) -> cindy::Result<String> {
     secret.reveal()
 }
 
-/// Side-effect probe for the keyless-handshake scenario: if the worker
-/// ever dispatches it, playbook code ran despite a failed vault
-/// preflight — the test asserts this marker never appears.
+/// Must never run: the keyless-handshake test asserts its marker is
+/// absent.
 #[cindy::remote]
 fn keyless_marker(dest: PathBuf) -> cindy::Result<()> {
     std::fs::write(dest, b"ran")?;
     Ok(())
 }
 
-/// Never called: its `secret!` site exists so a *worker* binary built
-/// with the `worker-vault-demand` feature registers a vault demand.
-/// Double-gated (remote + the feature) because it's link-time
-/// registration: the orchestrator build must not demand the vault (its
-/// own preflight would fire first and the worker path would never be
-/// reached), and ordinary scenario workers must not either — only the
-/// `CINDY_E2E_WORKER_KEYLESS` scenario's worker variant carries it.
-/// That scenario proves the worker refuses a keyless handshake before
-/// dispatching any call.
+/// Never called; its `secret!` makes the `worker-vault-demand` worker
+/// build demand a vault. Link-time registration, so it is gated on
+/// both: the orchestrator must not demand it (its own preflight would
+/// fire first), nor must any other scenario's worker.
 #[cfg(all(feature = "remote", feature = "worker-vault-demand"))]
 #[allow(dead_code, deprecated)]
 fn worker_side_vault_demand() -> cindy::Secret<String> {
     cindy::secret!("e2e-worker-vault", "never evaluated".to_owned())
 }
 
+/// Sleeps long enough for overlapping calls to be seen, and reports
+/// the most it saw at once.
 #[cindy::remote]
 fn budget_probe(data: Vec<u8>) -> (usize, usize) {
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -113,8 +93,7 @@ fn budget_probe(data: Vec<u8>) -> (usize, usize) {
     (data.len(), MAX_SEEN.load(Ordering::SeqCst))
 }
 
-/// Fails the way real builtins do: an io error under a context, for
-/// the `CINDY_E2E_REMOTE_ERRORS` scenario.
+/// An io error under a context, as builtins fail.
 #[cindy::remote]
 fn read_missing(path: PathBuf) -> cindy::Result<Vec<u8>> {
     use cindy::Context;
@@ -133,28 +112,57 @@ fn typed_failure(what: String) -> Result<(), TypedFailure> {
 
 #[cindy::main]
 async fn main(host: cindy::Host<Vars>) -> cindy::Result<()> {
-    use cindy::builtin;
+    use scenarios::*;
 
-    // Worker-death regression scenario (see tests/e2e.rs): issue one
-    // long-running remote call; the harness kills the worker mid-call
-    // and expects this process to fail fast instead of hanging on the
-    // never-arriving response.
-    if std::env::var_os("CINDY_E2E_SLEEP").is_some() {
-        builtin::command::command(
-            vec!["sleep".into(), "30".into()],
-            builtin::command::State::default(),
-        )
-        .await?;
-        return Ok(());
+    let on = |var| std::env::var_os(var).is_some();
+    let vars = &host.vars;
+    if on("CINDY_E2E_SLEEP") {
+        worker_dies_mid_call().await
+    } else if on("CINDY_E2E_BUDGET") {
+        worker_budget_serialises_calls().await
+    } else if on("CINDY_E2E_ORCH_BUDGET") {
+        orchestrator_budget_paces_without_deadlock().await
+    } else if on("CINDY_E2E_SECRETS") {
+        secret_reveals_on_the_worker(vars).await
+    } else if on("CINDY_E2E_REMOTE_ERRORS") {
+        remote_errors_keep_their_chain(vars).await
+    } else if on("CINDY_E2E_LIB_REMOTE") {
+        lib_remote_fns_reach_the_worker(vars).await
+    } else if on("CINDY_E2E_WORKER_KEYLESS") {
+        keyless_marker(vars.work_dir.join("must-not-exist.marker")).await
+    } else if on("CINDY_E2E_FETCH_LIMITS") {
+        fetch_limits(vars).await
+    } else if on("CINDY_E2E_DRY_RUN") {
+        check_mode_applies_nothing(vars).await
+    } else {
+        every_builtin(vars).await
+    }
+}
+
+#[cfg(feature = "orchestrator")]
+mod scenarios {
+    use super::*;
+    use cindy::builtin::{self, command, fetch, path};
+
+    fn mode(bits: u32) -> cindy::Result<path::Mode> {
+        path::Mode::try_from(bits)
     }
 
-    // Backpressure regression scenario (see tests/e2e.rs): the harness
-    // squeezes the worker's RPC byte budget down to 64 KiB while this
-    // play fans out eight ~40 KiB calls. At most one fits the budget
-    // at a time, so the probes must execute strictly serially — a
-    // leaked budget gate shows up as concurrent executions in the
-    // probes' own observations.
-    if std::env::var_os("CINDY_E2E_BUDGET").is_some() {
+    async fn work_dir(vars: &Vars) -> cindy::Result<()> {
+        let (user, group) = builtin::current_owner_names();
+        path::directory(vars.work_dir.clone(), &user, &group, mode(0o755)?).await?;
+        Ok(())
+    }
+
+    /// The test kills the worker during this; we must fail fast, not
+    /// wait forever for the response.
+    pub async fn worker_dies_mid_call() -> cindy::Result<()> {
+        command::command(vec!["sleep".into(), "30".into()], command::State::default()).await?;
+        Ok(())
+    }
+
+    /// Under a 64 KiB worker budget only one ~40 KiB call fits at once.
+    pub async fn worker_budget_serialises_calls() -> cindy::Result<()> {
         let blob = vec![7u8; 40 * 1024];
         let results =
             futures_util::future::join_all((0..8).map(|_| budget_probe(blob.clone()))).await;
@@ -168,85 +176,13 @@ async fn main(host: cindy::Host<Vars>) -> cindy::Result<()> {
                 );
             }
         }
-        return Ok(());
+        Ok(())
     }
 
-    // Vault-handshake scenario (see tests/e2e.rs): the sealed secret
-    // in vars must reveal *on the worker* — the key can only have
-    // arrived there via the RPC handshake — and match the expected
-    // plaintext. A marker file lands only if both hold.
-    if std::env::var_os("CINDY_E2E_SECRETS").is_some() {
-        let revealed = reveal_on_worker(host.vars.secret.clone()).await?;
-        if revealed != host.vars.secret_expected {
-            cindy::bail!(
-                "worker-side reveal returned {revealed:?}, expected {:?}",
-                host.vars.secret_expected
-            );
-        }
-        std::fs::create_dir_all(&host.vars.work_dir)?;
-        std::fs::write(host.vars.work_dir.join("reveal-ok.marker"), b"ok\n")?;
-        return Ok(());
-    }
-
-    // Remote-error scenario (see tests/e2e.rs): errors from the worker
-    // keep their whole chain, io errors their kind, typed errors their
-    // type. Reported rather than asserted here, so the test can show
-    // what actually arrived.
-    if std::env::var_os("CINDY_E2E_REMOTE_ERRORS").is_some() {
-        let err = read_missing(host.vars.work_dir.join("does-not-exist"))
-            .await
-            .expect_err("reading a missing file succeeded");
-        let chain: Vec<String> = err.chain().map(ToString::to_string).collect();
-        let io_kind = err.downcast_ref::<std::io::Error>().map(|e| e.kind());
-        let typed = match typed_failure("eth0".to_owned()).await {
-            Err(TypedFailure::Missing { what }) => what,
-            Ok(()) => "<succeeded>".to_owned(),
-        };
-        std::fs::create_dir_all(&host.vars.work_dir)?;
-        let report = serde_json::json!({
-            "chain": chain,
-            "rendered": format!("{err:#}"),
-            "io_kind": format!("{io_kind:?}"),
-            "typed_what": typed,
-        });
-        std::fs::write(
-            host.vars.work_dir.join("remote-errors.json"),
-            serde_json::to_vec(&report)?,
-        )?;
-        return Ok(());
-    }
-
-    // Library-remote scenario (see tests/e2e.rs): a remote fn defined
-    // in this package's lib must be registered in the worker, which
-    // never references the lib on its own.
-    if std::env::var_os("CINDY_E2E_LIB_REMOTE").is_some() {
-        let echoed = e2e_localhost::lib_side_echo("ping".to_owned()).await?;
-        std::fs::create_dir_all(&host.vars.work_dir)?;
-        std::fs::write(host.vars.work_dir.join("lib-remote.marker"), echoed)?;
-        return Ok(());
-    }
-
-    // Keyless-handshake scenario (see tests/e2e.rs): the worker
-    // demands `e2e-worker-vault` (see `worker_side_vault_demand`) but
-    // the orchestrator ships no keys. The worker must refuse at the
-    // handshake — before this scenario's marker-creating call could
-    // ever run. Reaching the `Ok(())` here would itself be a failure
-    // caught by the test asserting the marker's absence.
-    if std::env::var_os("CINDY_E2E_WORKER_KEYLESS").is_some() {
-        keyless_marker(host.vars.work_dir.join("must-not-exist.marker")).await?;
-        return Ok(());
-    }
-
-    // Orchestrator-side backpressure regression (see tests/e2e.rs):
-    // the harness squeezes the orchestrator's own RPC byte budget to
-    // 64 KiB while this play fans out 32 ~40 KiB calls. Dispatch must
-    // park on the budget without deadlocking: frame writes serialise,
-    // but response routing never parks, so every call still completes
-    // with its data intact. (Worker-side concurrency is *not* asserted
-    // here — the worker's budget is normal, so several probes may
-    // legitimately run at once; the orchestrator budget only paces
-    // frame writes.)
-    if std::env::var_os("CINDY_E2E_ORCH_BUDGET").is_some() {
+    /// A 64 KiB orchestrator budget under 32 such calls: dispatch parks,
+    /// routing doesn't, and every call completes intact. (Worker-side
+    /// concurrency isn't constrained here.)
+    pub async fn orchestrator_budget_paces_without_deadlock() -> cindy::Result<()> {
         let blob = vec![7u8; 40 * 1024];
         let results =
             futures_util::future::join_all((0..32).map(|_| budget_probe(blob.clone()))).await;
@@ -258,227 +194,216 @@ async fn main(host: cindy::Host<Vars>) -> cindy::Result<()> {
                 );
             }
         }
-        return Ok(());
+        Ok(())
     }
 
-    // Streaming-fetch regression scenario (see tests/e2e.rs). `fetch`
-    // no longer buffers a body in RAM, which puts three promises on the
-    // line: an over-sized body is refused (whether or not the server
-    // declares a length), a failed checksum leaves the destination
-    // untouched because verification happens before the publish, and an
-    // already-satisfied destination is *not* re-downloaded.
-    if std::env::var_os("CINDY_E2E_FETCH_LIMITS").is_some() {
-        use builtin::fetch;
+    pub async fn secret_reveals_on_the_worker(vars: &Vars) -> cindy::Result<()> {
+        let revealed = reveal_on_worker(vars.secret.clone()).await?;
+        if revealed != vars.secret_expected {
+            cindy::bail!(
+                "worker-side reveal returned {revealed:?}, expected {:?}",
+                vars.secret_expected
+            );
+        }
+        std::fs::create_dir_all(&vars.work_dir)?;
+        std::fs::write(vars.work_dir.join("reveal-ok.marker"), b"ok\n")?;
+        Ok(())
+    }
 
-        let work = &host.vars.work_dir;
-        let (user, group) = builtin::current_owner_names();
-        builtin::path::directory(
-            work.clone(),
-            &user,
-            &group,
-            builtin::path::Mode::try_from(0o755)?,
+    /// Reported, not asserted, so the test shows what actually arrived.
+    pub async fn remote_errors_keep_their_chain(vars: &Vars) -> cindy::Result<()> {
+        let err = read_missing(vars.work_dir.join("does-not-exist"))
+            .await
+            .expect_err("reading a missing file succeeded");
+        let chain: Vec<String> = err.chain().map(ToString::to_string).collect();
+        let io_kind = err.downcast_ref::<std::io::Error>().map(|e| e.kind());
+        let typed = match typed_failure("eth0".to_owned()).await {
+            Err(TypedFailure::Missing { what }) => what,
+            Ok(()) => "<succeeded>".to_owned(),
+        };
+        std::fs::create_dir_all(&vars.work_dir)?;
+        let report = serde_json::json!({
+            "chain": chain,
+            "rendered": format!("{err:#}"),
+            "io_kind": format!("{io_kind:?}"),
+            "typed_what": typed,
+        });
+        std::fs::write(
+            vars.work_dir.join("remote-errors.json"),
+            serde_json::to_vec(&report)?,
+        )?;
+        Ok(())
+    }
+
+    /// The worker's `main.rs` never names the lib on its own.
+    pub async fn lib_remote_fns_reach_the_worker(vars: &Vars) -> cindy::Result<()> {
+        let echoed = e2e_localhost::lib_side_echo("ping".to_owned()).await?;
+        std::fs::create_dir_all(&vars.work_dir)?;
+        std::fs::write(vars.work_dir.join("lib-remote.marker"), echoed)?;
+        Ok(())
+    }
+
+    /// Fails unless `attempt` fails and leaves nothing at `dest`.
+    async fn refused(
+        what: &str,
+        dest: &std::path::Path,
+        attempt: impl std::future::Future<Output = cindy::Result<builtin::Return>>,
+    ) -> cindy::Result<()> {
+        if attempt.await.is_ok() {
+            cindy::bail!("fetch accepted {what}");
+        }
+        if dest.exists() {
+            cindy::bail!("refusing {what} left {} behind", dest.display());
+        }
+        Ok(())
+    }
+
+    /// Streaming fetch keeps its promises: oversized bodies refused
+    /// (declared or not), a bad checksum publishes nothing, headers
+    /// reach the server, and a satisfied destination isn't re-fetched.
+    pub async fn fetch_limits(vars: &Vars) -> cindy::Result<()> {
+        work_dir(vars).await?;
+        let work = &vars.work_dir;
+        let sha256 = || Some(fetch::Checksum::Sha256(vars.fetch_sha256.clone()));
+        let token = |t: &str| -> cindy::Result<_> {
+            Ok(vec![("Authorization".into(), fetch::HeaderValue::new(t)?)])
+        };
+
+        let dest = work.join("over-declared.bin");
+        refused(
+            "a body whose Content-Length exceeded max_bytes",
+            &dest,
+            fetch::fetch(fetch::State {
+                url: vars.fetch_url.clone(),
+                dest: dest.clone(),
+                max_bytes: Some(4),
+                ..Default::default()
+            }),
         )
         .await?;
 
-        // A body over the limit, rejected off the declared
-        // Content-Length before any transfer starts.
-        let declared = work.join("over-declared.bin");
-        if fetch::fetch(fetch::State {
-            url: host.vars.fetch_url.clone(),
-            dest: declared.clone(),
-            max_bytes: Some(4),
-            ..Default::default()
-        })
-        .await
-        .is_ok()
-        {
-            cindy::bail!("fetch accepted a body whose Content-Length exceeded max_bytes");
-        }
-        if declared.exists() {
-            cindy::bail!(
-                "rejected oversized fetch left {} behind",
-                declared.display()
-            );
-        }
+        let dest = work.join("over-streamed.bin");
+        refused(
+            "an undeclared body that exceeded max_bytes",
+            &dest,
+            fetch::fetch(fetch::State {
+                url: vars.fetch_url_unsized.clone(),
+                dest: dest.clone(),
+                max_bytes: Some(4),
+                ..Default::default()
+            }),
+        )
+        .await?;
 
-        // The same, with no declared length — the limit has to be
-        // enforced as the bytes arrive.
-        let streamed = work.join("over-streamed.bin");
-        if fetch::fetch(fetch::State {
-            url: host.vars.fetch_url_unsized.clone(),
-            dest: streamed.clone(),
-            max_bytes: Some(4),
-            ..Default::default()
-        })
-        .await
-        .is_ok()
-        {
-            cindy::bail!("fetch accepted an undeclared body that exceeded max_bytes");
-        }
-        if streamed.exists() {
-            cindy::bail!(
-                "rejected oversized stream left {} behind",
-                streamed.display()
-            );
-        }
+        let dest = work.join("bad-checksum.bin");
+        refused(
+            "a body that failed its checksum",
+            &dest,
+            fetch::fetch(fetch::State {
+                url: vars.fetch_url.clone(),
+                dest: dest.clone(),
+                checksum: Some(fetch::Checksum::Sha256("0".repeat(64))),
+                ..Default::default()
+            }),
+        )
+        .await?;
 
-        // A checksum mismatch must not publish: the bytes are staged in
-        // a temp file and only renamed once the digest agrees.
-        let bad_sum = work.join("bad-checksum.bin");
-        if fetch::fetch(fetch::State {
-            url: host.vars.fetch_url.clone(),
-            dest: bad_sum.clone(),
-            checksum: Some(fetch::Checksum::Sha256("0".repeat(64))),
-            ..Default::default()
-        })
-        .await
-        .is_ok()
-        {
-            cindy::bail!("fetch accepted a body that failed its checksum");
-        }
-        if bad_sum.exists() {
-            cindy::bail!(
-                "failed-checksum fetch published {} anyway",
-                bad_sum.display()
-            );
-        }
-
-        // A good fetch lands the bytes…
         let good = work.join("streamed.bin");
-        if !fetch::fetch(fetch::State {
-            url: host.vars.fetch_url.clone(),
+        let fetched = fetch::fetch(fetch::State {
+            url: vars.fetch_url.clone(),
             dest: good.clone(),
-            checksum: Some(fetch::Checksum::Sha256(host.vars.fetch_sha256.clone())),
-            mode: Some(builtin::path::Mode::try_from(0o644)?),
+            checksum: sha256(),
+            mode: Some(mode(0o644)?),
             ..Default::default()
-        })
-        .await?
-        .changed()
-        {
+        });
+        if !fetched.await?.changed() {
             cindy::bail!("first fetch of {} reported Unchanged", good.display());
         }
 
-        // Request headers reach the server: the authed URL serves the
-        // same body, but only to a request carrying the token.
-        let authed_ok = work.join("authed.bin");
-        if !fetch::fetch(fetch::State {
-            url: host.vars.fetch_url_authed.clone(),
-            dest: authed_ok.clone(),
-            checksum: Some(fetch::Checksum::Sha256(host.vars.fetch_sha256.clone())),
-            headers: vec![(
-                "Authorization".into(),
-                fetch::HeaderValue::new("Bearer cindy-e2e-token")?,
-            )],
+        let authed = work.join("authed.bin");
+        let fetched = fetch::fetch(fetch::State {
+            url: vars.fetch_url_authed.clone(),
+            dest: authed.clone(),
+            checksum: sha256(),
+            headers: token("Bearer cindy-e2e-token")?,
             ..Default::default()
-        })
-        .await?
-        .changed()
-        {
+        });
+        if !fetched.await?.changed() {
             cindy::bail!("authed fetch reported Unchanged for a missing file");
         }
 
-        // Without the header the server refuses, and the fetch fails.
-        let authed_denied = work.join("authed-denied.bin");
-        if fetch::fetch(fetch::State {
-            url: host.vars.fetch_url_authed.clone(),
-            dest: authed_denied.clone(),
-            ..Default::default()
-        })
-        .await
-        .is_ok()
-        {
-            cindy::bail!("fetch succeeded against a server that demanded authorization");
-        }
-        if authed_denied.exists() {
-            cindy::bail!("refused fetch left {} behind", authed_denied.display());
-        }
+        let dest = work.join("authed-denied.bin");
+        refused(
+            "a fetch without the header the server demands",
+            &dest,
+            fetch::fetch(fetch::State {
+                url: vars.fetch_url_authed.clone(),
+                dest: dest.clone(),
+                ..Default::default()
+            }),
+        )
+        .await?;
 
-        // A satisfied destination skips the request entirely — even
-        // one whose headers would now be rejected. Pointing the
-        // re-run at a *bad* token is the proof: if it re-requested,
-        // the 403 would fail the call instead of reporting Unchanged.
-        if fetch::fetch(fetch::State {
-            url: host.vars.fetch_url_authed.clone(),
-            dest: authed_ok.clone(),
-            checksum: Some(fetch::Checksum::Sha256(host.vars.fetch_sha256.clone())),
-            headers: vec![(
-                "Authorization".into(),
-                fetch::HeaderValue::new("Bearer wrong-token")?,
-            )],
+        // With a token the server rejects: re-requesting would fail.
+        let refetched = fetch::fetch(fetch::State {
+            url: vars.fetch_url_authed.clone(),
+            dest: authed.clone(),
+            checksum: sha256(),
+            headers: token("Bearer wrong-token")?,
             ..Default::default()
-        })
-        .await?
-        .changed()
-        {
+        });
+        if refetched.await?.changed() {
             cindy::bail!("satisfied authed fetch re-requested instead of skipping");
         }
 
-        // …and a re-run whose content is already satisfied must repair
-        // drifted permissions *without* transferring anything. Pointing
-        // it at a refused port is the proof: if it re-downloaded, this
-        // call would fail instead of fixing the mode.
-        builtin::command::command(
+        // Drifted mode on satisfied content is repaired without a
+        // transfer: the URL is unreachable.
+        command::command(
             vec!["chmod".into(), "600".into(), good.display().to_string()],
-            builtin::command::State::default(),
+            command::State::default(),
         )
         .await?
         .exit_ok()?;
-        if !fetch::fetch(fetch::State {
+        let repaired = fetch::fetch(fetch::State {
             url: "http://127.0.0.1:1/unreachable".into(),
             dest: good.clone(),
-            checksum: Some(fetch::Checksum::Sha256(host.vars.fetch_sha256.clone())),
-            mode: Some(builtin::path::Mode::try_from(0o644)?),
+            checksum: sha256(),
+            mode: Some(mode(0o644)?),
             ..Default::default()
-        })
-        .await?
-        .changed()
-        {
+        });
+        if !repaired.await?.changed() {
             cindy::bail!("mode drift on a satisfied destination was not reported as Changed");
         }
-
-        return Ok(());
+        Ok(())
     }
 
-    // Check-mode scenario (see tests/e2e.rs): the harness runs the
-    // orchestrator with CINDY_DRY_RUN=1, which reaches the worker
-    // through the RPC handshake. Every builtin below must report a
-    // would-change and apply nothing — the harness asserts the probe
-    // file was never created and this process exited 0.
-    if std::env::var_os("CINDY_E2E_DRY_RUN").is_some() {
-        // This branch runs in the orchestrator process — the flag must
-        // be installed there too, not only in the worker (which the
-        // builtin assertions below exercise over RPC).
+    /// Run with CINDY_DRY_RUN=1: everything reports a change, nothing
+    /// is applied, probes still run.
+    pub async fn check_mode_applies_nothing(vars: &Vars) -> cindy::Result<()> {
         if !cindy::dry_run() {
             cindy::bail!("orchestrator-side dry_run() is false under --check");
         }
         let (user, group) = builtin::current_owner_names();
-        let probe = host.vars.work_dir.join("dry-run-probe.txt");
-        let file_return = builtin::path::file(
+        let probe = vars.work_dir.join("dry-run-probe.txt");
+        let file = path::file(
             probe.clone(),
             b"must not exist after the run".to_vec(),
             &user,
             &group,
-            builtin::path::Mode::try_from(0o644)?,
-        )
-        .await?;
-        if !file_return.changed() {
+            mode(0o644)?,
+        );
+        if !file.await?.changed() {
             cindy::bail!("path::file reported Unchanged for a missing file under --check");
         }
-        let out =
-            builtin::command::command(vec!["true".into()], builtin::command::State::default())
-                .await?;
-        if out.status != builtin::command::Status::Skipped {
+
+        let out = command::command(vec!["true".into()], command::State::default()).await?;
+        if out.status != command::Status::Skipped {
             cindy::bail!("command executed under --check: the worker never got the flag");
         }
         out.exit_ok()?;
 
-        // A probe is the opposite promise: check mode runs it.
-        let probed = builtin::command::probe(vec![
-            "echo".to_string(),
-            "probe-ran-under-check".to_string(),
-        ])
-        .await?;
-        if probed.status == builtin::command::Status::Skipped {
+        let probed = command::probe(vec!["echo".into(), "probe-ran-under-check".into()]).await?;
+        if probed.status == command::Status::Skipped {
             cindy::bail!("probe was suppressed under --check; its whole point is to run");
         }
         if probed.stdout.trim() != "probe-ran-under-check" {
@@ -487,18 +412,13 @@ async fn main(host: cindy::Host<Vars>) -> cindy::Result<()> {
                 probed.stdout
             );
         }
-        probed.exit_ok()?;
 
-        // The `path::file` above reported `Changed` without creating
-        // anything; a read-only probe must see the file still absent.
-        let looked = builtin::command::probe_shell(
+        // The file above was reported, not created: a probe sees that.
+        let looked = command::probe_shell(
             "/bin/sh",
             format!("test -e {} && echo present || echo absent", probe.display()),
         )
         .await?;
-        if looked.status == builtin::command::Status::Skipped {
-            cindy::bail!("probe_shell was suppressed under --check");
-        }
         if looked.stdout.trim() != "absent" {
             cindy::bail!(
                 "probe_shell saw {:?}; check mode created the file it only \
@@ -506,123 +426,87 @@ async fn main(host: cindy::Host<Vars>) -> cindy::Result<()> {
                 looked.stdout
             );
         }
-        return Ok(());
+        Ok(())
     }
 
-    let work = &host.vars.work_dir;
+    /// Every builtin once. The play can't hand data back to the harness
+    /// except through the target, so it writes a JSON report the test
+    /// reads.
+    pub async fn every_builtin(vars: &Vars) -> cindy::Result<()> {
+        work_dir(vars).await?;
+        let work = &vars.work_dir;
+        let (user, group) = builtin::current_owner_names();
 
-    // --- path: directory, file, symlink -------------------------------
-    let (user, group) = builtin::current_owner_names();
-    builtin::path::directory(
-        work.clone(),
-        &user,
-        &group,
-        builtin::path::Mode::try_from(0o755)?,
-    )
-    .await?;
+        let greeting = work.join("greeting.txt");
+        path::file(
+            greeting.clone(),
+            "hello from cindy\n".as_bytes(),
+            &user,
+            &group,
+            mode(0o644)?,
+        )
+        .await?;
+        path::link(work.join("greeting.link"), greeting.clone(), &user, &group).await?;
 
-    let greeting = work.join("greeting.txt");
-    builtin::path::file(
-        greeting.clone(),
-        "hello from cindy\n".as_bytes(),
-        &user,
-        &group,
-        builtin::path::Mode::try_from(0o644)?,
-    )
-    .await?;
+        let echo = command::command(
+            vec!["echo".into(), "command-module-ran".into()],
+            command::State::default(),
+        )
+        .await?
+        .exit_ok()?;
 
-    let link = work.join("greeting.link");
-    builtin::path::link(link.clone(), greeting.clone(), &user, &group).await?;
+        let shell_marker = work.join("shell-marker");
+        command::shell(
+            "/bin/sh".into(),
+            format!("printf done > {}", shell_marker.display()),
+            command::State::default(),
+        )
+        .await?
+        .exit_ok()?;
 
-    // --- command: run a program directly, capture its output ----------
-    let echo = builtin::command::command(
-        vec!["echo".into(), "command-module-ran".into()],
-        builtin::command::State::default(),
-    )
-    .await?
-    .exit_ok()?;
-    if echo.stdout.trim() != "command-module-ran" {
-        cindy::bail!("command stdout was {:?}", echo.stdout);
+        let downloaded = work.join("downloaded.bin");
+        fetch::fetch(fetch::State {
+            url: vars.fetch_url.clone(),
+            dest: downloaded.clone(),
+            checksum: Some(fetch::Checksum::Sha256(vars.fetch_sha256.clone())),
+            mode: Some(mode(0o644)?),
+            ..Default::default()
+        })
+        .await?;
+
+        let tarball = work.join("bundle.tar.gz");
+        builtin::archive::archive(builtin::archive::State {
+            sources: vec![greeting.clone()],
+            dest: tarball.clone(),
+            format: None,
+            mode: Some(mode(0o644)?),
+        })
+        .await?;
+        let extract_dir = work.join("extracted");
+        builtin::unarchive::extract(tarball.clone(), extract_dir.clone()).await?;
+
+        let payload = b"the quick brown fox jumps over the lazy dog".repeat(64);
+        let compressed = builtin::compress::compress(payload.clone(), builtin::Codec::Zstd).await?;
+        let restored =
+            builtin::decompress::decompress(compressed.clone(), builtin::Codec::Zstd).await?;
+
+        let report = serde_json::json!({
+            "command_stdout": echo.stdout.trim(),
+            "shell_marker_exists": shell_marker.exists(),
+            "downloaded_exists": downloaded.exists(),
+            "tarball_exists": tarball.exists(),
+            "extracted_greeting_exists": extract_dir.join("greeting.txt").exists(),
+            "compressed_len": compressed.len(),
+            "roundtrip_ok": restored == payload,
+        });
+        path::file(
+            work.join("report.json"),
+            serde_json::to_vec_pretty(&report)?,
+            &user,
+            &group,
+            mode(0o644)?,
+        )
+        .await?;
+        Ok(())
     }
-
-    // --- shell: explicit interpreter, writes a marker file ------------
-    let shell_marker = work.join("shell-marker");
-    builtin::command::shell(
-        "/bin/sh".into(),
-        format!("printf done > {}", shell_marker.display()),
-        builtin::command::State::default(),
-    )
-    .await?
-    .exit_ok()?;
-
-    // --- fetch: download with checksum verification -------------------
-    let downloaded = work.join("downloaded.bin");
-    builtin::fetch::fetch(builtin::fetch::State {
-        url: host.vars.fetch_url.clone(),
-        dest: downloaded.clone(),
-        checksum: Some(builtin::fetch::Checksum::Sha256(
-            host.vars.fetch_sha256.clone(),
-        )),
-        mode: Some(builtin::path::Mode::try_from(0o644)?),
-        ..Default::default()
-    })
-    .await?;
-
-    // --- archive + unarchive: tar.gz round-trip of the work dir -------
-    let tarball = work.join("bundle.tar.gz");
-    builtin::archive::archive(builtin::archive::State {
-        sources: vec![greeting.clone()],
-        dest: tarball.clone(),
-        format: None,                                      // inferred from `.tar.gz`
-        mode: Some(builtin::path::Mode::try_from(0o644)?), // readable so `unarchive` can read it back
-    })
-    .await?;
-
-    let extract_dir = work.join("extracted");
-    builtin::unarchive::unarchive(builtin::unarchive::State {
-        src: tarball.clone(),
-        dest: extract_dir.clone(),
-        format: None,
-        max_bytes: None,
-    })
-    .await?;
-
-    // --- compress + decompress: raw byte round-trip -------------------
-    let payload = b"the quick brown fox jumps over the lazy dog".repeat(64);
-    let compressed = builtin::compress::compress(payload.clone(), builtin::Codec::Zstd).await?;
-    let restored =
-        builtin::decompress::decompress(compressed.clone(), builtin::Codec::Zstd).await?;
-    if restored != payload {
-        cindy::bail!("zstd round-trip mismatch");
-    }
-
-    // --- write a machine-readable summary the test asserts on ---------
-    //
-    // The play can't return structured data to the harness (the process
-    // just exits 0/1), so it drops a JSON report into the work dir that
-    // the test reads back.
-    use std::collections::BTreeMap;
-    let mut report: BTreeMap<&str, serde_json::Value> = BTreeMap::new();
-    report.insert("command_stdout", echo.stdout.trim().into());
-    report.insert("shell_marker_exists", shell_marker.exists().into());
-    report.insert("downloaded_exists", downloaded.exists().into());
-    report.insert("tarball_exists", tarball.exists().into());
-    report.insert(
-        "extracted_greeting_exists",
-        extract_dir.join("greeting.txt").exists().into(),
-    );
-    report.insert("compressed_len", (compressed.len() as u64).into());
-    report.insert("roundtrip_ok", (restored == payload).into());
-
-    let report_path = work.join("report.json");
-    builtin::path::file(
-        report_path,
-        serde_json::to_vec_pretty(&report).expect("serialise report"),
-        &user,
-        &group,
-        builtin::path::Mode::try_from(0o644)?,
-    )
-    .await?;
-
-    Ok(())
 }
