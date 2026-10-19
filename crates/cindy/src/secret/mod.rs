@@ -1,23 +1,10 @@
-//! Vaulted secrets. A `Secret<T>` is a wrapper that:
+//! Vaulted secrets: a value that serialises only sealed, never
+//! `Debug`-prints, and decrypts only on an explicit
+//! [`reveal`](Secret::reveal).
 //!
-//!   * Round-trips through serde — JSON, postcard, anything — as a
-//!     compact tagged blob (`{ vault, ciphertext }`).
-//!   * Reveals the inner `T` only on an explicit `.reveal()` call,
-//!     using a per-vault key looked up at runtime.
-//!   * Refuses to leak the plaintext via `Debug`/`Display`. The
-//!     plaintext buffers on the reveal path are wiped with `zeroize`
-//!     after use (the decrypted `SealedPayload`, the raw key bytes
-//!     handed to the keychain); transport frames and the sealed
-//!     ciphertext form are *not* scrubbed — treat swapped/coredumped
-//!     memory as out of scope for this design.
-//!
-//! There are two states the type lives in over its lifecycle. **Plain**
-//! is only meant to exist transiently in source code that hasn't been
-//! sealed yet (and at runtime in dev/tests); the `cindy secret seal`
-//! workflow rewrites these into the **Sealed** form. The sealed form
-//! is what the CLI actually serialises, deserialises, and ships to the
-//! orchestrator process through the host-context hand-off (see
-//! `cindy::entry`), and so on.
+//! Plaintext buffers on the reveal path are zeroized. Transport frames
+//! and ciphertext aren't, and swapped or core-dumped memory is out of
+//! scope.
 
 use std::fmt;
 
@@ -31,52 +18,35 @@ pub mod keychain;
 
 use crate::Context as _;
 
-/// Vaulted wrapper over `T`.
-///
-/// Two states:
-///   * `Plain(T)` — pre-seal. The CLI's `cindy secret seal` step rewrites
-///     this in source to `Sealed { .. }`. At runtime, `.reveal()` just
-///     hands the inner value back.
-///   * `Sealed { vault, ciphertext }` — committed form. `.reveal()`
-///     looks up the named vault's key via the keychain and decrypts.
+// No zeroizing `Drop`: it would forbid moving out in `reveal(self)`,
+// and ciphertext isn't secret. A `Plain(T)` that matters should hold
+// zeroize-aware types.
+#[derive(Clone)]
 pub enum Secret<T> {
+    /// What `secret!` produces in source, until `cindy secret seal`
+    /// rewrites it. Refuses to serialise.
     Plain(T),
+    /// The committed form; decrypts with the vault's key.
     Sealed { vault: String, ciphertext: Vec<u8> },
 }
 
-/// What actually gets encrypted by `cindy secret seal`. The wrapper
-/// carries both the postcard-encoded `T` (so `Secret::<T>::reveal`
-/// can hand a typed value back to user code) *and* the literal
-/// source-tokens of the original `secret!` value expression (so
-/// `cindy secret unseal` can splice the same syntax back into the file
-/// and recover the editable shape).
-///
-/// Cost: roughly 2× the ciphertext size compared with a postcard-only
-/// payload. Worth it for the round-trip UX — and `cargo fmt` cleans up
-/// the whitespace `stringify!()` injects.
+/// What `cindy secret seal` encrypts: the value, and the source tokens
+/// of the `secret!` expression so `unseal` can put the editable form
+/// back — about twice the size, for a lossless round trip.
 #[doc(hidden)]
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct SealedPayload {
-    /// `postcard::to_allocvec(&value)` — the bytes `Secret<T>::reveal`
-    /// hands to `postcard::from_bytes::<T>(...)`.
+    /// postcard of the value.
     pub value: Vec<u8>,
-    /// `stringify!($value)` captured at macro time. Used only by
-    /// `cindy secret unseal` to put the original `secret!(...)` call
-    /// back. Encrypted alongside `value` so leaking nothing about
-    /// shape/field-names.
+    /// `stringify!` of the expression.
     pub source: String,
 }
 
 impl<T> Secret<T> {
-    /// Construct a not-yet-sealed secret. Used in source code before
-    /// `cindy secret seal` rewrites it. Never produced at runtime on the
-    /// orchestrator.
     pub fn new(value: T) -> Self {
         Self::Plain(value)
     }
 
-    /// Construct an already-sealed secret. Used by the seal step (and
-    /// by serde deserialisation).
     pub fn sealed(vault: impl Into<String>, ciphertext: Vec<u8>) -> Self {
         Self::Sealed {
             vault: vault.into(),
@@ -84,14 +54,8 @@ impl<T> Secret<T> {
         }
     }
 
-    /// Construct a sealed secret from a base64-encoded ciphertext.
-    /// This is the constructor the `cindy secret seal` source-rewriter
-    /// emits in your code, because pasting raw bytes into a `.rs` file
-    /// is awful and base64 is unambiguous + greppable.
-    ///
-    /// Panics at runtime if `ciphertext_b64` isn't valid base64; we'd
-    /// rather fail loudly than silently produce a `Sealed` with bogus
-    /// bytes that only blows up much later in `.reveal()`.
+    /// What `cindy secret seal` writes into source. Panics on invalid
+    /// base64 — loudly now, rather than at a much later `reveal`.
     pub fn sealed_b64(vault: impl Into<String>, ciphertext_b64: &str) -> Self {
         let bytes = base64::engine::general_purpose::STANDARD
             .decode(ciphertext_b64.as_bytes())
@@ -102,8 +66,7 @@ impl<T> Secret<T> {
         }
     }
 
-    /// Name of the vault this secret is encrypted under. `Plain`
-    /// secrets have no vault yet; this returns `None` for them.
+    /// `None` until sealed.
     pub fn vault(&self) -> Option<&str> {
         match self {
             Self::Plain(_) => None,
@@ -112,52 +75,26 @@ impl<T> Secret<T> {
     }
 }
 
-/// Inventory-crate slot for a `secret!(...)` macro invocation waiting
-/// to be sealed. The `#[cindy::main]`-generated entry walks all
-/// `PendingSecret`s when launched with `CINDY_SEAL_SECRETS=1`, invokes
-/// each `serialize` thunk to get the plaintext bytes, encrypts them
-/// under the named vault's key, and emits one JSON object per pending
-/// secret on stdout so the CLI can patch the source files.
-///
-/// The same registry doubles as the *vault-preflight* source: iterating
-/// it yields every vault literal compiled into the binary (see
-/// [`registered_vaults`]).
+/// A `secret!` waiting to be sealed, registered at link time. Also the
+/// source of [`registered_vaults`].
 #[doc(hidden)]
 pub struct PendingSecret {
-    /// Source-file path captured by `file!()` at the macro call site.
     pub file: &'static str,
-    /// 1-based line number from `line!()`.
     pub line: u32,
-    /// 1-based column number from `column!()`.
     pub column: u32,
-    /// Vault name (the macro's first argument).
     pub vault: &'static str,
-    /// Thunk that re-evaluates the macro's value expression and
-    /// returns its `postcard`-serialised bytes. Required to be a
-    /// `fn` pointer (no captures) so it's registerable at link time;
-    /// this is what forces the "literals-only" constraint on
-    /// `secret!`.
+    /// The `SealedPayload` bytes. A `fn` pointer so it registers at
+    /// link time — hence `secret!` takes no captures.
     pub serialize: fn() -> Vec<u8>,
 }
 
 inventory::collect!(PendingSecret);
 
-/// Collect the distinct vaults referenced by `secret!` invocations
-/// compiled into this binary.
-///
-/// This is the "secrets in code" half of the vault preflight. It's an
-/// over-approximation of what a given run will actually touch — it
-/// includes `secret!`s in code paths a host might not hit, and can't
-/// tell whether a given secret reveals on the orchestrator or a worker
-/// (that isn't recoverable cross-crate). Both are the conservative bias
-/// a key preflight wants: every participating machine is simply
-/// required to hold every vault any `secret!` references, so a run can
-/// never fail mid-play on a missing in-code secret key.
-///
-/// The *precise*, per-host half — secrets living in inventory `vars` —
-/// is handled separately by walking the host's data (see the CLI and
-/// `inventory`), because there the exact vault set per host *is*
-/// knowable.
+/// Every vault a `secret!` in this binary names. An over-approximation
+/// — paths a host never takes, orchestrator- and worker-side alike —
+/// which is the right bias for a preflight: it can't let a run fail
+/// halfway on a missing key. Secrets in inventory `vars` are walked
+/// per host instead, where the exact set is knowable.
 #[doc(hidden)]
 pub fn registered_vaults() -> Vec<String> {
     let mut vaults: Vec<String> = crate::__reexports::inventory::iter::<PendingSecret>()
@@ -168,14 +105,7 @@ pub fn registered_vaults() -> Vec<String> {
     vaults
 }
 
-/// Verify that every vault in `vaults` has a reachable key, returning
-/// the sorted list of those that don't.
-///
-/// "Reachable" means the keychain can load it — from the in-memory
-/// cache (on a worker, pre-installed from `CINDY_VAULT_KEYS`) or the
-/// on-disk `keys/<vault>.key` (on the orchestrator). This is the actual
-/// preflight probe: it touches no ciphertext, just confirms the key is
-/// present, so it can run before any real work.
+/// The vaults the keychain can't load, sorted.
 #[doc(hidden)]
 pub fn missing_vaults<I, S>(vaults: I) -> Vec<String>
 where
@@ -192,16 +122,8 @@ where
     missing
 }
 
-/// Run the vault preflight for a participant (orchestrator or worker):
-/// the union of every `secret!`-referenced vault compiled into this
-/// binary plus any vaults found in `host_context_json` (a serialised
-/// `Host<V>`, whose sealed `vars` secrets are walked precisely). If any
-/// key is missing, print an actionable message naming all of them and
-/// return `Err` so the caller can fail before doing any work.
-///
-/// `host_context_json` is optional: pass `None` for the zero-arg `main`
-/// shape (no host context), in which case only the in-code `secret!`
-/// vaults are checked.
+/// Fail before any work if a key for a vault in this binary or in the
+/// host's context is missing.
 #[doc(hidden)]
 pub fn preflight(role: &str, host_context_json: Option<&str>) -> crate::Result<()> {
     let mut needed: std::collections::BTreeSet<String> = registered_vaults().into_iter().collect();
@@ -234,22 +156,13 @@ pub fn preflight(role: &str, host_context_json: Option<&str>) -> crate::Result<(
 #[doc(hidden)]
 pub fn UNSEALED_SECRET() {}
 
-/// Wrap a literal value in a [`Secret<T>`] and register it for the
-/// `cindy secret seal` step to encrypt in-place.
+/// A [`Secret::Plain`] in source, registered for `cindy secret seal`,
+/// which rewrites the call into an encrypted [`Secret::sealed_b64`]
+/// (`cindy secret unseal` puts it back). Until sealed it warns, and
+/// refuses to cross the wire.
 ///
-/// At runtime this expands to a [`Secret<T>::Plain`]. Your code will
-/// be analyzed and will compile, but you might not be able to run
-/// it, depending on where the [`Secret`] is present, and if it needs
-/// to be transferred over the wire
-/// (in other words; if [`serde::Serialize`] needs to be used).
-///
-/// To seal the secret, use `cindy secret seal [--all]`.
-/// The [`secret!`] calls will get rewritten in the source code to a [`Secret::sealed_b64`]
-/// call containing the encrypted value + encrypted raw tokens for `cindy secret unseal [--all]`.
-///
-/// The values used as secrets must be either constants or literals
-/// (or [`include_str!`] / [`include_bytes!`]; anything resolvable at compile time).
-/// You cannot capture variables from local scope. Doing so will surface as E0435 or E0425.
+/// The value must be self-contained — literals, constants,
+/// `include_str!` — not local variables (E0435/E0425).
 ///
 /// ```rust,ignore
 /// let pw = cindy::secret!("prod", Credentials {
@@ -290,98 +203,61 @@ macro_rules! secret {
 }
 
 impl<T: serde::de::DeserializeOwned> Secret<T> {
-    /// Reveal the inner value. For `Plain`, returns it as-is. For
-    /// `Sealed`, fetches the vault key from the keychain, decrypts
-    /// the ciphertext into a [`SealedPayload`], and
-    /// `postcard`-deserialises the inner `T` out of its `value`
-    /// field. The `source` field of the payload is ignored here —
-    /// it's there for `cindy secret unseal`.
     pub fn reveal(self) -> crate::Result<T> {
         match self {
             Self::Plain(v) => Ok(v),
-            Self::Sealed { vault, ciphertext } => {
-                let key = keychain::get_vault_key(&vault)?;
-                let plaintext = crypto::unseal(&key, &ciphertext)?;
-                let mut payload: SealedPayload =
-                    postcard::from_bytes(&plaintext).context(format!(
-                            "couldn't deserialise SealedPayload for vault `{vault}`. \
-                             If this secret was sealed by an older cindy version, \
-                             rewrite it as `cindy::secret!(\"{vault}\", ..)` and re-run `cindy secret seal`."
-                        ))?;
-                let value: T = postcard::from_bytes(&payload.value)
-                    .context(format!("couldn't deserialise inner T for vault `{vault}`"))?;
-                payload.value.zeroize();
-                payload.source.zeroize();
-                Ok(value)
-            }
+            Self::Sealed { vault, ciphertext } => decrypt(&vault, &ciphertext),
+        }
+    }
+
+    /// For reveal-mode rendering, which can't consume. A `Plain` can't
+    /// be revealed by reference, and never reaches that path.
+    fn reveal_ref(&self) -> crate::Result<T> {
+        match self {
+            Self::Plain(_) => crate::bail!("cannot reveal a `Plain` secret by reference"),
+            Self::Sealed { vault, ciphertext } => decrypt(vault, ciphertext),
         }
     }
 }
 
+fn decrypt<T: serde::de::DeserializeOwned>(vault: &str, ciphertext: &[u8]) -> crate::Result<T> {
+    let key = keychain::get_vault_key(vault)?;
+    let plaintext = crypto::unseal(&key, ciphertext)?;
+    let mut payload: SealedPayload = postcard::from_bytes(&plaintext).context(format!(
+        "couldn't deserialise SealedPayload for vault `{vault}`. If this secret was sealed \
+         by an older cindy version, rewrite it as `cindy::secret!(\"{vault}\", ..)` and \
+         re-run `cindy secret seal`."
+    ))?;
+    let value = postcard::from_bytes(&payload.value)
+        .context(format!("couldn't deserialise inner T for vault `{vault}`"));
+    payload.value.zeroize();
+    payload.source.zeroize();
+    value
+}
+
 thread_local! {
-    /// When set, the `Debug` and `Serialize` impls of `Secret<T>`
-    /// decrypt and render the real inner value instead of redacting it.
-    /// Scoped strictly to the closure passed to [`with_revealed_secrets`]
-    /// so it can never leak into ordinary logging or persisted output.
     static REVEAL_SECRETS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
-/// Whether reveal mode is currently active on this thread.
 pub(crate) fn revealing() -> bool {
     REVEAL_SECRETS.with(|c| c.get())
 }
 
-/// Run `f` with secret revelation enabled on the current thread, then
-/// restore the previous setting. Inside the closure, `Debug` and
-/// `Serialize` of any `Secret<T>` render the *decrypted value* rather
-/// than `<secret vault=…>` / the sealed `{vault, ciphertext}` blob.
-///
-/// This is *only* wired up by `cindy inventory --reveal`, which runs in
-/// the orchestrator process where the vault keys are reachable. It is
-/// deliberately not exposed to normal operation — a misplaced reveal is
-/// exactly the leak `Secret` exists to prevent.
+/// Inside `f`, on this thread, `Debug` and `Serialize` of a `Secret`
+/// render the decrypted value. Only `cindy inventory --reveal` uses it;
+/// anywhere else it is the leak `Secret` exists to prevent.
 pub fn with_revealed_secrets<R>(f: impl FnOnce() -> R) -> R {
     let _guard = REVEAL_SECRETS.with(|c| RevealGuard(c.replace(true)));
     f()
 }
 
-/// Restores `REVEAL_SECRETS` on drop.
-///
-/// Saving and restoring around the call is not equivalent: if `f`
-/// panics, the restore never runs and reveal mode stays set on a thread
-/// the tokio runtime will hand to the next task — whose `Debug` /
-/// `Serialize` would then emit plaintext. Unwinding through `Drop` is
-/// what makes the scope actually scoped.
+/// A guard, not save-and-restore: a panic in `f` would otherwise leave
+/// reveal mode on, for whichever task tokio runs on this thread next.
 struct RevealGuard(bool);
 
 impl Drop for RevealGuard {
     fn drop(&mut self) {
         REVEAL_SECRETS.with(|c| c.set(self.0));
-    }
-}
-
-impl<T: serde::de::DeserializeOwned> Secret<T> {
-    /// Decrypt into the inner `T` by reference (for reveal rendering).
-    /// Unlike [`Secret::reveal`], doesn't consume `self`. `Plain` is
-    /// not decryptable by reference (we can't move the value out), so
-    /// it errors — but `Plain` never reaches the reveal path in
-    /// practice, since the orchestrator only renders sealed inventories.
-    fn reveal_ref(&self) -> crate::Result<T> {
-        match self {
-            Self::Plain(_) => crate::bail!("cannot reveal a `Plain` secret by reference"),
-            Self::Sealed { vault, ciphertext } => {
-                let key = keychain::get_vault_key(vault)?;
-                let plaintext = crypto::unseal(&key, ciphertext)?;
-                let mut payload: SealedPayload = postcard::from_bytes(&plaintext).context(
-                    format!("couldn't deserialise SealedPayload for vault `{vault}`"),
-                )?;
-                let value: T = postcard::from_bytes(&payload.value)
-                    .context(format!("couldn't deserialise inner T for vault `{vault}`"))?;
-                payload.value.zeroize();
-                payload.source.zeroize();
-                Ok(value)
-            }
-        }
     }
 }
 
@@ -400,53 +276,18 @@ impl<T: fmt::Debug + serde::de::DeserializeOwned> fmt::Debug for Secret<T> {
     }
 }
 
-impl<T: Clone> Clone for Secret<T> {
-    fn clone(&self) -> Self {
-        match self {
-            Self::Plain(v) => Self::Plain(v.clone()),
-            Self::Sealed { vault, ciphertext } => Self::Sealed {
-                vault: vault.clone(),
-                ciphertext: ciphertext.clone(),
-            },
-        }
-    }
-}
-
-// Note: deliberately no `Drop` impl. We'd want one for zeroizing the
-// ciphertext buffer, but auto-`Drop` makes `reveal(self)` impossible
-// (you can't move out of a type that implements `Drop`). Ciphertext is
-// non-secret material once it's left our process anyway; the
-// load-bearing zeroize is on the plaintext that lives inside the
-// `Zeroizing<Vec<u8>>` returned by [`crypto::unseal`] during a
-// `.reveal()` call. For `Plain(T)` containing sensitive data, callers
-// should make sure `T` itself uses zeroize-aware types.
-
-// ---- serde ---------------------------------------------------------
-//
-// The on-the-wire shape is **always** the sealed form. `Plain` values
-// *refuse* to serialise — serialising one would either leak plaintext
-// to disk or silently fake a sealed blob, so it's a hard error naming
-// the fix (`cindy secret seal`). The one deliberate exception is
-// reveal mode (`with_revealed_secrets`, used by
-// `cindy inventory --reveal --json`), which serialises the decrypted
-// plaintext value in place of the blob — opt-in, operator-facing.
-//
-// Deserialisation always produces `Sealed`; revealing requires an
-// explicit `.reveal()` call.
-
+// The wire form is always sealed: a `Plain` refuses to serialise
+// rather than leak or fake one, except in reveal mode. Deserialising
+// always yields `Sealed`.
 #[derive(Serialize, Deserialize)]
 struct WireForm<'a> {
     vault: std::borrow::Cow<'a, str>,
-    /// Base64 of the AEAD blob (nonce || ciphertext || tag).
     ciphertext: std::borrow::Cow<'a, str>,
 }
 
 impl<T: Serialize + serde::de::DeserializeOwned> Serialize for Secret<T> {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         use serde::ser::Error as _;
-        // Reveal mode (orchestrator, `inventory --reveal --json`):
-        // decrypt and serialise the *plaintext value* in place of the
-        // sealed blob. Strictly scoped to `with_revealed_secrets`.
         if revealing() {
             let value = self.reveal_ref().map_err(S::Error::custom)?;
             return value.serialize(serializer);
@@ -586,16 +427,12 @@ mod tests {
         };
         let s: Secret<Creds> = Secret::sealed("dbg-reveal", seal_creds("dbg-reveal", &creds));
 
-        // Default: redacted.
         assert_eq!(format!("{s:?}"), "<secret vault=dbg-reveal>");
 
-        // Inside the scope: the *decrypted value's* own Debug, not the
-        // source tokens.
         let revealed = with_revealed_secrets(|| format!("{s:?}"));
         assert_eq!(revealed, format!("{creds:?}"));
         assert!(revealed.contains("s3cr3t"));
 
-        // Flag is restored afterwards.
         assert_eq!(format!("{s:?}"), "<secret vault=dbg-reveal>");
     }
 
@@ -607,12 +444,10 @@ mod tests {
         };
         let s: Secret<Creds> = Secret::sealed("ser-reveal", seal_creds("ser-reveal", &creds));
 
-        // Default: sealed blob with vault + ciphertext, no plaintext.
         let sealed_json = serde_json::to_value(&s).unwrap();
         assert!(sealed_json.get("ciphertext").is_some());
         assert!(!sealed_json.to_string().contains("pw123"));
 
-        // Revealed: the plaintext value serialised in place.
         let revealed = with_revealed_secrets(|| serde_json::to_value(&s).unwrap());
         assert_eq!(revealed, serde_json::to_value(&creds).unwrap());
         assert_eq!(revealed["pw"], "pw123");
@@ -645,7 +480,6 @@ mod tests {
 
     #[test]
     fn missing_vaults_reports_unavailable_only() {
-        // Install one vault; the other should be reported missing.
         let key = crypto::generate_vault_key();
         let mut chain = std::collections::HashMap::new();
         chain.insert("present-vault".to_owned(), key);
@@ -657,9 +491,6 @@ mod tests {
 
     #[test]
     fn a_panic_inside_a_reveal_scope_does_not_leave_reveal_mode_set() {
-        // The scope has to survive unwinding: tokio hands the thread to
-        // the next task, and a leaked flag would make *its* `Debug` emit
-        // plaintext.
         let caught = std::panic::catch_unwind(|| {
             with_revealed_secrets(|| panic!("boom"));
         });
@@ -672,7 +503,6 @@ mod tests {
 
     #[test]
     fn debug_reveal_failure_does_not_leak_and_does_not_panic() {
-        // No key installed for this vault → reveal fails gracefully.
         let s: Secret<Creds> = Secret::sealed("no-such-vault-for-debug", vec![9, 9, 9]);
         let out = with_revealed_secrets(|| format!("{s:?}"));
         assert!(out.starts_with("<secret reveal failed:"));

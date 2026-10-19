@@ -1,14 +1,7 @@
-//! Symmetric encryption used to seal a single secret's bytes with a
-//! vault's key.
+//! Sealing one secret under a vault key: ChaCha20-Poly1305, a fresh
+//! random nonce per seal.
 //!
-//! ChaCha20-Poly1305 with a 96-bit random nonce: standard AEAD,
-//! constant-time, no MAC truncation games. Each sealed blob carries
-//! its own random nonce, so the same plaintext encrypted twice yields
-//! different ciphertexts.
-//!
-//! Wire layout: `nonce (12 bytes) || ciphertext (N bytes) || tag (16 bytes)`,
-//! assembled by hand in [`seal`] from the AEAD's `encrypt` output
-//! (`ciphertext || tag`) plus the fresh nonce it was encrypted under.
+//! Blob: `[version][nonce (12)][ciphertext][tag (16)]`.
 
 use chacha20poly1305::{
     AeadCore, ChaCha20Poly1305, KeyInit, Nonce,
@@ -16,48 +9,25 @@ use chacha20poly1305::{
 };
 use zeroize::Zeroizing;
 
-/// Length of a vault key in bytes. Matches ChaCha20-Poly1305.
 pub const VAULT_KEY_LEN: usize = 32;
 
-/// Length of the AEAD nonce prepended to every ciphertext.
 pub const NONCE_LEN: usize = 12;
 
-/// A vault's symmetric key. Held in `Zeroizing` so the underlying
-/// bytes are wiped on drop. Pass by reference; never clone unnecessarily.
+/// Wiped on drop.
 pub type VaultKey = Zeroizing<[u8; VAULT_KEY_LEN]>;
 
-/// Generate a fresh random key using the OS CSPRNG. We piggy-back on
-/// the `rand_core::OsRng` that ships with `chacha20poly1305`'s `aead`
-/// re-export to avoid pulling a second version of `rand_core` into the
-/// dependency graph.
+/// From the OS CSPRNG, via the `aead` re-export: no second `rand_core`.
 pub fn generate_vault_key() -> VaultKey {
     let mut bytes = [0u8; VAULT_KEY_LEN];
     AeadOsRng.fill_bytes(&mut bytes);
     Zeroizing::new(bytes)
 }
 
-/// Version prefix on sealed blobs, so a future format change is a
-/// clean, detectable migration instead of a parse failure
-/// indistinguishable from corruption. v1 blobs are
-/// `[0x01][nonce (12)][ciphertext (N)][tag (16)]`.
-///
-/// Legacy (pre-versioning, "v0") blobs are `[nonce][ct][tag]` with no
-/// prefix; their first byte is random nonce, so it collides with this
-/// marker ~1/256 of the time. Decoding therefore tries v1 on marker
-/// match and falls back to the legacy layout when that fails — one
-/// rejected decrypt attempt on those few old blobs, nothing otherwise.
-///
-/// When both layouts fail and the leading byte is a small value other
-/// than this version, decoding reports "unknown version" rather than a
-/// bare decrypt failure: versions are sequential small integers, so
-/// that shape is most plausibly a blob sealed by a *newer* cindy. A
-/// large leading byte is more likely a corrupt legacy blob (whose
-/// random nonce dominates the space) and keeps the decrypt-failure
-/// error.
+/// So a format change is detectable, not indistinguishable from
+/// corruption. Legacy blobs have no prefix, and their random first byte
+/// matches it 1 time in 256: unsealing tries v1, then the legacy layout.
 pub const BLOB_VERSION: u8 = 1;
 
-/// Encrypt `plaintext` with `key`, returning
-/// `[version byte][nonce ‖ ciphertext ‖ tag]`.
 pub fn seal(key: &VaultKey, plaintext: &[u8]) -> crate::Result<Vec<u8>> {
     let cipher = ChaCha20Poly1305::new(key.as_slice().into());
     let nonce = ChaCha20Poly1305::generate_nonce(&mut AeadOsRng);
@@ -72,10 +42,7 @@ pub fn seal(key: &VaultKey, plaintext: &[u8]) -> crate::Result<Vec<u8>> {
     Ok(out)
 }
 
-/// Decrypt a sealed blob — v1 (version-prefixed) or legacy v0 (bare
-/// `nonce ‖ ct ‖ tag`, with the marker-collision fallback described on
-/// [`BLOB_VERSION`]). Returns the plaintext (also held in `Zeroizing`
-/// so it's wiped if the caller drops it without consuming).
+/// A current or legacy blob.
 pub fn unseal(key: &VaultKey, framed: &[u8]) -> crate::Result<Zeroizing<Vec<u8>>> {
     if framed.first() == Some(&BLOB_VERSION)
         && let Ok(plaintext) = aead_decrypt(key, &framed[1..])
@@ -83,14 +50,9 @@ pub fn unseal(key: &VaultKey, framed: &[u8]) -> crate::Result<Zeroizing<Vec<u8>>
         return Ok(plaintext);
     }
     aead_decrypt(key, framed).map_err(|decrypt_failure| match framed.first() {
-        // Both layouts failed. Without this arm a future-format blob
-        // dies with the bare `AEAD decryption failed` — exactly the
-        // parse-failure-indistinguishable-from-corruption outcome the
-        // version byte exists to eliminate. The range starts above
-        // `BLOB_VERSION`: a blob carrying the *current* version that
-        // fails both layouts is a wrong key or corruption (the most
-        // common secrets failure), and must keep that error, not be
-        // sent chasing a cindy upgrade.
+        // Both failed. A small byte above ours is most plausibly a newer
+        // format (versions count up; legacy nonces fill the whole byte).
+        // Ours, failing, is a wrong key or corruption — say that.
         Some(&byte) if byte > BLOB_VERSION && byte < 0x10 => crate::Error::msg(format!(
             "sealed blob reports version {byte}, which this cindy doesn't understand \
              (it knows {BLOB_VERSION}); it was probably sealed by a newer cindy — \
@@ -100,7 +62,6 @@ pub fn unseal(key: &VaultKey, framed: &[u8]) -> crate::Result<Zeroizing<Vec<u8>>
     })
 }
 
-/// Decrypt `nonce ‖ ciphertext ‖ tag` with the vault key.
 fn aead_decrypt(key: &VaultKey, framed: &[u8]) -> crate::Result<Zeroizing<Vec<u8>>> {
     if framed.len() < NONCE_LEN {
         crate::bail!(
@@ -132,8 +93,6 @@ mod tests {
 
     #[test]
     fn distinct_nonces_per_encryption() {
-        // Same plaintext, same key, two seals must yield different
-        // ciphertexts (because each carries its own random nonce).
         let key = generate_vault_key();
         let pt = b"the quick brown fox";
         let a = seal(&key, pt).unwrap();
@@ -147,7 +106,6 @@ mod tests {
         let pt = b"important";
         let mut ct = seal(&key, pt).unwrap();
         assert_eq!(ct[0], BLOB_VERSION, "new blobs carry the version byte");
-        // Flip a bit in the ciphertext body (skip version and nonce).
         ct[1 + NONCE_LEN] ^= 0x01;
         assert!(unseal(&key, &ct).is_err());
     }
@@ -158,11 +116,7 @@ mod tests {
         let key_b = generate_vault_key();
         let ct = seal(&key_a, b"x").unwrap();
         let err = unseal(&key_b, &ct).unwrap_err().to_string();
-        // The message IS the feature here: a wrong key on a
-        // current-format blob must report the decrypt failure, never
-        // a version claim — b268fa3 shipped exactly that regression
-        // (a self-contradictory "reports version 1 … it knows 1")
-        // because this test only asserted is_err().
+        // b268fa3 shipped "reports version 1 … it knows 1" here.
         assert!(
             err.contains("AEAD decryption failed"),
             "wrong-key failure must name decryption, not a version: {err}"
@@ -173,28 +127,21 @@ mod tests {
         );
     }
 
-    /// Blobs sealed before the version byte existed have no prefix and
-    /// must keep working.
     #[test]
     fn legacy_blobs_unseal() {
         let key = generate_vault_key();
         let pt = b"sealed by cindy 0.3.0";
         let v1 = seal(&key, pt).unwrap();
-        // The same AEAD blob without the version prefix is exactly what
-        // a legacy blob looks like.
         let legacy = v1[1..].to_vec();
         let recovered = unseal(&key, &legacy).unwrap();
         assert_eq!(&*recovered, pt);
     }
 
-    /// A legacy blob whose random nonce happens to start with the
-    /// version byte takes the fallback path and still unseals.
     #[test]
     fn legacy_blob_with_colliding_nonce_prefix_unseals() {
         let key = generate_vault_key();
         let pt = b"unlucky nonce";
 
-        // Build a bare (v0) blob whose nonce starts with BLOB_VERSION.
         let cipher = ChaCha20Poly1305::new(key.as_slice().into());
         let mut nonce = [0u8; NONCE_LEN];
         nonce[0] = BLOB_VERSION;
@@ -209,8 +156,6 @@ mod tests {
         assert_eq!(&*recovered, pt);
     }
 
-    /// An unknown future version is a named error, not silent garbage
-    /// or a bare decrypt failure.
     #[test]
     fn unknown_version_fails_loudly() {
         let key = generate_vault_key();
@@ -221,9 +166,6 @@ mod tests {
             err.contains("version") && err.contains("2"),
             "future-version blob must name the version: {err}"
         );
-        // A large leading byte that fails both layouts reads as
-        // corruption, not a version claim — legacy nonces dominate
-        // that space.
         ct[0] = 0xab;
         let err = unseal(&key, &ct).unwrap_err().to_string();
         assert!(
